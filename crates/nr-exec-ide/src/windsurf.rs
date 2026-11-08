@@ -29,7 +29,7 @@ impl WindsurfExecutor {
     pub fn new(provider: &str) -> Self {
         let config = nr_data::provider(provider)
             .or_else(|| nr_data::provider("windsurf"))
-            .unwrap_or_else(|| &nr_core::Json::Object(Default::default()));
+            .unwrap_or(&EMPTY_CONFIG);
         Self {
             provider: provider.to_string(),
             config,
@@ -78,3 +78,5 @@ mod tests {
         assert_eq!(executor.provider(), "windsurf");
     }
 }
+
+static EMPTY_CONFIG: std::sync::LazyLock<nr_core::Json> = std::sync::LazyLock::new(|| nr_core::Json::Object(Default::default()));

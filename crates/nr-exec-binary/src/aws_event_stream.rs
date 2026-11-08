@@ -291,7 +291,8 @@ pub fn encode_event_frame(headers: &BTreeMap<String, String>, payload: Option<&J
     let mut frame = vec![0u8; total_length];
     frame[0..4].copy_from_slice(&(total_length as u32).to_be_bytes());
     frame[4..8].copy_from_slice(&(headers_length as u32).to_be_bytes());
-    frame[8..12].copy_from_slice(&crc32(&frame[0..8]).to_be_bytes());
+    let prelude_crc = crc32(&frame[0..8]);
+    frame[8..12].copy_from_slice(&prelude_crc.to_be_bytes());
 
     let mut offset = 12;
     for chunk in header_chunks {
@@ -302,7 +303,8 @@ pub fn encode_event_frame(headers: &BTreeMap<String, String>, payload: Option<&J
     frame[offset..offset + payload_bytes.len()].copy_from_slice(&payload_bytes);
     offset += payload_bytes.len();
 
-    frame[offset..offset + 4].copy_from_slice(&crc32(&frame[0..offset]).to_be_bytes());
+    let message_crc = crc32(&frame[0..offset]);
+    frame[offset..offset + 4].copy_from_slice(&message_crc.to_be_bytes());
 
     frame
 }
@@ -313,8 +315,9 @@ mod tests {
 
     #[test]
     fn crc32_matches_js() {
-        // Test vectors from JS tests
-        assert_eq!(crc32(b"hello"), 0x907e4e6f);
+        // Standard CRC-32, same as the JS table implementation.
+        // Vector produced by open-sse/utils/awsEventStream.js crc32().
+        assert_eq!(crc32(b"hello"), 0x3610a686);
         assert_eq!(crc32(b""), 0);
     }
 

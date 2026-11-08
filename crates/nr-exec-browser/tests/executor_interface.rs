@@ -28,19 +28,13 @@ async fn test_veoaifree_web_executor_creates() {
     assert!(std::mem::size_of_val(&*executor) > 0);
 }
 
+// One test: both cases mutate the same env var, and tests run in parallel threads.
 #[test]
-fn test_browser_pool_status_when_disabled() {
+fn test_browser_pool_status_follows_env() {
     std::env::set_var("NINEROUTER_BROWSER_POOL", "off");
-    let status = nr_exec_browser::get_browser_pool_status();
-    assert!(!status.enabled);
+    assert!(!nr_exec_browser::get_browser_pool_status().enabled);
     std::env::remove_var("NINEROUTER_BROWSER_POOL");
-}
-
-#[test]
-fn test_browser_pool_status_when_enabled() {
-    std::env::remove_var("NINEROUTER_BROWSER_POOL");
-    let status = nr_exec_browser::get_browser_pool_status();
-    assert!(status.enabled);
+    assert!(nr_exec_browser::get_browser_pool_status().enabled);
 }
 
 #[test]

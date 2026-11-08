@@ -190,7 +190,7 @@ pub fn sign_aws_request(opts: SigningOptions) -> Result<BTreeMap<String, String>
     let signature = {
         let mut mac = HmacSha256::new_from_slice(&signing_key).expect("HMAC key size valid");
         mac.update(string_to_sign.as_bytes());
-        format!("{:x}", mac.finalize())
+        hex::encode(mac.finalize().into_bytes())
     };
 
     headers_to_sign.insert(

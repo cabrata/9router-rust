@@ -77,6 +77,14 @@ impl BaseHooks for KiroExecutor {
 
 #[async_trait]
 impl nr_core::Executor for KiroExecutor {
+    fn provider(&self) -> &str {
+        BaseHooks::provider(self)
+    }
+
+    fn no_auth(&self) -> bool {
+        BaseHooks::no_auth(self)
+    }
+
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecResult> {
         // shortcut: This delegates to base_execute without Kiro-specific features.
         // Full implementation requires:

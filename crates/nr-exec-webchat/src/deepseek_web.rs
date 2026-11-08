@@ -23,7 +23,7 @@ impl Executor for DeepSeekWebExecutor {
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecResult> {
         // Extract user token from credentials (raw or JSON-wrapped)
         let user_token = extract_user_token(req.credentials)
-            .ok_or_else(|| nr_core::Error::auth("Missing userToken for DeepSeek Web"))?;
+            .ok_or_else(|| nr_core::Error::other("Missing userToken for DeepSeek Web"))?;
 
         // TODO: Implement full execution path:
         // 1. Acquire access token from /users/current
@@ -71,14 +71,14 @@ mod tests {
     #[test]
     fn test_extract_user_token_raw() {
         let mut creds = Credentials::new();
-        creds.set_api_key("raw-token-string");
+        creds.set("apiKey", "raw-token-string");
         assert_eq!(extract_user_token(&creds), Some("raw-token-string".to_string()));
     }
 
     #[test]
     fn test_extract_user_token_json_wrapped() {
         let mut creds = Credentials::new();
-        creds.set_api_key(r#"{"value":"json-wrapped-token"}"#);
+        creds.set("apiKey", r#"{"value":"json-wrapped-token"}"#);
         assert_eq!(extract_user_token(&creds), Some("json-wrapped-token".to_string()));
     }
 

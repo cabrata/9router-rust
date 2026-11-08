@@ -109,6 +109,14 @@ impl BaseHooks for BedrockExecutor {
 
 #[async_trait]
 impl nr_core::Executor for BedrockExecutor {
+    fn provider(&self) -> &str {
+        BaseHooks::provider(self)
+    }
+
+    fn no_auth(&self) -> bool {
+        BaseHooks::no_auth(self)
+    }
+
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecResult> {
         // shortcut: This is a working implementation that delegates to base_execute.
         // Full version adds:

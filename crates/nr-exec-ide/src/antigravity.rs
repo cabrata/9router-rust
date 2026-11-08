@@ -31,7 +31,7 @@ impl AntigravityExecutor {
     pub fn new(provider: &str) -> Self {
         let config = nr_data::provider(provider)
             .or_else(|| nr_data::provider("antigravity"))
-            .unwrap_or_else(|| &nr_core::Json::Object(Default::default()));
+            .unwrap_or(&EMPTY_CONFIG);
         Self {
             provider: provider.to_string(),
             config,
@@ -80,6 +80,8 @@ impl AntigravityExecutor {
     }
 }
 
+// TODO(port): antigravity.js computeRetryDelay (Retry-After parsing, transient
+// error patterns) is not ported yet; base retry behavior applies until then.
 impl nr_exec_base::base::BaseHooks for AntigravityExecutor {
     fn provider(&self) -> &str {
         "antigravity"
@@ -87,27 +89,6 @@ impl nr_exec_base::base::BaseHooks for AntigravityExecutor {
 
     fn config(&self) -> &nr_core::Json {
         self.config
-    }
-
-    /// Override retry logic to detect transient Antigravity errors.
-    async fn compute_retry_delay(
-        &self,
-        status: u16,
-        _headers: &http::HeaderMap,
-        body: &[u8],
-        _attempt: u32,
-        delay_ms: u64,
-    ) -> nr_exec_base::base::RetryDelay {
-        // TODO(dedupe): Implement transient error pattern matching.
-        // Check both status code and error message for patterns like:
-        // "high traffic", "agent execution terminated", "capacity", etc.
-
-        // For now, use default retry logic
-        if (500..=599).contains(&status) || status == 429 {
-            nr_exec_base::base::RetryDelay::Ms(delay_ms.min(15000))
-        } else {
-            nr_exec_base::base::RetryDelay::Default
-        }
     }
 }
 
@@ -182,3 +163,5 @@ mod tests {
         assert_eq!(executor.provider(), "antigravity");
     }
 }
+
+static EMPTY_CONFIG: std::sync::LazyLock<nr_core::Json> = std::sync::LazyLock::new(|| nr_core::Json::Object(Default::default()));

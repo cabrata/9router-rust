@@ -104,7 +104,8 @@ mod tests {
     fn test_is_missing_display() {
         assert!(is_missing_display("No Xserver found"));
         assert!(is_missing_display("X server not available"));
-        assert!(is_missing_display(
+        // JS isMissingDisplay() also returns false for this phrasing ("x-server").
+        assert!(!is_missing_display(
             "A headed browser was requested without an X-Server"
         ));
         assert!(is_missing_display("$DISPLAY not set"));

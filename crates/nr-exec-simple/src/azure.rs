@@ -9,6 +9,11 @@ use nr_exec_base::base::{base_execute, BaseHooks};
 
 static EMPTY: LazyLock<Json> = LazyLock::new(|| Json::Object(Default::default()));
 
+/// `process.env.X` as a JS-truthy string.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
+
 struct AzureExecutor {
     config: &'static Json,
 }
@@ -30,20 +35,21 @@ impl BaseHooks for AzureExecutor {
     }
 
     fn build_url(&self, model: &str, _stream: bool, _url_index: usize, creds: &Credentials) -> Result<String> {
-        let azure_endpoint = creds.psd_str("azureEndpoint")
-            .or_else(|| std::env::var("AZURE_ENDPOINT").ok().as_deref())
-            .unwrap_or("https://api.openai.com");
+        let azure_endpoint = creds.psd_str("azureEndpoint").map(String::from)
+            .or_else(|| env_nonempty("AZURE_ENDPOINT"))
+            .unwrap_or_else(|| "https://api.openai.com".into());
 
-        let api_version = creds.psd_str("apiVersion")
-            .or_else(|| std::env::var("AZURE_API_VERSION").ok().as_deref())
-            .unwrap_or("2024-10-01-preview");
+        let api_version = creds.psd_str("apiVersion").map(String::from)
+            .or_else(|| env_nonempty("AZURE_API_VERSION"))
+            .unwrap_or_else(|| "2024-10-01-preview".into());
 
-        let deployment = creds.psd_str("deployment")
-            .or(Some(model))
-            .or_else(|| std::env::var("AZURE_DEPLOYMENT").ok().as_deref())
-            .unwrap_or("gpt-4");
+        let deployment = creds.psd_str("deployment").map(String::from)
+            .or_else(|| (!model.is_empty()).then(|| model.to_string()))
+            .or_else(|| env_nonempty("AZURE_DEPLOYMENT"))
+            .unwrap_or_else(|| "gpt-4".into());
 
-        let endpoint = azure_endpoint.trim_end_matches('/');
+        // JS `replace(/\/$/, "")` strips one trailing slash.
+        let endpoint = azure_endpoint.strip_suffix('/').unwrap_or(&azure_endpoint);
         Ok(format!("{}/openai/deployments/{}/chat/completions?api-version={}", endpoint, deployment, api_version))
     }
 
@@ -60,18 +66,17 @@ impl BaseHooks for AzureExecutor {
             }
         }
 
-        let api_key = creds.api_key()
-            .or_else(|| creds.access_token())
-            .or_else(|| std::env::var("OPENAI_API_KEY").ok().as_deref());
+        let api_key = creds.api_key().or_else(|| creds.access_token()).map(String::from)
+            .or_else(|| env_nonempty("OPENAI_API_KEY"));
 
         if let Some(key) = api_key {
-            headers.insert("api-key".into(), key.to_string());
+            headers.insert("api-key".into(), key);
         }
 
-        let organization = creds.psd_str("organization")
-            .or_else(|| std::env::var("AZURE_ORGANIZATION").ok().as_deref());
+        let organization = creds.psd_str("organization").map(String::from)
+            .or_else(|| env_nonempty("AZURE_ORGANIZATION"));
         if let Some(org) = organization {
-            headers.insert("OpenAI-Organization".into(), org.to_string());
+            headers.insert("OpenAI-Organization".into(), org);
         }
 
         if stream {

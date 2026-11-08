@@ -31,7 +31,7 @@ impl QoderExecutor {
     pub fn new(provider: &str) -> Self {
         let config = nr_data::provider(provider)
             .or_else(|| nr_data::provider("qoder"))
-            .unwrap_or_else(|| &nr_core::Json::Object(Default::default()));
+            .unwrap_or(&EMPTY_CONFIG);
         Self {
             provider: provider.to_string(),
             config,
@@ -89,8 +89,8 @@ mod tests {
     fn qoder_executor_base_hooks() {
         use nr_exec_base::base::BaseHooks;
         let executor = QoderExecutor::new("qoder");
-        assert_eq!(executor.provider(), "qoder");
-        assert_eq!(executor.no_auth(), false);
+        assert_eq!(nr_exec_base::BaseHooks::provider(&executor), "qoder");
+        assert_eq!(nr_exec_base::BaseHooks::no_auth(&executor), false);
         assert!(executor.base_urls().len() > 0);
     }
 
@@ -100,3 +100,5 @@ mod tests {
         assert_eq!(executor.provider(), "qoder");
     }
 }
+
+static EMPTY_CONFIG: std::sync::LazyLock<nr_core::Json> = std::sync::LazyLock::new(|| nr_core::Json::Object(Default::default()));
