@@ -1,0 +1,20 @@
+[package]
+name = "nr-cli"
+description = "The `9router` command: starts the server and manages it (port of cli/)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "9router"
+path = "src/main.rs"
+
+[dependencies]
+nr-core.workspace = true
+nr-server.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Debian's rustc. resolver 3 picks the newest dependency versions that build on it.
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/cabrata/9router-rust"
+
+[workspace.dependencies]
+nr-core = { path = "crates/nr-core" }
+nr-data = { path = "crates/nr-data" }
+nr-common = { path = "crates/nr-common" }
+nr-db = { path = "crates/nr-db" }
+nr-translator = { path = "crates/nr-translator" }
+nr-oauth = { path = "crates/nr-oauth" }
+nr-exec-base = { path = "crates/nr-exec-base" }
+nr-exec-binary = { path = "crates/nr-exec-binary" }
+nr-exec-browser = { path = "crates/nr-exec-browser" }
+nr-exec-cli = { path = "crates/nr-exec-cli" }
+nr-exec-ide = { path = "crates/nr-exec-ide" }
+nr-exec-simple = { path = "crates/nr-exec-simple" }
+nr-exec-webchat = { path = "crates/nr-exec-webchat" }
+nr-executors = { path = "crates/nr-executors" }
+nr-engine = { path = "crates/nr-engine" }
+nr-server = { path = "crates/nr-server" }
+
+anyhow = "1"
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
+base64 = "0.22"
+bcrypt = ">=0.15, <0.20"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = ">=4.5, <5", features = ["derive", "env"] }
+futures = "0.3"
+hex = "0.4"
+hmac = "0.12"
+http = "1"
+http-body-util = "0.1"
+indexmap = { version = "2", features = ["serde"] }
+jsonwebtoken = "9"
+maud = { version = "0.27", features = ["axum"] }
+parking_lot = "0.12"
+rand = "0.8"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "socks", "http2", "gzip", "brotli", "deflate", "zstd", "multipart", "cookies"] }
+rusqlite = { version = ">=0.32, <0.42", features = ["bundled", "serde_json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.dev]
+# Smaller, faster builds on the 4-core dev box.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+strip = true

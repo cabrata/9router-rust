@@ -1,0 +1,156 @@
+{
+ "source": "open-sse/config/errorConfig.js",
+ "exports": {
+  "BACKOFF_CONFIG": {
+   "base": 2000,
+   "max": 300000,
+   "maxLevel": 15
+  },
+  "COOLDOWN_MS": {
+   "unauthorized": 120000,
+   "paymentRequired": 120000,
+   "notFound": 120000,
+   "transient": 30000,
+   "requestNotAllowed": 5000
+  },
+  "DEFAULT_ERROR_MESSAGES": {
+   "400": "Bad request",
+   "401": "Invalid API key provided",
+   "402": "Payment required",
+   "403": "You exceeded your current quota",
+   "404": "Model not found",
+   "406": "Model not supported",
+   "429": "Rate limit exceeded",
+   "500": "Internal server error",
+   "502": "Bad gateway - upstream provider error",
+   "503": "Service temporarily unavailable",
+   "504": "Gateway timeout"
+  },
+  "ERROR_RULES": [
+   {
+    "provider": "codex",
+    "text": "model is not supported when using codex with a chatgpt account",
+    "cooldownMs": 1800000
+   },
+   {
+    "provider": "codebuddy-intl",
+    "text": "request illegal",
+    "backoff": true
+   },
+   {
+    "provider": "codebuddy-intl",
+    "text": "conversation id missing",
+    "backoff": true
+   },
+   {
+    "text": "no credentials",
+    "cooldownMs": 120000
+   },
+   {
+    "text": "request not allowed",
+    "cooldownMs": 5000
+   },
+   {
+    "text": "improperly formed request",
+    "cooldownMs": 120000
+   },
+   {
+    "text": "rate limit",
+    "backoff": true
+   },
+   {
+    "text": "too many requests",
+    "backoff": true
+   },
+   {
+    "text": "quota exceeded",
+    "backoff": true
+   },
+   {
+    "text": "insufficient credit",
+    "backoff": true
+   },
+   {
+    "text": "credit balance is too low",
+    "backoff": true
+   },
+   {
+    "text": "capacity",
+    "backoff": true
+   },
+   {
+    "text": "overloaded",
+    "backoff": true
+   },
+   {
+    "status": 401,
+    "cooldownMs": 120000
+   },
+   {
+    "status": 402,
+    "cooldownMs": 120000
+   },
+   {
+    "status": 403,
+    "cooldownMs": 120000
+   },
+   {
+    "status": 404,
+    "cooldownMs": 120000
+   },
+   {
+    "status": 429,
+    "backoff": true
+   }
+  ],
+  "ERROR_TYPES": {
+   "400": {
+    "type": "invalid_request_error",
+    "code": "bad_request"
+   },
+   "401": {
+    "type": "authentication_error",
+    "code": "invalid_api_key"
+   },
+   "402": {
+    "type": "billing_error",
+    "code": "payment_required"
+   },
+   "403": {
+    "type": "permission_error",
+    "code": "insufficient_quota"
+   },
+   "404": {
+    "type": "invalid_request_error",
+    "code": "model_not_found"
+   },
+   "406": {
+    "type": "invalid_request_error",
+    "code": "model_not_supported"
+   },
+   "429": {
+    "type": "rate_limit_error",
+    "code": "rate_limit_exceeded"
+   },
+   "500": {
+    "type": "server_error",
+    "code": "internal_server_error"
+   },
+   "502": {
+    "type": "server_error",
+    "code": "bad_gateway"
+   },
+   "503": {
+    "type": "server_error",
+    "code": "service_unavailable"
+   },
+   "504": {
+    "type": "server_error",
+    "code": "gateway_timeout"
+   }
+  },
+  "MAX_RATE_LIMIT_COOLDOWN_MS": 1800000,
+  "TRANSIENT_COOLDOWN_MS": 30000
+ },
+ "functions": []
+}

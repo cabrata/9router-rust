@@ -1,0 +1,48 @@
+{
+ "source": "open-sse/providers/shared.js",
+ "exports": {
+  "ANTHROPIC_API_VERSION": "2023-06-01",
+  "ANTHROPIC_COMPAT_BASE": "https://api.anthropic.com/v1",
+  "ANTIGRAVITY_IDE_BASE_URL": "https://daily-cloudcode-pa.googleapis.com",
+  "ANTIGRAVITY_IDE_USER_AGENT": "antigravity/hub/2.24.0 darwin/arm64",
+  "ANTIGRAVITY_IDE_VERSION": "2.24.0",
+  "ANTIGRAVITY_OAUTH_CLIENT": {
+   "clientId": "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+   "clientSecret": "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"
+  },
+  "CLAUDE_API_HEADERS": {
+   "Anthropic-Version": "2023-06-01",
+   "Anthropic-Beta": "claude-code-20250219,interleaved-thinking-2025-05-14"
+  },
+  "CLAUDE_CLI_SPOOF_HEADERS": {
+   "Anthropic-Version": "2023-06-01",
+   "Anthropic-Beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28",
+   "Anthropic-Dangerous-Direct-Browser-Access": "true",
+   "User-Agent": "claude-cli/2.1.280 (external, sdk-cli)",
+   "X-App": "cli",
+   "X-Stainless-Helper-Method": "stream",
+   "X-Stainless-Retry-Count": "0",
+   "X-Stainless-Runtime-Version": "v24.14.0",
+   "X-Stainless-Package-Version": "0.80.0",
+   "X-Stainless-Runtime": "node",
+   "X-Stainless-Lang": "js",
+   "X-Stainless-Arch": "x64",
+   "X-Stainless-Os": "Linux",
+   "X-Stainless-Timeout": "600"
+  },
+  "CLAUDE_CLI_VERSION": "2.1.280",
+  "GOOGLE_OAUTH_CLIENT": {
+   "clientId": "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
+   "clientSecret": "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"
+  },
+  "KIMI_CODING_BASE_URL": "https://api.kimi.com/coding/v1/messages",
+  "OPENAI_COMPAT_BASE": "https://api.openai.com/v1"
+ },
+ "functions": [
+  "mapStainlessArch",
+  "mapStainlessOs",
+  "mergeAnthropicBeta",
+  "selectAnthropicBeta",
+  "wantsThinkingSummaries"
+ ]
+}

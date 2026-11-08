@@ -1,0 +1,7 @@
+{
+ "source": "open-sse/providers/visionPatterns.js",
+ "exports": {},
+ "functions": [
+  "looksLikeVisionModel"
+ ]
+}

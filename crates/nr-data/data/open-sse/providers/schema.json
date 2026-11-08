@@ -1,0 +1,62 @@
+{
+ "source": "open-sse/providers/schema.js",
+ "exports": {
+  "ENDPOINT_DEFAULTS": {
+   "openai": {
+    "chat": "/chat/completions",
+    "test": "/models",
+    "models": "/models"
+   },
+   "claude": {
+    "chat": "/messages",
+    "test": "/models",
+    "countTokens": "/messages/count_tokens"
+   },
+   "gemini": {
+    "chat": "/{model}:streamGenerateContent",
+    "models": "/models",
+    "test": "/models"
+   }
+  },
+  "PROVIDER_DEFAULTS": {
+   "baseUrl": "",
+   "format": "openai",
+   "headers": {},
+   "auth": {
+    "header": "Authorization",
+    "scheme": "bearer",
+    "source": [
+     "accessToken",
+     "apiKey"
+    ]
+   },
+   "forceStream": false,
+   "urlSuffix": "",
+   "quirks": {},
+   "passthroughModels": false,
+   "retry": {
+    "429": {
+     "attempts": 0,
+     "delayMs": 0
+    },
+    "502": {
+     "attempts": 3,
+     "delayMs": 3000
+    },
+    "503": {
+     "attempts": 3,
+     "delayMs": 2000
+    },
+    "504": {
+     "attempts": 2,
+     "delayMs": 3000
+    }
+   },
+   "timeoutMs": 60000,
+   "executor": "default"
+  }
+ },
+ "functions": [
+  "resolveProvider"
+ ]
+}

@@ -1,0 +1,42 @@
+{
+ "source": "open-sse/translator/schema/finishReasons.js",
+ "exports": {
+  "CLAUDE_STOP": {
+   "END_TURN": "end_turn",
+   "MAX_TOKENS": "max_tokens",
+   "TOOL_USE": "tool_use",
+   "STOP_SEQUENCE": "stop_sequence",
+   "REFUSAL": "refusal"
+  },
+  "GEMINI_FINISH": {
+   "STOP": "STOP",
+   "MAX_TOKENS": "MAX_TOKENS",
+   "SAFETY": "SAFETY",
+   "RECITATION": "RECITATION",
+   "BLOCKLIST": "BLOCKLIST",
+   "PROHIBITED_CONTENT": "PROHIBITED_CONTENT",
+   "MALFORMED_FUNCTION_CALL": "MALFORMED_FUNCTION_CALL",
+   "UNEXPECTED_TOOL_CALL": "UNEXPECTED_TOOL_CALL",
+   "OTHER": "OTHER"
+  },
+  "NO_RETRY_EMPTY_FINISH": [
+   "content_filter"
+  ],
+  "OPENAI_FINISH": {
+   "STOP": "stop",
+   "LENGTH": "length",
+   "TOOL_CALLS": "tool_calls",
+   "CONTENT_FILTER": "content_filter"
+  },
+  "RESPONSES_INCOMPLETE_REASON": {
+   "MAX_OUTPUT_TOKENS": "max_output_tokens",
+   "CONTENT_FILTER": "content_filter"
+  },
+  "RESPONSES_STATUS": {
+   "COMPLETED": "completed",
+   "INCOMPLETE": "incomplete",
+   "FAILED": "failed"
+  }
+ },
+ "functions": []
+}

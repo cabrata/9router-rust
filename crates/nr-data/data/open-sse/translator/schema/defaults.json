@@ -1,0 +1,8 @@
+{
+ "source": "open-sse/translator/schema/defaults.js",
+ "exports": {
+  "DEFAULT_IMAGE_MIME": "image/png",
+  "MODEL_FALLBACK": "unknown"
+ },
+ "functions": []
+}

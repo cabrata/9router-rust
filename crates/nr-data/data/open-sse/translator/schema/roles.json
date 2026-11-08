@@ -1,0 +1,17 @@
+{
+ "source": "open-sse/translator/schema/roles.js",
+ "exports": {
+  "GEMINI_ROLE": {
+   "USER": "user",
+   "MODEL": "model"
+  },
+  "ROLE": {
+   "USER": "user",
+   "ASSISTANT": "assistant",
+   "TOOL": "tool",
+   "SYSTEM": "system",
+   "DEVELOPER": "developer"
+  }
+ },
+ "functions": []
+}

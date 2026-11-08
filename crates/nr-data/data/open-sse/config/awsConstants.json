@@ -1,0 +1,60 @@
+{
+ "source": "open-sse/config/awsConstants.js",
+ "exports": {
+  "AWS_CREDENTIAL_MODE": {
+   "STATIC": "static",
+   "PROFILE": "profile"
+  },
+  "AWS_CREDENTIAL_NO_EXPIRY_TTL_MS": 60000,
+  "AWS_CREDENTIAL_PROVIDERS_MODULE": "@aws-sdk/credential-providers",
+  "AWS_CREDENTIAL_REFRESH_LEAD_MS": 300000,
+  "AWS_CREDENTIAL_RESOLVE_TIMEOUT_MS": 10000,
+  "AWS_EVENTSTREAM": {
+   "maxMessageBytes": 25165824,
+   "maxHeadersBytes": 131072
+  },
+  "AWS_PROFILE_PATTERN": {
+   "__regex": "^[\\w@+.%: -]{1,64}$",
+   "flags": ""
+  },
+  "AWS_REGION_PATTERN": {
+   "__regex": "^[a-z0-9][a-z0-9-]{0,30}$",
+   "flags": ""
+  },
+  "AWS_SIGV4": {
+   "algorithm": "AWS4-HMAC-SHA256",
+   "terminator": "aws4_request",
+   "keyPrefix": "AWS4",
+   "dateHeader": "x-amz-date",
+   "securityTokenHeader": "x-amz-security-token"
+  },
+  "BEDROCK": {
+   "service": "bedrock",
+   "defaultRegion": "us-east-1",
+   "anthropicVersion": "bedrock-2023-05-31",
+   "streamPath": "invoke-with-response-stream",
+   "invokePath": "invoke",
+   "chunkEventName": "chunk",
+   "modelFamilyPatterns": {
+    "claude": {
+     "__regex": "(^|[./])anthropic\\.",
+     "flags": ""
+    },
+    "openai": {
+     "__regex": "(^|[./])xai\\.",
+     "flags": ""
+    }
+   },
+   "modelFamilyHints": {
+    "claude": "an Anthropic model, e.g. \"us.anthropic.claude-sonnet-4-5-20250929-v1:0\"",
+    "openai": "an xAI model, e.g. \"us.xai.grok-4.6\""
+   },
+   "terminalEventType": "message_stop",
+   "probePath": "foundation-models",
+   "probeTimeoutMs": 8000,
+   "errorTypeHeader": "x-amzn-errortype",
+   "accessDeniedErrorType": "AccessDeniedException"
+  }
+ },
+ "functions": []
+}

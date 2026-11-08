@@ -1,0 +1,14 @@
+{
+ "source": "open-sse/config/grokCli.js",
+ "exports": {
+  "GROK_CLI_BASE_URL": "https://cli-chat-proxy.grok.com/v1",
+  "GROK_CLI_CLIENT_IDENTIFIER": "grok-shell",
+  "GROK_CLI_MODEL": "grok-build",
+  "GROK_CLI_PAGER_USER_AGENT": "grok-pager/1.0.44 grok-shell/1.0.44 (linux; x86_64)",
+  "GROK_CLI_USER_AGENT": "grok-shell/1.0.44 (linux; x86_64)",
+  "GROK_CLI_VERSION": "1.0.44"
+ },
+ "functions": [
+  "supportsGrokCliReasoningEffort"
+ ]
+}

@@ -1,0 +1,9 @@
+{
+ "source": "open-sse/config/models.js",
+ "exports": {
+  "MODEL_INFO": {}
+ },
+ "functions": [
+  "getModelInfo"
+ ]
+}

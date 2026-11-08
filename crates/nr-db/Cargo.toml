@@ -1,0 +1,25 @@
+[package]
+name = "nr-db"
+description = "SQLite persistence compatible with the JS build's data.sqlite (port of src/lib/db, usageDb, requestDetailsDb)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nr-core.workspace = true
+nr-data.workspace = true
+chrono.workspace = true
+indexmap.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

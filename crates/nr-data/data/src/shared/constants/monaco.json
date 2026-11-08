@@ -1,0 +1,8 @@
+{
+ "source": "src/shared/constants/monaco.js",
+ "exports": {
+  "MONACO_VERSION": "0.57.0",
+  "MONACO_VS_PATH": "https://cdn.jsdelivr.net/npm/monaco-editor@0.57.0/min/vs"
+ },
+ "functions": []
+}

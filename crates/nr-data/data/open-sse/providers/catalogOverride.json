@@ -1,0 +1,14 @@
+{
+ "source": "open-sse/providers/catalogOverride.js",
+ "exports": {
+  "CATALOG_FILE": "/home/caliph/.9router/model-catalog.json",
+  "CATALOG_RAW_FILE": "/home/caliph/.9router/model-catalog-raw.json",
+  "CATALOG_VERSION": 2
+ },
+ "functions": [
+  "getCatalogLimits",
+  "getCatalogModalities",
+  "installCatalogSource",
+  "invalidateCatalog"
+ ]
+}

@@ -1,0 +1,29 @@
+[package]
+name = "nr-oauth"
+description = "OAuth flows and token refresh (port of src/lib/oauth, open-sse/services/tokenRefresh*, oauthCredentialManager.js)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nr-core.workspace = true
+nr-data.workspace = true
+nr-common.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hex.workspace = true
+hmac.workspace = true
+http.workspace = true
+rand.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true

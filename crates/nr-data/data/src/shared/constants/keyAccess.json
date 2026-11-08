@@ -1,0 +1,19 @@
+{
+ "source": "src/shared/constants/keyAccess.js",
+ "exports": {
+  "KEY_ACCESS_COMBO_OWNER": "combo",
+  "KEY_ACCESS_MAX_ENTRIES": 200,
+  "KEY_ACCESS_MAX_ENTRY_LENGTH": 256,
+  "KEY_ACCESS_PROVIDER_AS_MODEL_KINDS": [
+   "webSearch",
+   "webFetch"
+  ],
+  "KEY_ACCESS_UNRESTRICTED": {
+   "restricted": false,
+   "allow": []
+  }
+ },
+ "functions": [
+  "keyAccessDeniedMessage"
+ ]
+}

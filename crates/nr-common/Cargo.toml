@@ -1,0 +1,23 @@
+[package]
+name = "nr-common"
+description = "Leaf utilities shared by translator, executors and engine (port of open-sse/utils leaf modules, services/provider.js and services/model.js)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nr-core.workspace = true
+nr-data.workspace = true
+base64.workspace = true
+chrono.workspace = true
+hex.workspace = true
+indexmap.workspace = true
+rand.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true

@@ -1,0 +1,3 @@
+[build]
+# The dev box has 4 cores and ~3 GB free RAM; several agents share one target dir.
+jobs = 2

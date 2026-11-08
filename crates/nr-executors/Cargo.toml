@@ -1,0 +1,17 @@
+[package]
+name = "nr-executors"
+description = "Executor registry: provider id → executor (port of open-sse/executors/index.js)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nr-core.workspace = true
+nr-exec-base.workspace = true
+nr-exec-binary.workspace = true
+nr-exec-browser.workspace = true
+nr-exec-cli.workspace = true
+nr-exec-ide.workspace = true
+nr-exec-simple.workspace = true
+nr-exec-webchat.workspace = true

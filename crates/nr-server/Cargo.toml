@@ -1,0 +1,16 @@
+[package]
+name = "nr-server"
+description = "HTTP server: /v1 gateway, /api management API, dashboard UI (port of src/app, src/lib, src/mitm, custom-server.js)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nr-core.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true

@@ -1,0 +1,66 @@
+{
+ "source": "open-sse/providers/models/namePatterns.js",
+ "exports": {
+  "NAME_PATTERNS": [
+   [
+    {
+     "__regex": "^kimi-k(\\d+(?:\\.\\d+)?)(-thinking)?$",
+     "flags": "i"
+    }
+   ],
+   [
+    {
+     "__regex": "^glm-(\\d+(?:\\.\\d+)?)(v)?$",
+     "flags": "i"
+    }
+   ],
+   [
+    {
+     "__regex": "^minimax-m(\\d+(?:\\.\\d+)?)$",
+     "flags": "i"
+    }
+   ],
+   [
+    {
+     "__regex": "^gpt-(.+)$",
+     "flags": "i"
+    }
+   ],
+   [
+    {
+     "__regex": "^gemini-(.+)$",
+     "flags": "i"
+    }
+   ],
+   [
+    {
+     "__regex": "^grok-(.+)$",
+     "flags": "i"
+    }
+   ],
+   [
+    {
+     "__regex": "^deepseek-(.+)$",
+     "flags": "i"
+    }
+   ],
+   [
+    {
+     "__regex": "^qwen([\\d.]+.*)$",
+     "flags": "i"
+    }
+   ]
+  ]
+ },
+ "functions": [
+  "NAME_PATTERNS.0.1",
+  "NAME_PATTERNS.1.1",
+  "NAME_PATTERNS.2.1",
+  "NAME_PATTERNS.3.1",
+  "NAME_PATTERNS.4.1",
+  "NAME_PATTERNS.5.1",
+  "NAME_PATTERNS.6.1",
+  "NAME_PATTERNS.7.1",
+  "deriveModelName"
+ ]
+}

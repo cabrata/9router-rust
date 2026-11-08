@@ -1,0 +1,27 @@
+{
+ "source": "open-sse/translator/schema/streamEvents.js",
+ "exports": {
+  "CLAUDE_DELTA": {
+   "TEXT": "text_delta",
+   "INPUT_JSON": "input_json_delta"
+  },
+  "CLAUDE_EVENT": {
+   "CONTENT_BLOCK_START": "content_block_start",
+   "CONTENT_BLOCK_DELTA": "content_block_delta",
+   "MESSAGE_DELTA": "message_delta"
+  },
+  "RESPONSES_EVENT": {
+   "OUTPUT_ITEM_ADDED": "response.output_item.added",
+   "OUTPUT_ITEM_DONE": "response.output_item.done",
+   "OUTPUT_TEXT_DELTA": "response.output_text.delta",
+   "OUTPUT_TEXT_DONE": "response.output_text.done",
+   "FUNCTION_CALL_ARGUMENTS_DELTA": "response.function_call_arguments.delta",
+   "CUSTOM_TOOL_CALL_INPUT_DELTA": "response.custom_tool_call_input.delta",
+   "COMPLETED": "response.completed",
+   "INCOMPLETE": "response.incomplete",
+   "FAILED": "response.failed"
+  },
+  "RESPONSES_EVENT_PREFIX": "response."
+ },
+ "functions": []
+}

@@ -1,0 +1,66 @@
+{
+ "source": "open-sse/config/mediaConfig.js",
+ "exports": {
+  "BLOCKED_HOSTS": [
+   "localhost",
+   "127.0.0.1",
+   "0.0.0.0",
+   "::1",
+   "169.254.169.254",
+   "metadata.google.internal"
+  ],
+  "FETCH_TIMEOUT_MS": 10000,
+  "IMAGE_SIGNATURES": [
+   {
+    "sig": [
+     137,
+     80,
+     78,
+     71
+    ],
+    "offset": 0,
+    "mime": "image/png"
+   },
+   {
+    "sig": [
+     255,
+     216,
+     255
+    ],
+    "offset": 0,
+    "mime": "image/jpeg"
+   },
+   {
+    "sig": [
+     71,
+     73,
+     70,
+     56
+    ],
+    "offset": 0,
+    "mime": "image/gif"
+   },
+   {
+    "sig": [
+     82,
+     73,
+     70,
+     70
+    ],
+    "offset": 0,
+    "mime": "image/webp",
+    "verifyWebp": true
+   },
+   {
+    "sig": [
+     66,
+     77
+    ],
+    "offset": 0,
+    "mime": "image/bmp"
+   }
+  ],
+  "MAX_IMAGE_BYTES": 10485760
+ },
+ "functions": []
+}

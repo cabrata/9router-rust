@@ -1,0 +1,16 @@
+[package]
+name = "nr-engine"
+description = "Request engine: chatCore, combo/account fallback, streaming, RTK, media handlers (port of open-sse/handlers, services, rtk, utils and src/sse)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+nr-core.workspace = true
+nr-data.workspace = true
+nr-common.workspace = true
+nr-db.workspace = true
+nr-executors.workspace = true
+nr-oauth.workspace = true
+nr-translator.workspace = true

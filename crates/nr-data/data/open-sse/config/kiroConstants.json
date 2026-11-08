@@ -1,0 +1,43 @@
+{
+ "source": "open-sse/config/kiroConstants.js",
+ "exports": {
+  "KIRO_AGENTIC_SUFFIX": "-agentic",
+  "KIRO_AGENTIC_SYSTEM_PROMPT": "# CRITICAL: CHUNKED WRITE PROTOCOL (MANDATORY)\n\nYou MUST follow these rules for ALL file operations. Violation causes server timeouts and task failure.\n\n## ABSOLUTE LIMITS\n- **MAXIMUM 350 LINES** per single write/edit operation - NO EXCEPTIONS\n- **RECOMMENDED 300 LINES** or less for optimal performance\n- **NEVER** write entire files in one operation if >300 lines\n\n## MANDATORY CHUNKED WRITE STRATEGY\n\n### For NEW FILES (>300 lines total):\n1. FIRST: Write initial chunk (first 250-300 lines) using write_to_file/fsWrite\n2. THEN: Append remaining content in 250-300 line chunks using file append operations\n3. REPEAT: Continue appending until complete\n\n### For EDITING EXISTING FILES:\n1. Use surgical edits (apply_diff/targeted edits) - change ONLY what's needed\n2. NEVER rewrite entire files - use incremental modifications\n3. Split large refactors into multiple small, focused edits\n\n### For LARGE CODE GENERATION:\n1. Generate in logical sections (imports, types, functions separately)\n2. Write each section as a separate operation\n3. Use append operations for subsequent sections\n\n## EXAMPLES OF CORRECT BEHAVIOR\n\nCORRECT: Writing a 600-line file\n- Operation 1: Write lines 1-300 (initial file creation)\n- Operation 2: Append lines 301-600\n\nCORRECT: Editing multiple functions\n- Operation 1: Edit function A\n- Operation 2: Edit function B\n- Operation 3: Edit function C\n\nWRONG: Writing 500 lines in single operation -> TIMEOUT\nWRONG: Rewriting entire file to change 5 lines -> TIMEOUT\nWRONG: Generating massive code blocks without chunking -> TIMEOUT\n\n## WHY THIS MATTERS\n- Server has 2-3 minute timeout for operations\n- Large writes exceed timeout and FAIL completely\n- Chunked writes are FASTER and more RELIABLE\n- Failed writes waste time and require retry\n\nREMEMBER: When in doubt, write LESS per operation. Multiple small operations > one large operation.",
+  "KIRO_CODEWHISPERER_TARGET": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+  "KIRO_DEFAULT_PROFILE_ARN": "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX",
+  "KIRO_DEFAULT_PROFILE_ARNS": {
+   "builder-id": "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX",
+   "social": "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+  },
+  "KIRO_ENDPOINT_FALLBACK_STATUSES": [
+   401,
+   403,
+   404
+  ],
+  "KIRO_THINKING_BUDGET_DEFAULT": 16000,
+  "KIRO_THINKING_SUFFIX": "-thinking",
+  "KIRO_TOOL_DESCRIPTION_MAX_LENGTH": 10237,
+  "KIRO_TOOL_ID_MAX_LENGTH": 64,
+  "KIRO_TOOL_NAME_MAX_LENGTH": 64
+ },
+ "functions": [
+  "applyKiroThinkingOverride",
+  "buildKiroAdditionalModelRequestFields",
+  "buildKiroAdditionalModelRequestFieldsForModel",
+  "buildThinkingSystemPrefix",
+  "extractKiroEffortLevel",
+  "isAgenticModel",
+  "isThinkingEnabled",
+  "isThinkingModel",
+  "normalizeKiroUpstreamModelId",
+  "resolveDefaultProfileArn",
+  "resolveKiroEffortPath",
+  "resolveKiroModel",
+  "resolveKiroModelIntent",
+  "resolveKiroThinkingBudget",
+  "stripAgenticSuffix",
+  "stripThinkingSuffix",
+  "supportsKiroAdditionalModelRequestFields",
+  "usesKiroNativeGptEffort"
+ ]
+}

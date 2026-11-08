@@ -1,0 +1,20 @@
+{
+ "source": "open-sse/providers/models/schema.js",
+ "exports": {
+  "MODEL_DEFAULTS": {
+   "kind": "llm",
+   "quotaFamily": "normal",
+   "strip": [],
+   "targetFormat": null
+  }
+ },
+ "functions": [
+  "modelKind",
+  "modelQuotaFamily",
+  "modelStrip",
+  "modelSupportedFormats",
+  "modelTargetFormat",
+  "normalizeModel",
+  "normalizeModelId"
+ ]
+}

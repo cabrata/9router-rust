@@ -1,0 +1,193 @@
+{
+ "source": "open-sse/config/appConstants.js",
+ "exports": {
+  "AG_DEFAULT_TOOLS": [
+   "browser_subagent",
+   "command_status",
+   "find_by_name",
+   "generate_image",
+   "grep_search",
+   "list_dir",
+   "list_resources",
+   "multi_replace_file_content",
+   "notify_user",
+   "read_resource",
+   "read_terminal",
+   "read_url_content",
+   "replace_file_content",
+   "run_command",
+   "search_web",
+   "send_command_input",
+   "task_boundary",
+   "view_content_chunk",
+   "view_file",
+   "write_to_file"
+  ],
+  "AG_TOOL_SUFFIX": "_ide",
+  "ANTIGRAVITY_DEFAULT_SYSTEM": "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.**Absolute paths only****Proactiveness**",
+  "ANTIGRAVITY_HEADERS": {
+   "User-Agent": "antigravity/hub/2.24.0 darwin/arm64"
+  },
+  "ANTIGRAVITY_LOAD_CODE_ASSIST_HEADERS": {
+   "Content-Type": "application/json",
+   "User-Agent": "antigravity/hub/2.24.0 darwin/arm64"
+  },
+  "ANTIGRAVITY_PROMPT_REWRITES": [
+   {
+    "from": "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    "to": ""
+   },
+   {
+    "from": {
+     "__regex": "You are Hermes(?: Agent)?(?:,\\s*(?:an intelligent AI assistant|an AI assistant|an AI agent))?(?:,?\\s*(?:built|created)\\s+by\\s+Nous Research)?\\.",
+     "flags": "gi"
+    },
+    "to": "You are an AI assistant."
+   },
+   {
+    "from": {
+     "__regex": "^x-anthropic-billing-header:[^\\n]*(?:\\r?\\n)*",
+     "flags": "gim"
+    },
+    "to": ""
+   },
+   {
+    "from": {
+     "__regex": "opencode",
+     "flags": "gi"
+    }
+   }
+  ],
+  "CC_DEFAULT_TOOLS": [
+   "Task",
+   "TaskOutput",
+   "TaskStop",
+   "TaskCreate",
+   "TaskGet",
+   "TaskUpdate",
+   "TaskList",
+   "Bash",
+   "Glob",
+   "Grep",
+   "Read",
+   "Edit",
+   "Write",
+   "NotebookEdit",
+   "WebFetch",
+   "WebSearch",
+   "AskUserQuestion",
+   "Skill",
+   "EnterPlanMode",
+   "ExitPlanMode"
+  ],
+  "CLAUDE_SYSTEM_PROMPT": "You are Claude Code, Anthropic's official CLI for Claude.",
+  "CLAUDE_TOOL_SUFFIX": "_ide",
+  "CLIENT_METADATA": {
+   "ideType": 9,
+   "platform": 3,
+   "pluginType": 2
+  },
+  "CLOUD_CODE_API": {
+   "gemini-cli": {
+    "loadCodeAssist": "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    "onboardUser": "https://cloudcode-pa.googleapis.com/v1internal:onboardUser"
+   },
+   "antigravity": {
+    "loadCodeAssist": "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    "onboardUser": "https://cloudcode-pa.googleapis.com/v1internal:onboardUser"
+   }
+  },
+  "CODEX_CLI_VERSION": "0.159.0",
+  "GEMINI_CLI_API_CLIENT": "google-genai-sdk/1.41.0 gl-node/v22.19.0",
+  "GEMINI_CLI_VERSION": "0.34.0",
+  "GITHUB_COPILOT": {
+   "VSCODE_VERSION": "1.110.0",
+   "COPILOT_CHAT_VERSION": "0.38.0",
+   "USER_AGENT": "GitHubCopilotChat/0.38.0",
+   "API_VERSION": "2025-04-01"
+  },
+  "IDE_TYPE": {
+   "UNSPECIFIED": 0,
+   "JETSKI": 10,
+   "ANTIGRAVITY": 9,
+   "PLUGINS": 7
+  },
+  "INTERNAL_REQUEST_HEADER": {
+   "name": "x-request-source",
+   "value": "local"
+  },
+  "LOAD_CODE_ASSIST_HEADERS": {
+   "Content-Type": "application/json",
+   "User-Agent": "google-api-nodejs-client/9.15.1",
+   "X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+   "Client-Metadata": "{\"ideType\":9,\"platform\":3,\"pluginType\":2}"
+  },
+  "LOAD_CODE_ASSIST_METADATA": {
+   "ideType": 9,
+   "platform": 3,
+   "pluginType": 2
+  },
+  "NOUS_ATTRIBUTION": {
+   "hostname": "inference-api.nousresearch.com",
+   "chatCompletionsPath": "/v1/chat/completions",
+   "tags": [
+    "product=9router",
+    "client=9router",
+    "user=9router"
+   ]
+  },
+  "OAUTH_ENDPOINTS": {
+   "google": {
+    "token": "https://oauth2.googleapis.com/token",
+    "auth": "https://accounts.google.com/o/oauth2/auth"
+   },
+   "openai": {
+    "token": "https://auth.openai.com/oauth/token",
+    "auth": "https://auth.openai.com/oauth/authorize"
+   },
+   "anthropic": {
+    "token": "https://api.anthropic.com/v1/oauth/token",
+    "auth": "https://api.anthropic.com/v1/oauth/authorize"
+   },
+   "iflow": {
+    "token": "https://iflow.cn/oauth/token",
+    "auth": "https://iflow.cn/oauth"
+   },
+   "github": {
+    "token": "https://github.com/login/oauth/access_token",
+    "auth": "https://github.com/login/oauth/authorize",
+    "deviceCode": "https://github.com/login/device/code"
+   }
+  },
+  "PLATFORM": {
+   "UNSPECIFIED": 0,
+   "DARWIN_AMD64": 1,
+   "DARWIN_ARM64": 2,
+   "LINUX_AMD64": 3,
+   "LINUX_ARM64": 4,
+   "WINDOWS_AMD64": 5
+  },
+  "PLUGIN_TYPE": {
+   "UNSPECIFIED": 0,
+   "CLOUD_CODE": 1,
+   "GEMINI": 2
+  },
+  "REFRESH_LEAD_MS": {
+   "antigravity": 300000,
+   "claude": 14400000,
+   "codex": 600000,
+   "grok-cli": 300000,
+   "iflow": 86400000,
+   "kimi": 300000,
+   "minimax-code": 600000,
+   "minimax-code-global": 600000
+  }
+ },
+ "functions": [
+  "ANTIGRAVITY_PROMPT_REWRITES.3.to",
+  "buildKimiHeaders",
+  "geminiCLIUserAgent",
+  "getPlatformEnum",
+  "getPlatformUserAgent"
+ ]
+}
