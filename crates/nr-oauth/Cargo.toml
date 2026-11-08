@@ -17,6 +17,7 @@ futures.workspace = true
 hex.workspace = true
 hmac.workspace = true
 http.workspace = true
+parking_lot.workspace = true
 rand.workspace = true
 regex.workspace = true
 reqwest.workspace = true

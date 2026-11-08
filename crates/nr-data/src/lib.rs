@@ -86,6 +86,123 @@ pub fn runtime_u64(name: &str) -> u64 {
     runtime(name).and_then(Json::as_u64).unwrap_or_else(|| panic!("nr-data: runtimeConfig.{name} missing; re-run tools/dump-js-data.mjs"))
 }
 
+// === providers/shared.js functions ===
+
+/// Normalize version separators: hyphen between digits becomes dot
+pub fn normalize_model_id(model_id: &str) -> String {
+    regex::Regex::new(r"(\d)-(\d)").unwrap().replace_all(model_id, "$1.$2").to_string()
+}
+
+/// Model defaults
+pub fn model_defaults() -> serde_json::Value {
+    export("open-sse/providers/models/schema", "MODEL_DEFAULTS")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({
+            "kind": "llm",
+            "quotaFamily": "normal",
+            "strip": [],
+            "targetFormat": null
+        }))
+}
+
+/// Resolve model kind with default
+pub fn model_kind(model: &Json) -> String {
+    model.get("kind")
+        .or_else(|| model.get("type"))
+        .and_then(Json::as_str)
+        .unwrap_or("llm")
+        .to_string()
+}
+
+/// Resolve model quota family with default
+pub fn model_quota_family(model: &Json) -> String {
+    model.get("quotaFamily")
+        .and_then(Json::as_str)
+        .unwrap_or("normal")
+        .to_string()
+}
+
+/// Resolve model strip list
+pub fn model_strip(model: &Json) -> Vec<String> {
+    model.get("strip")
+        .and_then(Json::as_array)
+        .map(|arr| arr.iter().filter_map(Json::as_str).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// Resolve model target format
+pub fn model_target_format(model: &Json) -> Option<String> {
+    model.get("targetFormat").and_then(Json::as_str).map(String::from)
+}
+
+/// Resolve model supported formats
+pub fn model_supported_formats(model: &Json) -> Option<Vec<String>> {
+    model.get("supportedFormats")
+        .and_then(Json::as_array)
+        .map(|arr| arr.iter().filter_map(Json::as_str).map(String::from).collect())
+}
+
+/// Get models for a provider/alias
+pub fn get_provider_models(alias_or_id: &str) -> Vec<Json> {
+    provider_models().get(alias_or_id)
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Get first (default) model for provider/alias
+pub fn get_default_model(alias_or_id: &str) -> Option<String> {
+    get_provider_models(alias_or_id)
+        .first()
+        .and_then(|m| m.get("id").and_then(Json::as_str))
+        .map(String::from)
+}
+
+/// Select Anthropic beta headers based on model
+pub fn select_anthropic_beta(model: &str, body: Option<&Json>) -> String {
+    let wants_summaries = body
+        .and_then(|b| b.get("thinking"))
+        .and_then(|t| t.get("display"))
+        .and_then(Json::as_str)
+        .map(|d| d == "summarized")
+        .unwrap_or(false);
+
+    let mut flags = vec![
+        "claude-code-20250219",
+        "oauth-2025-04-20",
+        "interleaved-thinking-2025-05-14",
+        "context-management-2025-06-27",
+        "prompt-caching-scope-2026-01-05",
+        "structured-outputs-2025-12-15",
+        "fast-mode-2026-02-01",
+        "token-efficient-tools-2026-03-28",
+    ];
+
+    if !wants_summaries {
+        flags.push("redact-thinking-2026-02-12");
+    }
+
+    if model.starts_with("claude-opus") || model.starts_with("claude-sonnet") {
+        flags.push("advanced-tool-use-2025-11-20");
+        flags.push("effort-2025-11-24");
+    }
+
+    flags.join(",")
+}
+
+/// Merge Anthropic beta header flags, removing duplicates
+pub fn merge_anthropic_beta(values: &[&str]) -> String {
+    let mut flags: Vec<&str> = values
+        .iter()
+        .flat_map(|v| v.split(','))
+        .map(|f| f.trim())
+        .filter(|f| !f.is_empty())
+        .collect();
+    flags.sort();
+    flags.dedup();
+    flags.join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4,6 +4,7 @@
 
 pub mod qoder;
 pub mod zed;
+pub mod zed_auth;
 pub mod trae;
 pub mod windsurf;
 pub mod antigravity;

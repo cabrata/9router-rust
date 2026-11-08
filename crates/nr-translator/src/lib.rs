@@ -18,4 +18,8 @@ pub mod state;
 pub mod transformer;
 
 pub use registry::{RequestFn, ResponseFn, Registry, TranslationOptions};
+pub use registry::{translate_request, translate_response, needs_translation, init_state, init_registry};
 pub use state::StreamState;
+
+#[cfg(test)]
+mod tests;

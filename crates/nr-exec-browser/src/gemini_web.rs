@@ -1,5 +1,5 @@
 //! Port of open-sse/executors/gemini-web.js.
-//! Wave-0 stub: delegates to DefaultExecutor until ported.
+//! Not ported yet: delegates to DefaultExecutor (wave-1 placeholder never compiled).
 
 use std::sync::Arc;
 
