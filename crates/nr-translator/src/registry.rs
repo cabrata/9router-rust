@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use nr_core::{Credentials, Json};
+use serde_json::json;
 
 use crate::state::StreamState;
 
@@ -255,8 +256,7 @@ pub fn translate_response(
     // Direct route: target:source pair (e.g., kiro:claude, kiro:openai)
     if let Some(direct_fn) = reg.response_fn(target_format, source_format) {
         let converted = direct_fn(chunk, state);
-        // TODO(dedupe): restoreToolNames on results
-        return converted;
+        return restore_tool_names(converted, state.tool_name_map.as_ref());
     }
 
     // Pivot route: target → openai → source
@@ -285,10 +285,124 @@ pub fn translate_response(
         }
     }
 
-    // TODO(dedupe): restoreToolNames(results, state?.toolNameMap)
-    // TODO: attach OpenAI intermediate results for logging if applicable
+    // Restore sanitized tool names (`mcp__a__b` → `mcp_a_b` in Kiro, suffixed
+    // cloaked names in Claude) so tool calls stream back under the client's
+    // own names. JS: restoreToolNames(results, state?.toolNameMap).
+    restore_tool_names(results, state.tool_name_map.as_ref())
+}
 
-    results
+/// Port of open-sse/utils/opencodeFingerprint.js `restoreToolNames`.
+/// Maps tool call names back through `map` (sanitized → client) across the
+/// shapes clients actually see: Claude content_block_start + message content,
+/// OpenAI Chat Completions delta/message.tool_calls, and Responses
+/// output / output_item.added events.
+fn restore_tool_names(payloads: Vec<Json>, map: Option<&HashMap<String, String>>) -> Vec<Json> {
+    let Some(map) = map.filter(|m| !m.is_empty()) else {
+        return payloads;
+    };
+    payloads.into_iter().map(|p| restore_tool_names_one(p, map)).collect()
+}
+
+fn restore_tool_names_one(payload: Json, map: &HashMap<String, String>) -> Json {
+    let Json::Object(mut out) = payload.clone() else {
+        if let Json::Array(arr) = payload {
+            return Json::Array(arr.into_iter().map(|item| restore_tool_names_one(item, map)).collect());
+        }
+        return payload;
+    };
+
+    // Rename a tool-bearing object's `name` when the map knows it.
+    let rename = |value: &Json| -> Option<Json> {
+        let name = value.get("name").and_then(|v| v.as_str())?;
+        let mapped = map.get(name)?;
+        let mut next = value.clone();
+        next["name"] = json!(mapped);
+        Some(next)
+    };
+    let rename_tagged = |value: &Json, kind: &str| -> Option<Json> {
+        if value.get("type").and_then(|v| v.as_str()) != Some(kind) {
+            return None;
+        }
+        rename(value)
+    };
+    let rename_all = |values: &[Json], kinds: &[&str]| -> Option<Vec<Json>> {
+        let mut changed = false;
+        let mut next: Vec<Json> = Vec::with_capacity(values.len());
+        for value in values {
+            match kinds.iter().find_map(|kind| rename_tagged(value, kind)) {
+                Some(renamed) => {
+                    next.push(renamed);
+                    changed = true;
+                }
+                None => next.push(value.clone()),
+            }
+        }
+        changed.then_some(next)
+    };
+
+    // Claude SSE content_block_start event and Claude message bodies.
+    if let Some(renamed) = out.get("content_block").and_then(|b| rename_tagged(b, "tool_use")) {
+        out.insert("content_block".into(), renamed);
+    }
+    if let Some(content) = out.get("content").and_then(|v| v.as_array()) {
+        if let Some(renamed) = rename_all(content, &["tool_use"]) {
+            out.insert("content".into(), Json::Array(renamed));
+        }
+    }
+
+    // OpenAI Chat Completions: streaming `delta` and non-streaming `message`.
+    if let Some(choices) = out.get("choices").and_then(|v| v.as_array()).cloned() {
+        let mut changed = false;
+        let next: Vec<Json> = choices
+            .into_iter()
+            .map(|choice| {
+                let mut choice = choice;
+                let mut choice_changed = false;
+                for holder in ["delta", "message"] {
+                    let calls = choice
+                        .get(holder)
+                        .and_then(|v| v.get("tool_calls"))
+                        .and_then(|v| v.as_array())
+                        .cloned();
+                    let Some(calls) = calls else { continue };
+                    let mut renamed_calls: Vec<Json> = Vec::with_capacity(calls.len());
+                    let mut call_changed = false;
+                    for call in calls {
+                        match call.get("function").and_then(rename) {
+                            Some(function) => {
+                                let mut call = call;
+                                call["function"] = function;
+                                renamed_calls.push(call);
+                                call_changed = true;
+                            }
+                            None => renamed_calls.push(call),
+                        }
+                    }
+                    if call_changed {
+                        choice[holder]["tool_calls"] = Json::Array(renamed_calls);
+                        choice_changed = true;
+                    }
+                }
+                changed |= choice_changed;
+                choice
+            })
+            .collect();
+        if changed {
+            out.insert("choices".into(), Json::Array(next));
+        }
+    }
+
+    // OpenAI Responses final body (`output[]`) and SSE `response.output_item.*` (`item`).
+    if let Some(output) = out.get("output").and_then(|v| v.as_array()) {
+        if let Some(renamed) = rename_all(output, &["function_call"]) {
+            out.insert("output".into(), Json::Array(renamed));
+        }
+    }
+    if let Some(item) = out.get("item").and_then(|v| rename_tagged(v, "function_call")) {
+        out.insert("item".into(), item);
+    }
+
+    Json::Object(out)
 }
 
 /// Initialize streaming state based on source format.
@@ -306,4 +420,72 @@ pub fn init_state(_source_format: &str) -> StreamState {
     // if _source_format == formats::OPENAI_RESPONSES { ... }
 
     state
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn map() -> HashMap<String, String> {
+        [("mcp_a_b".to_string(), "mcp__a__b".to_string())].into_iter().collect()
+    }
+
+    #[test]
+    fn test_restore_claude_content_block_start() {
+        let chunk = json!({"type": "content_block_start", "content_block": {"type": "tool_use", "name": "mcp_a_b", "id": "t1"}});
+        let restored = restore_tool_names(vec![chunk], Some(&map()));
+        assert_eq!(restored[0]["content_block"]["name"], "mcp__a__b");
+    }
+
+    #[test]
+    fn test_restore_claude_message_content() {
+        let msg = json!({"role": "assistant", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "tool_use", "name": "mcp_a_b", "id": "t1", "input": {}}
+        ]});
+        let restored = restore_tool_names(vec![msg], Some(&map()));
+        assert_eq!(restored[0]["content"][0]["text"], "hi");
+        assert_eq!(restored[0]["content"][1]["name"], "mcp__a__b");
+    }
+
+    #[test]
+    fn test_restore_openai_delta_and_message() {
+        let m = map();
+        let delta = json!({"choices": [{"delta": {"tool_calls": [{"id": "t1", "function": {"name": "mcp_a_b", "arguments": "{}"}}]}}]});
+        let restored = restore_tool_names(vec![delta], Some(&m));
+        assert_eq!(restored[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "mcp__a__b");
+
+        let message = json!({"choices": [{"message": {"tool_calls": [{"id": "t1", "function": {"name": "mcp_a_b", "arguments": "{}"}}]}}]});
+        let restored = restore_tool_names(vec![message], Some(&m));
+        assert_eq!(restored[0]["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "mcp__a__b");
+    }
+
+    #[test]
+    fn test_restore_responses_output_and_item() {
+        let m = map();
+        let body = json!({"output": [{"type": "function_call", "name": "mcp_a_b", "call_id": "c1"}]});
+        let restored = restore_tool_names(vec![body], Some(&m));
+        assert_eq!(restored[0]["output"][0]["name"], "mcp__a__b");
+
+        let event = json!({"type": "response.output_item.added", "item": {"type": "function_call", "name": "mcp_a_b"}});
+        let restored = restore_tool_names(vec![event], Some(&m));
+        assert_eq!(restored[0]["item"]["name"], "mcp__a__b");
+    }
+
+    #[test]
+    fn test_restore_noop_without_map() {
+        let chunk = json!({"type": "content_block_start", "content_block": {"type": "tool_use", "name": "mcp_a_b"}});
+        let restored = restore_tool_names(vec![chunk.clone()], None);
+        assert_eq!(restored[0]["content_block"]["name"], "mcp_a_b");
+        let restored = restore_tool_names(vec![chunk], Some(&HashMap::new()));
+        assert_eq!(restored[0]["content_block"]["name"], "mcp_a_b");
+    }
+
+    #[test]
+    fn test_restore_unknown_names_untouched() {
+        let chunk = json!({"choices": [{"delta": {"tool_calls": [{"id": "t1", "function": {"name": "other"}}]}}]});
+        let restored = restore_tool_names(vec![chunk], Some(&map()));
+        assert_eq!(restored[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "other");
+    }
 }
