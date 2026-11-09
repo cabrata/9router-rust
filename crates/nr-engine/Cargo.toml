@@ -13,6 +13,7 @@ nr-data.workspace = true
 nr-db.workspace = true
 nr-translator.workspace = true
 nr-executors.workspace = true
+nr-exec-base.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 chrono.workspace = true

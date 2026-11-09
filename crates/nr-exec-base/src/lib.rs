@@ -12,6 +12,7 @@ pub mod cline_auth;
 pub mod cline_envelope;
 pub mod machine_id;
 pub mod clinepass_models;
+pub mod project_id;
 
 pub use base::{base_execute, BaseHooks, RetryDelay};
 pub use default_executor::DefaultExecutor;
@@ -21,3 +22,7 @@ pub use clinepass_models::{
 };
 pub use cline_envelope::unwrap_cline_envelope;
 pub use machine_id::get_consistent_machine_id;
+pub use project_id::{
+    get_cached_project_id, get_project_id_for_connection, invalidate_project_id,
+    remove_connection,
+};

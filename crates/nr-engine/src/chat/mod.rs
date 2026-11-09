@@ -244,6 +244,25 @@ async fn execute_on_account(
     let mut credentials = selected.credentials.clone();
     let target_format = target_format_for(&provider, &credentials);
 
+    // Cold miss: both Cloud Code Assist providers refuse a wrapped payload with
+    // an empty project, so fetch the account's real project id before the first
+    // request and persist it for later turns (JS chat.js does the same).
+    if matches!(provider.as_str(), "antigravity" | "gemini-cli")
+        && credentials.psd_str("projectId").filter(|p| !p.trim().is_empty()).is_none()
+    {
+        if let Some(access_token) = credentials.access_token().map(str::to_string) {
+            let connection_id = selected.connection_id.clone();
+            if let Some(project_id) =
+                nr_exec_base::get_project_id_for_connection(&connection_id, &access_token, &provider).await
+            {
+                credentials
+                    .psd_mut()
+                    .insert("projectId".into(), json!(project_id));
+                persist_refreshed_credentials(db, &connection_id, &credentials);
+            }
+        }
+    }
+
     let mut translated_body = if passthrough {
         let mut b = body.clone();
         if let Some(obj) = b.as_object_mut() {
