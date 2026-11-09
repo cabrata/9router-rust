@@ -288,3 +288,100 @@ mod tests {
         assert_eq!(tool_call.get("type"), Some(&Json::String("function".to_string())));
     }
 }
+
+/// JS `fallbackToolCallId(index)`: mint a unique-enough id when a streaming
+/// fragment arrives without one. `Date.now()` keeps it unique per call.
+pub fn fallback_tool_call_id(index: Option<i64>) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    match index {
+        Some(i) => format!("call_{i}_{now}"),
+        None => format!("call_{now}"),
+    }
+}
+
+/// Port of open-sse/utils/streamHelpers.js `ensureStreamToolCallIds`.
+///
+/// OpenAI streaming tool calls arrive as fragments: only the first carries an
+/// `id`, the rest only carry `index`. Minting new ids per fragment aborts strict
+/// OpenAI-compatible clients (#4992) — reuse the id seen for that index instead.
+/// Returns true when any fragment was patched.
+pub fn ensure_stream_tool_call_ids(
+    chunk: &mut Json,
+    seen_ids: &mut std::collections::HashMap<i64, String>,
+) -> bool {
+    let Some(choices) = chunk.get_mut("choices").and_then(|v| v.as_array_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    for choice in choices {
+        let Some(calls) = choice.get_mut("delta").and_then(|d| d.get_mut("tool_calls")).and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for tc in calls.iter_mut() {
+            if !tc.is_object() {
+                continue;
+            }
+            let index = tc.get("index").and_then(|v| v.as_i64());
+            if let Some(id) = tc.get("id").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                if let Some(index) = index {
+                    seen_ids.insert(index, id.to_string());
+                }
+                continue;
+            }
+            // No id on this fragment: reuse the one seen for this index, or mint one.
+            let id = match index.and_then(|i| seen_ids.get(&i).cloned()) {
+                Some(known) => known,
+                None => fallback_tool_call_id(index),
+            };
+            tc["id"] = Json::String(id.clone());
+            if let Some(index) = index {
+                seen_ids.insert(index, id);
+            }
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod stream_ids_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_fragments_inherit_id_from_index() {
+        let mut seen = std::collections::HashMap::new();
+        let mut chunk = json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "call_abc", "function": {"name": "f", "arguments": ""}},
+            {"index": 0, "function": {"arguments": "{\"a\":"}},
+            {"index": 0, "function": {"arguments": "1}"}}
+        ]}}]});
+        assert!(ensure_stream_tool_call_ids(&mut chunk, &mut seen));
+        let calls = chunk["choices"][0]["delta"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls[0]["id"], "call_abc");
+        assert_eq!(calls[1]["id"], "call_abc");
+        assert_eq!(calls[2]["id"], "call_abc");
+    }
+
+    #[test]
+    fn test_new_index_gets_minted_id() {
+        let mut seen = std::collections::HashMap::new();
+        let mut chunk = json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 3, "function": {"name": "f", "arguments": ""}}
+        ]}}]});
+        assert!(ensure_stream_tool_call_ids(&mut chunk, &mut seen));
+        let id = chunk["choices"][0]["delta"]["tool_calls"][0]["id"].as_str().unwrap().to_string();
+        assert!(id.starts_with("call_3_"));
+        assert_eq!(seen.get(&3).map(|s| s.as_str()), Some(id.as_str()));
+    }
+
+    #[test]
+    fn test_non_openai_chunk_is_noop() {
+        let mut seen = std::collections::HashMap::new();
+        let mut chunk = json!({"type": "content_block_start"});
+        assert!(!ensure_stream_tool_call_ids(&mut chunk, &mut seen));
+    }
+}

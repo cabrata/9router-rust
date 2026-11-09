@@ -278,15 +278,23 @@ pub fn translate_response(
 ) -> Vec<Json> {
     // Same format: passthrough with stream tool-call ID fixup
     if source_format == target_format {
-        if let Some(chunk) = chunk {
-            // Restore OAuth-cloaked tool names (state.toolNameMap set by cloak_claude_tools).
-            if let Some(map) = state.tool_name_map.as_ref() {
-                let restored = nr_common::claude_cloaking::decloak_stream_chunk(chunk, Some(map));
-                return vec![restored];
+        let Some(chunk) = chunk else { return Vec::new() };
+        let mut result = chunk.clone();
+        // Streaming OpenAI tool calls arrive as fragments; only the first carries
+        // an `id`, the rest only carry `index`. Minting per-fragment ids aborts
+        // strict OpenAI-compatible clients (#4992) — reuse the id for that index.
+        if chunk.get("choices").and_then(|v| v.as_array()).is_some() {
+            let mut chunk = result.clone();
+            if crate::concerns::tool_call::ensure_stream_tool_call_ids(&mut chunk, &mut state.stream_tool_call_ids) {
+                result = chunk;
             }
-            return vec![chunk.clone()];
         }
-        return Vec::new();
+        // Restore OAuth-cloaked tool names (state.toolNameMap set by cloak_claude_tools).
+        if let Some(map) = state.tool_name_map.as_ref() {
+            let restored = nr_common::claude_cloaking::decloak_stream_chunk(&result, Some(map));
+            return vec![restored];
+        }
+        return vec![result];
     }
 
     let reg = global_registry();
@@ -466,6 +474,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+
     fn map() -> HashMap<String, String> {
         [("mcp_a_b".to_string(), "mcp__a__b".to_string())].into_iter().collect()
     }
@@ -527,12 +536,7 @@ mod tests {
         let restored = restore_tool_names(vec![chunk], Some(&map()));
         assert_eq!(restored[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "other");
     }
-}
 
-#[cfg(test)]
-mod pipeline_tests {
-    use super::*;
-    use serde_json::json;
 
     #[test]
     fn test_detect_client_last_role_shapes() {
@@ -582,5 +586,27 @@ mod pipeline_tests {
         assert_eq!(out["messages"][0]["role"], "system");
         assert_eq!(out["messages"][1]["content"], "hi");
         assert_eq!(out["store"], true);
+    }
+
+
+    #[test]
+    fn test_passthrough_mints_shared_ids_for_index_fragments() {
+        let mut state = StreamState::default();
+        let chunk = json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "call_abc", "function": {"name": "f", "arguments": ""}},
+            {"index": 0, "function": {"arguments": "{}"}}
+        ]}}]});
+        let out = translate_response("openai", "openai", Some(&chunk), &mut state);
+        let calls = out[0]["choices"][0]["delta"]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls[0]["id"], "call_abc");
+        assert_eq!(calls[1]["id"], "call_abc");
+    }
+
+    #[test]
+    fn test_passthrough_no_choices_untouched() {
+        let mut state = StreamState::default();
+        let chunk = json!({"type": "content_block_start"});
+        let out = translate_response("openai", "openai", Some(&chunk), &mut state);
+        assert_eq!(out[0], chunk);
     }
 }
