@@ -296,7 +296,7 @@ mod tests {
         // Verify the insert was committed
         let result = db.query_row(
             "SELECT value FROM _meta WHERE key = 'tx_test'",
-            [],
+            &[],
             |row| row.get::<_, String>(0),
         ).unwrap();
         assert_eq!(result, Some("tx_value".to_string()));
@@ -317,7 +317,7 @@ mod tests {
         // Verify the insert was rolled back
         let result = db.query_row(
             "SELECT value FROM _meta WHERE key = 'rollback_test'",
-            [],
+            &[],
             |row| row.get::<_, String>(0),
         ).unwrap();
         assert_eq!(result, None);

@@ -45,7 +45,7 @@ impl OAuthProvider for WindsurfProvider {
 
     async fn exchange_token(
         &self,
-        config: &Json,
+        _config: &Json,
         code: &str,
         _redirect_uri: &str,
         _code_verifier: Option<&str>,

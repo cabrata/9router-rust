@@ -69,7 +69,7 @@ impl OAuthProvider for GrokCliProvider {
         Ok(Json::Object(result))
     }
 
-    async fn post_exchange(&self, tokens: &Json, _meta: Option<&Json>, _log: &Logger) -> Result<Option<Json>> {
+    async fn post_exchange(&self, _tokens: &Json, _meta: Option<&Json>, _log: &Logger) -> Result<Option<Json>> {
         // TODO: Fetch user info from cli-chat-proxy.grok.com/v1/user with Bearer token
         Ok(Some(json!({ "user": serde_json::Value::Null })))
     }

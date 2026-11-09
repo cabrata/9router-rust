@@ -297,7 +297,7 @@ pub fn create_provider_connection(db: &Db, data: &Value) -> Result<Value> {
 
                 // Find matching connection based on workspace ID or username
                 if let Some(incoming_ws) = data.get("providerSpecificData").and_then(|psd| psd.get("chatgptAccountId")).and_then(|v| v.as_str()) {
-                    for conn in conns {
+                    for conn in &conns {
                         if let Some(existing_ws) = conn.get("providerSpecificData").and_then(|psd| psd.get("chatgptAccountId")).and_then(|v| v.as_str()) {
                             if incoming_ws == existing_ws {
                                 existing_option = Some(conn.clone());
@@ -310,7 +310,7 @@ pub fn create_provider_connection(db: &Db, data: &Value) -> Result<Value> {
                 // If no ws match, try username match
                 if existing_option.is_none() {
                     if let Some(incoming_username) = data.get("providerSpecificData").and_then(|psd| psd.get("username")).and_then(|v| v.as_str()) {
-                        for conn in conns {
+                        for conn in &conns {
                             if let Some(existing_username) = conn.get("providerSpecificData").and_then(|psd| psd.get("username")).and_then(|v| v.as_str()) {
                                 if incoming_username == existing_username {
                                     existing_option = Some(conn.clone());
@@ -323,7 +323,7 @@ pub fn create_provider_connection(db: &Db, data: &Value) -> Result<Value> {
 
                 // If still no match and no workspace/username on incoming, take bare email match
                 if existing_option.is_none() {
-                    for conn in conns {
+                    for conn in &conns {
                         if !data.get("providerSpecificData").and_then(|psd| psd.get("chatgptAccountId")).is_some()
                             && !data.get("providerSpecificData").and_then(|psd| psd.get("username")).is_some()
                             && !conn.get("providerSpecificData").and_then(|psd| psd.get("chatgptAccountId")).is_some()

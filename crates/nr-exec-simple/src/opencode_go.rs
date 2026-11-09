@@ -20,13 +20,12 @@ static EMPTY: LazyLock<Json> = LazyLock::new(|| Json::Object(Default::default())
 /// Translate a session ID to opencode-go format.
 fn translate_session_id(session_id: &str, client_tool: &str) -> String {
     use sha2::{Sha256, Digest};
-    use hex::ToHex;
 
     let key = format!("opencode-go\0{}\0{}", client_tool, session_id);
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
     let digest = hasher.finalize();
-    let hex: String = digest[..16].to_hex();
+    let hex: String = hex::encode(&digest[..16]);
     format!("ses_{}", hex)
 }
 
@@ -77,7 +76,7 @@ impl OpencodeGoExecutor {
 
         // Try to get native session from headers
         if let Some(native) = native_session(&creds) {
-            creds.insert(SESSION_FIELD.to_string(), Json::String(native));
+            creds.set(SESSION_FIELD, Json::String(native));
             return creds;
         }
 
@@ -87,7 +86,7 @@ impl OpencodeGoExecutor {
             .unwrap_or_else(|| "default-session".to_string());
 
         let translated = translate_session_id(&resolved, client_tool.unwrap_or("generic"));
-        creds.insert(SESSION_FIELD.to_string(), Json::String(translated));
+        creds.set(SESSION_FIELD, Json::String(translated));
         creds
     }
 }
@@ -155,8 +154,9 @@ impl Executor for OpencodeGoExecutor {
         );
 
         // Execute through base executor with prepared credentials
+        let mut req_creds = credentials;
         base_execute(self, ExecRequest {
-            credentials: &credentials,
+            credentials: &mut req_creds,
             ..req
         }).await
     }

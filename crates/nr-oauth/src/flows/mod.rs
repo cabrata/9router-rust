@@ -78,7 +78,9 @@ impl MappedTokens {
 /// Port of DeviceCodeResponse from JS src/lib/oauth/services.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeviceCodeResponse {
+    #[serde(rename = "deviceCode")]
     pub device_code: String,
+    #[serde(rename = "userCode")]
     pub user_code: String,
 
     #[serde(rename = "verificationUri")]
@@ -141,6 +143,7 @@ mod tests {
             verification_uri_complete: Some("https://example.com/verify?code=ABC123".to_string()),
             expires_in: 600,
             interval: 5,
+            extra: None,
         };
 
         let json = serde_json::to_value(&resp).unwrap();

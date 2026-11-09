@@ -17,7 +17,7 @@ use uuid::Uuid;
 const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
 
 /// Count user turns in a Responses `input` array (≈ user messages).
-fn count_user_turns(input: Option<&Json>) -> usize {
+pub(crate) fn count_user_turns(input: Option<&Json>) -> usize {
     let Some(arr) = input.and_then(Json::as_array) else {
         return 1;
     };
@@ -324,15 +324,18 @@ impl BaseHooks for GrokCliExecutor {
         b.as_object_mut().map(|o| o.shift_remove("reasoning_effort"));
 
         // Include encrypted reasoning in response
-        if let Some(reasoning) = b.get("reasoning").and_then(Json::as_object) {
-            if reasoning.get("effort").and_then(Json::as_str).unwrap_or("") != "none" {
-                let include = b
-                    .get_mut("include")
-                    .and_then(|i| i.as_array_mut())
-                    .unwrap_or_else(|| {
-                        b["include"] = Json::Array(Vec::new());
-                        b.get_mut("include").unwrap().as_array_mut().unwrap()
-                    });
+        let needs_reasoning = b.get("reasoning")
+            .and_then(Json::as_object)
+            .and_then(|r| r.get("effort"))
+            .and_then(Json::as_str)
+            .map(|e| e != "none")
+            .unwrap_or(false);
+
+        if needs_reasoning {
+            if b.get("include").is_none() {
+                b["include"] = Json::Array(Vec::new());
+            }
+            if let Some(include) = b.get_mut("include").and_then(|i| i.as_array_mut()) {
                 if !include.iter().any(|i| i.as_str() == Some("reasoning.encrypted_content")) {
                     include.push(Json::String("reasoning.encrypted_content".into()));
                 }

@@ -57,7 +57,7 @@ impl OAuthProvider for XaiProvider {
         &self,
         config: &Json,
         code: &str,
-        redirect_uri: &str,
+        _redirect_uri: &str,
         code_verifier: Option<&str>,
         _state: Option<&str>,
         _meta: Option<&Json>,

@@ -55,23 +55,26 @@ fn encode_fingerprint(slots: &[serde_json::Value]) -> String {
     BASE64_STANDARD.encode(json_str.as_bytes())
 }
 
+static SCRIPT_CANDIDATES: &[&str] = &[
+    "https://chatgpt.com/cdn/assets/685809.dec86dcdc1.js",
+    "https://chatgpt.com/cdn/assets/399565.a1117ca8b4.js",
+];
+static DOCUMENT_KEYS: &[&str] = &[
+    "cookie", "domain", "readyState", "title", "URL", "charset", "location",
+];
+static WINDOW_KEYS: &[&str] = &[
+    "caches", "crypto", "fetch", "indexedDB", "localStorage", "origin",
+];
+static NAV_PROTOTYPE: &[&str] = &["userAgent", "language", "hardwareConcurrency"];
+
 /// Build the 24-slot fingerprint array.
 fn build_fingerprint(user_agent: &str) -> Vec<serde_json::Value> {
     let mut rng = rand::thread_rng();
-    let script_candidates = vec![
-        "https://chatgpt.com/cdn/assets/685809.dec86dcdc1.js",
-        "https://chatgpt.com/cdn/assets/399565.a1117ca8b4.js",
-    ];
-    let document_keys = vec!["cookie", "domain", "readyState", "title", "URL", "charset", "location"];
-    let window_keys = vec!["caches", "crypto", "fetch", "indexedDB", "localStorage", "origin"];
-    let nav_prototype = vec!["userAgent", "language", "hardwareConcurrency"];
 
-    let pick_str = |list: &[&str]| list[rng.gen_range(0..list.len())];
-
-    let nav_key = pick_str(&nav_prototype);
-    let script = pick_str(&script_candidates);
-    let doc_key = pick_str(&document_keys);
-    let window_key = pick_str(&window_keys);
+    let nav_key = NAV_PROTOTYPE[rng.gen_range(0..NAV_PROTOTYPE.len())];
+    let script = SCRIPT_CANDIDATES[rng.gen_range(0..SCRIPT_CANDIDATES.len())];
+    let doc_key = DOCUMENT_KEYS[rng.gen_range(0..DOCUMENT_KEYS.len())];
+    let window_key = WINDOW_KEYS[rng.gen_range(0..WINDOW_KEYS.len())];
 
     let now = Utc::now().to_rfc2822();
     let uuid = uuid::Uuid::new_v4().to_string();
@@ -127,7 +130,7 @@ pub fn solve_proof_of_work(seed: &str, difficulty: &str, user_agent: &str) -> Re
         let encoded = encode_fingerprint(&slots);
         let hash_input = format!("{}{}", seed, encoded);
         let hash = sentinel_hash(&hash_input);
-        if hash[..difficulty.len()] <= difficulty {
+        if &hash[..difficulty.len()] <= difficulty {
             return Ok(format!("{}{}{}", PROOF_PREFIX, encoded, PROOF_SUFFIX));
         }
     }
@@ -248,10 +251,9 @@ mod tests {
 
     #[test]
     fn test_fnv1a_hash() {
-        // Known FNV-1a hashes for validation
         let hash = sentinel_hash("test");
         assert!(!hash.is_empty());
-        assert_eq!(hash.len(), 8); // 8 hex characters
+        assert_eq!(hash.len(), 8);
     }
 
     #[test]
@@ -265,7 +267,6 @@ mod tests {
     fn test_encode_fingerprint() {
         let fingerprint = vec![json!(1), json!("test"), json!(null)];
         let encoded = encode_fingerprint(&fingerprint);
-        // Base64 should decode back to valid JSON
         let decoded = BASE64_STANDARD.decode(&encoded);
         assert!(decoded.is_ok());
     }

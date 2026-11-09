@@ -35,7 +35,7 @@ impl OAuthProvider for NousProvider {
         _options: Option<&Json>,
         _log: &Logger,
     ) -> Result<DeviceCodeResponse> {
-        let device_code_url = config.get("deviceCodeUrl").and_then(|v| v.as_str())
+        let _device_code_url = config.get("deviceCodeUrl").and_then(|v| v.as_str())
             .unwrap_or("https://portal.nousresearch.com/api/oauth/device/code");
 
         Ok(DeviceCodeResponse {
@@ -63,7 +63,7 @@ impl OAuthProvider for NousProvider {
         Ok(Json::Object(result))
     }
 
-    async fn post_exchange(&self, tokens: &Json, _meta: Option<&Json>, _log: &Logger) -> Result<Option<Json>> {
+    async fn post_exchange(&self, _tokens: &Json, _meta: Option<&Json>, _log: &Logger) -> Result<Option<Json>> {
         // TODO: Mint agent key via POST to agentKeyUrl with Bearer token
         Ok(Some(json!({ "agentKey": serde_json::Value::Null })))
     }

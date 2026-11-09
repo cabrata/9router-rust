@@ -26,7 +26,7 @@ impl OAuthProvider for TraeProvider {
         // TODO: Fetch login guidance, build verification URL with device context
         let client_id = config.get("clientId").and_then(|v| v.as_str()).unwrap_or("");
 
-        let mut params = vec![
+        let params = vec![
             ("client_id", client_id),
             ("auth_callback_url", redirect_uri),
             ("login_trace_id", state),

@@ -3,7 +3,6 @@
 use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json, json::str_of};
-use serde_json::json;
 
 pub struct IFlowProvider;
 
@@ -67,7 +66,7 @@ impl OAuthProvider for IFlowProvider {
         let response = reqwest::Client::new()
             .post(token_url)
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .json(&json!({"grant_type": "authorization_code"}))
+            .body(params)
             .send()
             .await?;
 

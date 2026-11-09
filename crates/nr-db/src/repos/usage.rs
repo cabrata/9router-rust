@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use chrono::Timelike;
+
 // In-memory state for pending requests and stats
 lazy_static::lazy_static! {
     static ref PENDING_REQUESTS: Arc<Mutex<PendingState>> = {
@@ -38,15 +40,15 @@ const PERIOD_MS: &[(&str, u64)] = &[
 ];
 
 fn get_local_date_key(timestamp: Option<i64>) -> String {
-    let ts = if let Some(ts) = timestamp {
-        match chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts) {
-            Ok(dt) => dt,
-            Err(_) => chrono::Utc::now(),
-        }
-    } else {
-        chrono::Utc::now()
+    let ts = match timestamp {
+        Some(ts) => match chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ts) {
+            Some(dt) => dt,
+            None => chrono::Utc::now(),
+        },
+        None => chrono::Utc::now(),
     };
-    ts.format("%Y-%m-%d").to_string()
+    let local: chrono::DateTime<chrono::Local> = ts.into();
+    local.format("%Y-%m-%d").to_string()
 }
 
 /// Mask an API key for display
@@ -72,7 +74,7 @@ pub fn track_pending_request(
     started: bool,
     _error: bool,
 ) -> Result<()> {
-    let state = PENDING_REQUESTS.lock().unwrap();
+    let mut state = PENDING_REQUESTS.lock().unwrap();
     let model_key = if !provider.is_empty() {
         format!("{} ({})", model, provider)
     } else {
@@ -191,7 +193,8 @@ pub async fn save_request_usage(db: &Db, entry: &Value) -> Result<()> {
     let endpoint = entry.get("endpoint").and_then(|v| v.as_str());
     let status = entry.get("status").and_then(|v| v.as_str()).unwrap_or("ok");
 
-    let tokens = entry.get("tokens").unwrap_or(&json!({}));
+    let default_tokens = json!({});
+    let tokens = entry.get("tokens").unwrap_or(&default_tokens);
     let prompt_tokens = tokens
         .get("prompt_tokens")
         .or_else(|| tokens.get("input_tokens"))
@@ -240,13 +243,14 @@ pub async fn save_request_usage(db: &Db, entry: &Value) -> Result<()> {
         }
 
         let tokens_json = stringify_json(tokens);
-        let meta_json = stringify_json(&json!({}));
+        let empty_meta = json!({});
+        let meta_json = stringify_json(&empty_meta);
 
         // Insert new usage history entry
         db.execute_with_params(
             "INSERT INTO usageHistory(timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, tokens, meta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                timestamp.as_str() as &dyn rusqlite::ToSql,
+                timestamp.as_str(),
                 &provider,
                 &model,
                 &connection_id,

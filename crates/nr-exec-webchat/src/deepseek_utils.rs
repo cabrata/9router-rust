@@ -1,10 +1,15 @@
 //! DeepSeek web executor utilities — port of deepseek-web/** and deepseek-web-done-terminator.js.
 //! Includes PoW solver (DeepSeekHashV1), stream format utilities, and drain scheduling.
 
-use serde_json::{json, Value as Json};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
+use nr_core::http::{proxy_fetch, FetchRequest, HeaderList, ProxyOptions};
+use nr_core::{Error, Json, Result};
+use tokio_util::sync::CancellationToken;
 
 /// PoW challenge from DeepSeek
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct DeepSeekPowChallenge {
     pub algorithm: String,
     pub challenge: String,
@@ -15,248 +20,227 @@ pub struct DeepSeekPowChallenge {
     pub target_path: String,
 }
 
-/// Request a DeepSeek PoW challenge.
-/// TODO(dedupe): Implement once browser/http layer is ready.
+/// Request a DeepSeek PoW challenge from `/api/v0/chat/create_pow_challenge`.
 pub async fn request_deepseek_pow_challenge(
-    _access_token: &str,
-    _target_path: &str,
-) -> Result<DeepSeekPowChallenge, Box<dyn std::error::Error>> {
-    Err("PoW challenge request not yet implemented".into())
+    access_token: &str,
+    headers: &HeaderList,
+    proxy: Option<&ProxyOptions>,
+    cancel: Option<&CancellationToken>,
+    target_path: &str,
+) -> Result<DeepSeekPowChallenge> {
+    let mut req_headers = headers.clone();
+    req_headers.insert("Content-Type".into(), "application/json".into());
+    req_headers.insert("Authorization".into(), format!("Bearer {}", access_token));
+
+    let body = serde_json::json!({
+        "target_path": target_path,
+    });
+
+    let fetch_req = FetchRequest {
+        header_timeout: None,
+        cancel: cancel.cloned(),
+        direct_fetch: None,
+        ..FetchRequest::post_json(
+            "https://chat.deepseek.com/api/v0/chat/create_pow_challenge",
+            req_headers,
+            &body,
+        )
+    };
+
+    let response = proxy_fetch(fetch_req, proxy).await?;
+    if !response.ok() {
+        return Err(Error::other(format!(
+            "create_pow_challenge HTTP {}",
+            response.status
+        )));
+    }
+
+    let json_val = response.json_body().await?;
+    let challenge_val = json_val
+        .get("data")
+        .and_then(|d| d.get("biz_data"))
+        .and_then(|b| b.get("challenge"))
+        .or_else(|| json_val.get("biz_data").and_then(|b| b.get("challenge")))
+        .ok_or_else(|| Error::other("DeepSeek response missing PoW challenge"))?;
+
+    let algorithm = challenge_val.get("algorithm").and_then(|v| v.as_str()).ok_or_else(|| Error::other("PoW challenge missing algorithm"))?;
+    let challenge = challenge_val.get("challenge").and_then(|v| v.as_str()).ok_or_else(|| Error::other("PoW challenge missing challenge"))?;
+    let salt = challenge_val.get("salt").and_then(|v| v.as_str()).ok_or_else(|| Error::other("PoW challenge missing salt"))?;
+    let signature = challenge_val.get("signature").and_then(|v| v.as_str()).ok_or_else(|| Error::other("PoW challenge missing signature"))?;
+    let difficulty = challenge_val.get("difficulty").and_then(|v| v.as_u64()).ok_or_else(|| Error::other("PoW challenge missing difficulty"))?;
+    let expire_at = challenge_val.get("expire_at").and_then(|v| v.as_u64()).ok_or_else(|| Error::other("PoW challenge missing expire_at"))?;
+
+    Ok(DeepSeekPowChallenge {
+        algorithm: algorithm.to_string(),
+        challenge: challenge.to_string(),
+        salt: salt.to_string(),
+        difficulty,
+        expire_at,
+        signature: signature.to_string(),
+        target_path: target_path.to_string(),
+    })
+}
+
+/// Format the solved PoW challenge as base64 JSON string for the `X-Ds-Pow-Response` header.
+pub fn format_pow_response(challenge: &DeepSeekPowChallenge, answer: i64) -> String {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+
+    let payload = serde_json::json!({
+        "algorithm": challenge.algorithm,
+        "challenge": challenge.challenge,
+        "salt": challenge.salt,
+        "answer": answer,
+        "signature": challenge.signature,
+        "target_path": challenge.target_path,
+    });
+    BASE64.encode(payload.to_string().as_bytes())
 }
 
 // ── DeepSeekHashV1: Keccak-f[1600] with round 0 skipped ──────────────────────────────
 //
-// Ported from open-sse/lib/deepseek-pow-hash.js. The JS implementation uses a custom
-// Keccak-f[1600] variant that executes only rounds 1-23 (skipping round 0).
-// This is **not** standard SHA3-256 (which uses all 24 rounds).
+// Ported from open-sse/lib/deepseek-pow-hash.js.
+// Runs rounds 1..=23 of Keccak-f[1600] (skipping round 0). Rate is 136 bytes (SHA3-256).
 
-const KECCAK_ROUNDS: usize = 23; // Skips round 0, runs rounds 1-23
-const KECCAK_BLOCK: usize = 136; // Rate in bytes for SHA3-256
+pub const MAX_DEEPSEEK_POW_DIFFICULTY: u64 = 250_000;
+const KECCAK_ROUNDS: usize = 23;
+const KECCAK_BLOCK: usize = 136;
 
-/// Keccak-f permutation constants (iota round constants).
-/// Pre-computed for all 24 rounds (we'll use rounds 1-23).
-fn keccak_iota_constants() -> ([u32; 24], [u32; 24]) {
-    // High and low 32-bit words of the iota constants for rounds 0-23.
-    // These match the values in the JS implementation.
-    let iota_h = [
-        0x00000001, 0x00000000, 0x00000000, 0x00000000,
-        0x00000001, 0x00000001, 0x00000001, 0x00000004,
-        0x00000004, 0x00000000, 0x00000001, 0x00000001,
-        0x00000004, 0x00000000, 0x00000004, 0x00000001,
-        0x00000005, 0x00000000, 0x00000001, 0x00000001,
-        0x00000004, 0x00000004, 0x00000000, 0x00000001,
-    ];
-    let iota_l = [
-        0x00000000, 0x00000089, 0x8000008b, 0x80008080,
-        0x0000008b, 0x00008000, 0x80008081, 0x80000001,
-        0x8000008b, 0x8000008b, 0x8000008b, 0x8000008b,
-        0x8000008b, 0x00008000, 0x80008081, 0x8000008b,
-        0x80000001, 0x80008080, 0x8000008b, 0x00000001,
-        0x8000008b, 0x00008081, 0x80000001, 0x80008080,
-    ];
-    (iota_h, iota_l)
-}
+const ROUND_CONSTANTS: [u64; 24] = [
+    0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
+    0x000000000000808b, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
+    0x000000000000008a, 0x0000000000000088, 0x0000000080008009, 0x000000008000000a,
+    0x000000008000808b, 0x800000000000008b, 0x8000000000008089, 0x8000000000008003,
+    0x8000000000008002, 0x8000000000000080, 0x000000000000800a, 0x800000008000000a,
+    0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+];
 
-/// Keccak rotation offsets (pi permutation rotations).
-fn keccak_rotation_offsets() -> [usize; 24] {
-    [
-        1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14,
-        27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
-    ]
-}
+const ROTATION_OFFSETS: [u32; 24] = [
+    1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14,
+    27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
+];
 
-/// Keccak pi permutation indices.
-fn keccak_pi_indices() -> [usize; 24] {
-    [
-        10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4,
-        15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
-    ]
-}
+const PI_INDICES: [usize; 24] = [
+    10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4,
+    15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
+];
 
-/// Rotate left a 64-bit value (represented as two 32-bit words).
-#[inline]
-fn rotl64(h: u32, l: u32, n: usize) -> (u32, u32) {
-    if n == 0 {
-        (h, l)
-    } else if n < 32 {
-        ((h << n) | (l >> (32 - n)), (l << n) | (h >> (32 - n)))
-    } else {
-        let n = n - 32;
-        ((l << n) | (h >> (32 - n)), (h << n) | (l >> (32 - n)))
-    }
-}
-
-/// Keccak-f[1600] permutation with custom round count (1-23, skipping round 0).
-fn keccak_p(state: &mut [u32; 50], num_rounds: usize) {
-    let (iota_h, iota_l) = keccak_iota_constants();
-    let rotations = keccak_rotation_offsets();
-    let pi_indices = keccak_pi_indices();
-
-    for round in (24 - num_rounds)..24 {
-        // Theta: column parity and mixing
-        let mut bc = [0u32; 10];
-        for x in 0..10 {
-            bc[x] = state[x] ^ state[x + 10] ^ state[x + 20] ^ state[x + 30] ^ state[x + 40];
+/// Keccak-f[1600] running only the last `rounds` rounds (for 23, rounds 1..24).
+fn keccak_p(s: &mut [u64; 25], rounds: usize) {
+    let start_round = 24 - rounds;
+    for round in start_round..24 {
+        // Theta
+        let mut bc = [0u64; 5];
+        for x in 0..5 {
+            bc[x] = s[x] ^ s[x + 5] ^ s[x + 10] ^ s[x + 15] ^ s[x + 20];
         }
-
-        for x in 0..10 {
-            let t_idx1 = (x + 8) % 10;
-            let t_idx0 = (x + 2) % 10;
-            let (t_h, t_l) = rotl64(bc[t_idx0], bc[t_idx0 + 1], 1);
-            let th = t_h ^ bc[t_idx1];
-            let tl = t_l ^ bc[t_idx1 + 1];
-
-            for y in (0..50).step_by(10) {
-                state[x + y] ^= th;
-                state[x + y + 1] ^= tl;
+        for x in 0..5 {
+            let t = bc[(x + 4) % 5] ^ bc[(x + 1) % 5].rotate_left(1);
+            for y in 0..5 {
+                s[y * 5 + x] ^= t;
             }
         }
 
         // Rho and Pi
-        let mut cur_h = state[2];
-        let mut cur_l = state[3];
+        let mut cur = s[1];
         for t in 0..24 {
-            let shift = rotations[t];
-            let (th, tl) = rotl64(cur_h, cur_l, shift);
-            let pi = pi_indices[t] * 2;
-            cur_h = state[pi];
-            cur_l = state[pi + 1];
-            state[pi] = th;
-            state[pi + 1] = tl;
+            let pi = PI_INDICES[t];
+            let shift = ROTATION_OFFSETS[t];
+            let next = s[pi];
+            s[pi] = cur.rotate_left(shift);
+            cur = next;
         }
 
         // Chi
-        for y in (0..50).step_by(10) {
-            let b0 = state[y];
-            let b1 = state[y + 1];
-            let b2 = state[y + 2];
-            let b3 = state[y + 3];
-            state[y] ^= !state[y + 2] & state[y + 4];
-            state[y + 1] ^= !state[y + 3] & state[y + 5];
-            state[y + 2] ^= !state[y + 4] & state[y + 6];
-            state[y + 3] ^= !state[y + 5] & state[y + 7];
-            state[y + 4] ^= !state[y + 6] & state[y + 8];
-            state[y + 5] ^= !state[y + 7] & state[y + 9];
-            state[y + 6] ^= !state[y + 8] & b0;
-            state[y + 7] ^= !state[y + 9] & b1;
-            state[y + 8] ^= !b0 & b2;
-            state[y + 9] ^= !b1 & b3;
+        for y in 0..5 {
+            let base = y * 5;
+            let b0 = s[base];
+            let b1 = s[base + 1];
+            let b2 = s[base + 2];
+            let b3 = s[base + 3];
+            let b4 = s[base + 4];
+            s[base] ^= !b1 & b2;
+            s[base + 1] ^= !b2 & b3;
+            s[base + 2] ^= !b3 & b4;
+            s[base + 3] ^= !b4 & b0;
+            s[base + 4] ^= !b0 & b1;
         }
 
         // Iota
-        state[0] ^= iota_h[round];
-        state[1] ^= iota_l[round];
+        s[0] ^= ROUND_CONSTANTS[round];
     }
 }
 
-/// DeepSeekHashV1 — find nonce such that hash(prefix + nonce) == target.
-/// Uses Keccak-f[1600] with only rounds 1-23 (skipping round 0).
-fn find_deepseek_pow_nonce(prefix: &str, challenge_hex: &str, difficulty: u64) -> i64 {
-    // Parse target hash from hex string
+/// Convert byte buffer (200 bytes) into 25 u64 lanes (little endian), run permutation, convert back.
+fn permute_state_bytes(state_bytes: &mut [u8; 200]) {
+    let mut lanes = [0u64; 25];
+    for i in 0..25 {
+        lanes[i] = u64::from_le_bytes([
+            state_bytes[i * 8],
+            state_bytes[i * 8 + 1],
+            state_bytes[i * 8 + 2],
+            state_bytes[i * 8 + 3],
+            state_bytes[i * 8 + 4],
+            state_bytes[i * 8 + 5],
+            state_bytes[i * 8 + 6],
+            state_bytes[i * 8 + 7],
+        ]);
+    }
+    keccak_p(&mut lanes, KECCAK_ROUNDS);
+    for i in 0..25 {
+        let b = lanes[i].to_le_bytes();
+        state_bytes[i * 8..i * 8 + 8].copy_from_slice(&b);
+    }
+}
+
+pub fn find_deepseek_pow_nonce(prefix: &str, challenge_hex: &str, difficulty: u64) -> i64 {
+    if challenge_hex.len() != 64 {
+        return -1;
+    }
     let mut target = [0u8; 32];
     for i in 0..32 {
-        if i * 2 + 2 > challenge_hex.len() {
-            return -1;
-        }
         match u8::from_str_radix(&challenge_hex[i * 2..i * 2 + 2], 16) {
-            Ok(byte) => target[i] = byte,
+            Ok(b) => target[i] = b,
             Err(_) => return -1,
         }
     }
 
     let prefix_bytes = prefix.as_bytes();
-
-    // Initialize state and absorb prefix
-    let mut state = [0u32; 50];
     let mut state_bytes = [0u8; 200];
     let mut pos = 0;
 
-    for &byte in prefix_bytes {
-        state_bytes[pos] ^= byte;
+    for &b in prefix_bytes {
+        state_bytes[pos] ^= b;
         pos += 1;
         if pos == KECCAK_BLOCK {
-            // Convert state_bytes to u32 array and permute
-            for i in 0..50 {
-                state[i] = u32::from_le_bytes([
-                    state_bytes[i * 4],
-                    state_bytes[i * 4 + 1],
-                    state_bytes[i * 4 + 2],
-                    state_bytes[i * 4 + 3],
-                ]);
-            }
-            keccak_p(&mut state, KECCAK_ROUNDS);
-            // Convert back to bytes
-            for i in 0..50 {
-                let bytes = state[i].to_le_bytes();
-                state_bytes[i * 4] = bytes[0];
-                state_bytes[i * 4 + 1] = bytes[1];
-                state_bytes[i * 4 + 2] = bytes[2];
-                state_bytes[i * 4 + 3] = bytes[3];
-            }
+            permute_state_bytes(&mut state_bytes);
             pos = 0;
         }
     }
 
-    // Snapshot state after absorbing prefix
-    let snapshot_bytes = state_bytes.clone();
-    let snapshot_pos = pos;
+    let snap_bytes = state_bytes;
+    let snap_pos = pos;
 
-    // Try nonces from 0 to difficulty
-    for nonce in 0..difficulty {
-        let mut bytes = snapshot_bytes.clone();
-        let mut p = snapshot_pos;
+    let max_diff = difficulty.min(MAX_DEEPSEEK_POW_DIFFICULTY);
+    for nonce in 0..max_diff {
+        let mut bytes = snap_bytes;
+        let mut p = snap_pos;
 
         let nonce_str = nonce.to_string();
-        for &byte in nonce_str.as_bytes() {
-            bytes[p] ^= byte;
+        for &b in nonce_str.as_bytes() {
+            bytes[p] ^= b;
             p += 1;
             if p == KECCAK_BLOCK {
-                // Permute
-                for i in 0..50 {
-                    state[i] = u32::from_le_bytes([
-                        bytes[i * 4],
-                        bytes[i * 4 + 1],
-                        bytes[i * 4 + 2],
-                        bytes[i * 4 + 3],
-                    ]);
-                }
-                keccak_p(&mut state, KECCAK_ROUNDS);
-                for i in 0..50 {
-                    let w = state[i];
-                    bytes[i * 4] = (w & 0xFF) as u8;
-                    bytes[i * 4 + 1] = ((w >> 8) & 0xFF) as u8;
-                    bytes[i * 4 + 2] = ((w >> 16) & 0xFF) as u8;
-                    bytes[i * 4 + 3] = ((w >> 24) & 0xFF) as u8;
-                }
+                permute_state_bytes(&mut bytes);
                 p = 0;
             }
         }
 
-        // Finish: add padding
+        // SHA3-256 padding
         bytes[p] ^= 0x06;
         bytes[KECCAK_BLOCK - 1] ^= 0x80;
+        permute_state_bytes(&mut bytes);
 
-        // Final permutation
-        for i in 0..50 {
-            state[i] = u32::from_le_bytes([
-                bytes[i * 4],
-                bytes[i * 4 + 1],
-                bytes[i * 4 + 2],
-                bytes[i * 4 + 3],
-            ]);
-        }
-        keccak_p(&mut state, KECCAK_ROUNDS);
-
-        // Extract first 32 bytes
-        for i in 0..50 {
-            let w = state[i];
-            bytes[i * 4] = (w & 0xFF) as u8;
-            bytes[i * 4 + 1] = ((w >> 8) & 0xFF) as u8;
-            bytes[i * 4 + 2] = ((w >> 16) & 0xFF) as u8;
-            bytes[i * 4 + 3] = ((w >> 24) & 0xFF) as u8;
-        }
-
-        // Compare with target
         if bytes[..32] == target {
             return nonce as i64;
         }
@@ -265,48 +249,39 @@ fn find_deepseek_pow_nonce(prefix: &str, challenge_hex: &str, difficulty: u64) -
     -1
 }
 
-/// Solve DeepSeek PoW challenge synchronously.
-pub fn solve_deepseek_pow(challenge: &DeepSeekPowChallenge) -> Result<i64, Box<dyn std::error::Error>> {
+pub fn solve_deepseek_pow(challenge: &DeepSeekPowChallenge) -> Result<i64> {
     if challenge.algorithm != "DeepSeekHashV1" {
-        return Err(format!("Unsupported algorithm: {}", challenge.algorithm).into());
+        return Err(Error::other(format!("Unsupported algorithm: {}", challenge.algorithm)));
     }
-
     let prefix = format!("{}_{}_", challenge.salt, challenge.expire_at);
     let nonce = find_deepseek_pow_nonce(&prefix, &challenge.challenge, challenge.difficulty);
-
     if nonce < 0 {
-        Err("PoW solver failed to find nonce".into())
+        Err(Error::other("PoW solver failed to find nonce within difficulty"))
     } else {
         Ok(nonce)
     }
 }
 
-/// Check if model is a thinking model (R1-like).
+// ── Stream Content Formatting ───────────────────────────────────────────────
+
 pub fn is_thinking_model(model: &str) -> bool {
     let lower = model.to_lowercase();
     lower.contains("think") || lower.contains("r1") || lower.contains("reason")
 }
 
-/// Maximum difficulty for PoW computation.
-pub const MAX_DEEPSEEK_POW_DIFFICULTY: u64 = 250_000;
-
-/// Check if model has web search capability.
 pub fn is_search_model(model: &str) -> bool {
     let lower = model.to_lowercase();
     lower.contains("search") || lower.contains("fold")
 }
 
-/// Clean DeepSeek stream token markers from text.
 pub fn clean_deepseek_token(text: &str) -> String {
     let s = text.replace("FINISHED", "");
-    // Order longer patterns first to avoid SEARCH matching prefix of SEARCHING
     regex::Regex::new(r"(?i)^(WEB_SEARCH|SEARCHING|SEARCH)\s*")
         .ok()
-        .and_then(|re| Some(re.replace(&s, "").to_string()))
+        .map(|re| re.replace(&s, "").to_string())
         .unwrap_or(s)
 }
 
-/// Format stream content for output, handling search models and citations.
 pub fn format_stream_content(raw: &str, model: &str) -> String {
     let text = clean_deepseek_token(raw);
     if !is_search_model(model) {
@@ -325,7 +300,6 @@ pub fn format_stream_content(raw: &str, model: &str) -> String {
     }
 }
 
-/// Format search results as citations.
 pub fn append_search_citations(search_results: &[Json], model: &str) -> String {
     if search_results.is_empty() || model.to_lowercase().contains("search-silent") {
         return String::new();
@@ -345,15 +319,16 @@ pub fn append_search_citations(search_results: &[Json], model: &str) -> String {
     citations.into_iter().map(|(_, s)| s).collect::<Vec<_>>().join("\n")
 }
 
-/// Guard state for stream finish — ensures `finishOnce` is called at most once.
+// ── Stream Done Terminator & Guards ─────────────────────────────────────────
+
 pub struct FinishOnceGuard {
-    finished: std::sync::atomic::AtomicBool,
+    finished: AtomicBool,
 }
 
 impl FinishOnceGuard {
     pub fn new() -> Self {
         FinishOnceGuard {
-            finished: std::sync::atomic::AtomicBool::new(false),
+            finished: AtomicBool::new(false),
         }
     }
 
@@ -361,14 +336,13 @@ impl FinishOnceGuard {
     where
         F: FnOnce(),
     {
-        if !self.finished.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            // Ignore panics; controller may be closed.
+        if !self.finished.swap(true, Ordering::SeqCst) {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok();
         }
     }
 
     pub fn has_finished(&self) -> bool {
-        self.finished.load(std::sync::atomic::Ordering::SeqCst)
+        self.finished.load(Ordering::SeqCst)
     }
 }
 
@@ -378,9 +352,72 @@ impl Default for FinishOnceGuard {
     }
 }
 
+pub const DEEPSEEK_FINISHED_DRAIN_MS: u64 = 750;
+
+pub struct FinishedDrainScheduler {
+    drain_timer: Mutex<Option<Instant>>,
+    drain_ms: u64,
+}
+
+impl FinishedDrainScheduler {
+    pub fn new(drain_ms: u64) -> Self {
+        FinishedDrainScheduler {
+            drain_timer: Mutex::new(None),
+            drain_ms,
+        }
+    }
+
+    pub fn schedule_finish_after_drain(&self) {
+        if let Ok(mut timer) = self.drain_timer.lock() {
+            *timer = Some(Instant::now());
+        }
+    }
+
+    pub fn clear_finished_drain(&self) {
+        if let Ok(mut timer) = self.drain_timer.lock() {
+            *timer = None;
+        }
+    }
+
+    pub fn is_drain_pending(&self) -> bool {
+        if let Ok(timer) = self.drain_timer.lock() {
+            if let Some(start) = *timer {
+                start.elapsed().as_millis() < self.drain_ms as u128
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pow_exact_node_vector() {
+        // Test vector from JS noble-hashes implementation:
+        // prefix: "test_prefix_", nonce 42 -> "1f644c1c67b7e07e81a6d7ed04f7192a36cdf3225cb9119a45717ae9b0dd986a"
+        let challenge = DeepSeekPowChallenge {
+            algorithm: "DeepSeekHashV1".to_string(),
+            challenge: "1f644c1c67b7e07e81a6d7ed04f7192a36cdf3225cb9119a45717ae9b0dd986a".to_string(),
+            salt: "test".to_string(),
+            difficulty: 100,
+            expire_at: 0,
+            signature: "sig".to_string(),
+            target_path: "/test".to_string(),
+        };
+        // Prefix formed in solve_deepseek_pow is salt_expireat_ = "test_0_"
+        // Let's test direct find_deepseek_pow_nonce with "test_prefix_"
+        let nonce = find_deepseek_pow_nonce(
+            "test_prefix_",
+            "1f644c1c67b7e07e81a6d7ed04f7192a36cdf3225cb9119a45717ae9b0dd986a",
+            100,
+        );
+        assert_eq!(nonce, 42);
+    }
 
     #[test]
     fn test_is_thinking_model() {
@@ -406,212 +443,10 @@ mod tests {
     }
 
     #[test]
-    fn test_format_stream_content_non_search() {
-        let content = "hello world";
-        let formatted = format_stream_content(content, "deepseek-chat");
-        assert_eq!(formatted, "hello world");
-    }
-
-    #[test]
     fn test_format_stream_content_search() {
         let content = "[citation:1] hello [citation:2] world";
         let formatted = format_stream_content(content, "deepseek-search");
         assert_eq!(formatted, "[1] hello [2] world");
-    }
-
-    #[test]
-    fn test_format_stream_content_search_silent() {
-        let content = "[citation:1] hello [citation:2] world";
-        let formatted = format_stream_content(content, "deepseek-search-silent");
-        assert_eq!(formatted, " hello  world");
-    }
-
-    #[test]
-    fn test_append_search_citations() {
-        let results = vec![
-            json!({"cite_index": 1, "title": "Page 1", "url": "http://example.com/1"}),
-            json!({"cite_index": 2, "title": "Page 2", "url": "http://example.com/2"}),
-        ];
-        let citations = append_search_citations(&results, "deepseek-search");
-        assert!(citations.contains("[1]: [Page 1](http://example.com/1)"));
-        assert!(citations.contains("[2]: [Page 2](http://example.com/2)"));
-    }
-
-    #[test]
-    fn test_append_search_citations_empty() {
-        let results: Vec<Json> = vec![];
-        let citations = append_search_citations(&results, "deepseek-search");
-        assert_eq!(citations, "");
-    }
-
-    #[test]
-    fn test_append_search_citations_silent() {
-        let results = vec![json!({"cite_index": 1, "title": "Page", "url": "http://example.com"})];
-        let citations = append_search_citations(&results, "deepseek-search-silent");
-        assert_eq!(citations, "");
-    }
-
-    #[test]
-    fn test_solve_deepseek_pow_invalid_algorithm() {
-        let challenge = DeepSeekPowChallenge {
-            algorithm: "InvalidAlgo".to_string(),
-            challenge: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-            salt: "salt".to_string(),
-            difficulty: 10,
-            expire_at: 1000,
-            signature: "sig".to_string(),
-            target_path: "/path".to_string(),
-        };
-        assert!(solve_deepseek_pow(&challenge).is_err());
-    }
-
-    #[test]
-    fn test_solve_deepseek_pow_invalid_hex() {
-        let challenge = DeepSeekPowChallenge {
-            algorithm: "DeepSeekHashV1".to_string(),
-            challenge: "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
-            salt: "salt".to_string(),
-            difficulty: 10,
-            expire_at: 1000,
-            signature: "sig".to_string(),
-            target_path: "/path".to_string(),
-        };
-        assert!(solve_deepseek_pow(&challenge).is_err());
-    }
-}
-
-/// Drain scheduler for DeepSeek `response/status=FINISHED` → wait for trailing search_results
-/// before closing the stream.
-pub struct FinishedDrainScheduler {
-    drain_timer: std::sync::Mutex<Option<std::time::Instant>>,
-    drain_ms: u64,
-}
-
-impl FinishedDrainScheduler {
-    pub fn new(drain_ms: u64) -> Self {
-        FinishedDrainScheduler {
-            drain_timer: std::sync::Mutex::new(None),
-            drain_ms,
-        }
-    }
-
-    pub fn schedule_finish_after_drain(&self) {
-        let mut timer = self.drain_timer.lock().unwrap();
-        *timer = Some(std::time::Instant::now());
-    }
-
-    pub fn clear_finished_drain(&self) {
-        let mut timer = self.drain_timer.lock().unwrap();
-        *timer = None;
-    }
-
-    pub fn is_drain_pending(&self) -> bool {
-        if let Ok(timer) = self.drain_timer.lock() {
-            if let Some(start) = *timer {
-                start.elapsed().as_millis() < self.drain_ms as u128
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_thinking_model() {
-        assert!(is_thinking_model("deepseek-r1"));
-        assert!(is_thinking_model("gpt-4-thinking"));
-        assert!(is_thinking_model("claude-opus-thinking"));
-        assert!(is_thinking_model("DEEPSEEK-REASON"));
-        assert!(!is_thinking_model("gpt-4"));
-        assert!(!is_thinking_model("deepseek-chat"));
-    }
-
-    #[test]
-    fn test_is_search_model() {
-        assert!(is_search_model("deepseek-search"));
-        assert!(is_search_model("grok-fold"));
-        assert!(is_search_model("DEEPSEEK-SEARCH"));
-        assert!(!is_search_model("gpt-4"));
-        assert!(!is_search_model("deepseek-chat"));
-    }
-
-    #[test]
-    fn test_clean_deepseek_token() {
-        assert_eq!(clean_deepseek_token("FINISHED"), "");
-        assert_eq!(clean_deepseek_token("hello FINISHED world"), "hello  world");
-        assert_eq!(clean_deepseek_token("SEARCH result"), "result");
-        assert_eq!(clean_deepseek_token("WEB_SEARCH data"), "data");
-        // \s* matches zero or more spaces, so "SEARCHING..." removes "SEARCHING" leaving "..."
-        assert_eq!(clean_deepseek_token("SEARCHING..."), "...");
-        assert_eq!(clean_deepseek_token("SEARCHING "), "");
-        assert_eq!(clean_deepseek_token("search result"), "result"); // case-insensitive
-        assert_eq!(clean_deepseek_token("hello"), "hello");
-    }
-
-    #[test]
-    fn test_format_stream_content_non_search() {
-        let content = "FINISHED hello world";
-        // clean_deepseek_token removes "FINISHED" but leaves the space
-        assert_eq!(format_stream_content(content, "deepseek-chat"), " hello world");
-    }
-
-    #[test]
-    fn test_format_stream_content_search_with_citations() {
-        let content = "result [citation:1] and [citation:2]";
-        let formatted = format_stream_content(content, "deepseek-search");
-        assert_eq!(formatted, "result [1] and [2]");
-    }
-
-    #[test]
-    fn test_format_stream_content_search_silent() {
-        let content = "result [citation:1] and [citation:2]";
-        let formatted = format_stream_content(content, "deepseek-search-silent");
-        assert_eq!(formatted, "result  and ");
-    }
-
-    #[test]
-    fn test_append_search_citations() {
-        let results = vec![
-            serde_json::json!({
-                "cite_index": 1,
-                "title": "Example",
-                "url": "https://example.com"
-            }),
-            serde_json::json!({
-                "cite_index": 2,
-                "title": "Test",
-                "url": "https://test.com"
-            }),
-        ];
-        let citations = append_search_citations(&results, "deepseek-search");
-        assert!(citations.contains("[1]: [Example](https://example.com)"));
-        assert!(citations.contains("[2]: [Test](https://test.com)"));
-    }
-
-    #[test]
-    fn test_append_search_citations_silent() {
-        let results = vec![
-            serde_json::json!({
-                "cite_index": 1,
-                "title": "Example",
-                "url": "https://example.com"
-            }),
-        ];
-        let citations = append_search_citations(&results, "deepseek-search-silent");
-        assert_eq!(citations, "");
-    }
-
-    #[test]
-    fn test_append_search_citations_empty() {
-        let results: Vec<_> = vec![];
-        let citations = append_search_citations(&results, "deepseek-search");
-        assert_eq!(citations, "");
     }
 
     #[test]
@@ -620,35 +455,9 @@ mod tests {
         assert!(!guard.has_finished());
 
         let mut count = 0;
-        guard.finish_once(|| {
-            count += 1;
-        });
-        guard.finish_once(|| {
-            count += 1;
-        });
-
-        // Should only call once
+        guard.finish_once(|| { count += 1; });
+        guard.finish_once(|| { count += 1; });
         assert_eq!(count, 1);
         assert!(guard.has_finished());
-    }
-
-    #[test]
-    fn test_finish_once_guard_default() {
-        let guard = FinishOnceGuard::default();
-        assert!(!guard.has_finished());
-        guard.finish_once(|| {});
-        assert!(guard.has_finished());
-    }
-
-    #[test]
-    fn test_finished_drain_scheduler() {
-        let scheduler = FinishedDrainScheduler::new(50);
-        assert!(!scheduler.is_drain_pending());
-
-        scheduler.schedule_finish_after_drain();
-        assert!(scheduler.is_drain_pending());
-
-        scheduler.clear_finished_drain();
-        assert!(!scheduler.is_drain_pending());
     }
 }

@@ -110,26 +110,13 @@ impl OAuthProvider for ZedProvider {
 
     async fn post_exchange(
         &self,
-        tokens: &Json,
+        _tokens: &Json,
         _meta: Option<&Json>,
         _log: &Logger,
     ) -> Result<Option<Json>> {
         // TODO: Fetch user info from Zed Cloud API using the access token
         // Best-effort lookup of email, name, organizationId
         // Returns: { userInfo: { email, name }, organizationId }
-
-        // For now, extract what we can from tokens
-        let user_id = tokens
-            .get("userId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let system_id = tokens
-            .get("systemId")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
 
         let mut result = serde_json::Map::new();
 
@@ -210,59 +197,49 @@ impl OAuthProvider for ZedProvider {
     }
 }
 
-/// Static instance for provider registry
-pub static PROVIDER: ZedProvider = ZedProvider;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_build_auth_url() {
-        let config = ZedConfig::default();
-        let url = build_auth_url(&config);
+    #[tokio::test]
+    async fn test_build_auth_url() {
+        let provider = ZedProvider;
+        let config = json!({});
+        let log = nr_core::Logger::new();
+        let url = provider
+            .build_auth_url(&config, "http://localhost/cb", "state", None, None, &log)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(url.contains("native_app_signin"));
         assert!(url.contains("zed.dev"));
     }
 
     #[test]
-    fn test_resolve_organization_id_with_user_info() {
-        let mut user_info = serde_json::Map::new();
-        user_info.insert(
-            "organizationId".to_string(),
-            json!("org_12345"),
-        );
-        let org_id = resolve_organization_id(Some(&user_info));
-        assert_eq!(org_id, "org_12345");
-    }
-
-    #[test]
-    fn test_resolve_organization_id_empty() {
-        let org_id = resolve_organization_id(None);
-        assert_eq!(org_id, "");
-    }
-
-    #[test]
     fn test_map_tokens() {
-        let tokens = ZedTokens {
-            access_token: "test_token".to_string(),
-            user_id: "user_123".to_string(),
-            system_id: "system_456".to_string(),
-        };
+        let provider = ZedProvider;
+        let tokens = json!({
+            "accessToken": "test_token",
+            "userId": "user_123",
+            "systemId": "system_456",
+        });
 
-        let mut extra = serde_json::Map::new();
-        extra.insert("email".to_string(), json!("user@example.com"));
-        extra.insert("name".to_string(), json!("Test User"));
-        extra.insert("organizationId".to_string(), json!("org_789"));
+        let extra = json!({
+            "userInfo": { "email": "user@example.com", "name": "Test User" },
+            "organizationId": "org_789",
+        });
 
-        let mapped = map_tokens(&tokens, Some(&extra));
+        let mapped = provider.map_tokens(&tokens, Some(&extra)).unwrap();
+        assert_eq!(mapped.access_token, "test_token");
+        assert_eq!(mapped.email.as_deref(), Some("user@example.com"));
 
-        assert_eq!(mapped.get("accessToken").and_then(|v| v.as_str()), Some("test_token"));
-        assert_eq!(mapped.get("email").and_then(|v| v.as_str()), Some("user@example.com"));
-
-        let provider_data = mapped.get("providerSpecificData").and_then(|v| v.as_object()).unwrap();
-        assert_eq!(provider_data.get("userId").and_then(|v| v.as_str()), Some("user_123"));
-        assert_eq!(provider_data.get("systemId").and_then(|v| v.as_str()), Some("system_456"));
-        assert_eq!(provider_data.get("organizationId").and_then(|v| v.as_str()), Some("org_789"));
+        let psd = mapped.provider_specific_data.as_ref().unwrap();
+        assert_eq!(psd.get("userId").and_then(Json::as_str), Some("user_123"));
+        assert_eq!(psd.get("systemId").and_then(Json::as_str), Some("system_456"));
+        assert_eq!(psd.get("organizationId").and_then(Json::as_str), Some("org_789"));
     }
 }
+
+/// Static instance for provider registry
+pub static PROVIDER: ZedProvider = ZedProvider;
+

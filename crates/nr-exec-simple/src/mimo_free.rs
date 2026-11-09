@@ -3,13 +3,12 @@
 //! MiMoCode Free requires bootstrapping a JWT from an open API, caching it per machine,
 //! and retrying on 401/403 with a fresh JWT.
 
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use nr_core::{ExecRequest, ExecResult, Executor, Json, Result, Error};
-use nr_core::http::{proxy_fetch, FetchRequest, HeaderList};
+use nr_core::http::{proxy_fetch, FetchRequest, HeaderList, ProxyOptions};
 use serde_json::json;
 
 const BOOTSTRAP_URL: &str = "https://api.xiaomimimo.com/api/free-ai/bootstrap";
@@ -32,7 +31,7 @@ pub const MIMO_SYSTEM_MARKER: &str =
     "You are MiMoCode, an interactive CLI tool that helps users with software engineering tasks.";
 
 // In-process JWT cache: per-process, survives across requests but not restarts
-static JWT_CACHE: Mutex<HashMap<String, JwtCacheEntry>> = Mutex::new(HashMap::new());
+static JWT_CACHE: LazyLock<Mutex<HashMap<String, JwtCacheEntry>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct JwtCacheEntry {
     jwt: String,
@@ -133,7 +132,7 @@ fn inject_system_marker(mut body: Json) -> Json {
 }
 
 /// Bootstrap a JWT from the MiMo free API.
-async fn bootstrap_jwt(proxy_options: Option<&nr_core::ProxyOptions>) -> Result<String> {
+async fn bootstrap_jwt(proxy_options: Option<&ProxyOptions>) -> Result<String> {
     let fingerprint = generate_fingerprint();
 
     let body = json!({ "client": fingerprint });
@@ -161,7 +160,7 @@ async fn bootstrap_jwt(proxy_options: Option<&nr_core::ProxyOptions>) -> Result<
 }
 
 /// Get a cached JWT or bootstrap a new one.
-async fn get_or_bootstrap_jwt(proxy_options: Option<&nr_core::ProxyOptions>) -> Result<String> {
+async fn get_or_bootstrap_jwt(proxy_options: Option<&ProxyOptions>) -> Result<String> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -205,7 +204,7 @@ impl Executor for MimoFreeExecutor {
 
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecResult> {
         // Bootstrap JWT
-        let jwt = get_or_bootstrap_jwt(req.proxy.as_ref()).await?;
+        let jwt = get_or_bootstrap_jwt(Some(&req.proxy)).await?;
 
         let url = CHAT_URL.to_string();
         let transformed_body = inject_system_marker(req.body.clone());
@@ -224,20 +223,20 @@ impl Executor for MimoFreeExecutor {
         req.log.debug("FETCH", format!("MIMO-FREE → {}", url));
 
         let fetch = FetchRequest::post_json(url.clone(), headers.clone(), &transformed_body);
-        let mut response = proxy_fetch(fetch, req.proxy.as_ref()).await?;
+        let mut response = proxy_fetch(fetch, Some(&req.proxy)).await?;
 
         // On 401/403, retry once with a fresh JWT
         if response.status == 401 || response.status == 403 {
             req.log.debug("AUTH", "MiMo auth failed, re-bootstrapping...");
 
-            let fresh_jwt = bootstrap_jwt(req.proxy.as_ref()).await?;
+            let fresh_jwt = bootstrap_jwt(Some(&req.proxy)).await?;
             let mut cache = JWT_CACHE.lock().unwrap();
             cache.remove("mimo-free-jwt");
             drop(cache);
 
             headers.insert("Authorization".into(), format!("Bearer {}", fresh_jwt));
             let fetch_retry = FetchRequest::post_json(url.clone(), headers.clone(), &transformed_body);
-            response = proxy_fetch(fetch_retry, req.proxy.as_ref()).await?;
+            response = proxy_fetch(fetch_retry, Some(&req.proxy)).await?;
         }
 
         Ok(ExecResult {

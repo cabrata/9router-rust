@@ -30,7 +30,7 @@ impl OAuthProvider for MuseProvider {
 
     async fn request_device_code(
         &self,
-        config: &Json,
+        _config: &Json,
         _code_challenge: Option<&str>,
         _options: Option<&Json>,
         _log: &Logger,
@@ -62,7 +62,7 @@ impl OAuthProvider for MuseProvider {
         Ok(Json::Object(result))
     }
 
-    async fn post_exchange(&self, tokens: &Json, _meta: Option<&Json>, _log: &Logger) -> Result<Option<Json>> {
+    async fn post_exchange(&self, _tokens: &Json, _meta: Option<&Json>, _log: &Logger) -> Result<Option<Json>> {
         // TODO: Mint subscription API key via POST to https://api.meta.ai/muse-code/key
         // Returns: { api_key, user_email, is_subs_active, subs_tier_name }
         Ok(Some(json!({ "key": serde_json::Value::Null })))

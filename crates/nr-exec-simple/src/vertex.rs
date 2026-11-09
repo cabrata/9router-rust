@@ -104,7 +104,7 @@ impl BaseHooks for VertexExecutor {
 
         if self.provider == "vertex-partner" {
             // Partner models require project_id in path regardless of auth method
-            let project = project_id.ok_or_else(|| nr_core::Error::InvalidConfig(
+            let project = project_id.ok_or_else(|| nr_core::Error::Config(
                 "Vertex partner models require a project_id. Add it in providerSpecificData or use Service Account JSON.".into()
             ))?;
             let url = format!("https://aiplatform.googleapis.com/v1/projects/{}/locations/global/endpoints/openapi/chat/completions", project);
@@ -120,7 +120,7 @@ impl BaseHooks for VertexExecutor {
 
         if uses_oauth {
             // SA JSON / ADC / pre-set accessToken: must use project-scoped path
-            let project = project_id.ok_or_else(|| nr_core::Error::InvalidConfig(
+            let project = project_id.ok_or_else(|| nr_core::Error::Config(
                 "Vertex OAuth/ADC requires a project_id. Add quota_project_id to your ADC JSON or set providerSpecificData.projectId.".into()
             ))?;
 

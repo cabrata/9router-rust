@@ -23,7 +23,7 @@ const BASE62_CHARS: &str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop
 static EMPTY: LazyLock<Json> = LazyLock::new(|| Json::Object(Default::default()));
 
 // Session cache for stable session IDs per identity
-static SESSION_CACHE: Mutex<HashMap<String, String>> = Mutex::new(HashMap::new());
+static SESSION_CACHE: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Generate a session ID with timestamp-based prefix and random suffix.
 fn generate_session_id() -> String {
@@ -34,9 +34,9 @@ fn generate_session_id() -> String {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    // Session prefix = 12 hex of ~(timeMs * 0x1000 + counter)
+    // Session prefix = 12 hex of !(timeMs * 0x1000 + counter)
     let session_prefix_mask = (1u64 << 48) - 1;
-    let descending_time = (~(now_ms * 0x1000 + 1) & session_prefix_mask) as u64;
+    let descending_time = (!(now_ms * 0x1000 + 1) & session_prefix_mask) as u64;
     let hex_time = format!("{:012x}", descending_time);
 
     // Random suffix
@@ -158,7 +158,7 @@ impl OpencodeExecutor {
     ) -> Credentials {
         let mut creds = credentials.clone();
         let session = resolve_opencode_session(body, &creds, provider_session_id, client_tool);
-        creds.insert(SESSION_FIELD.to_string(), Json::String(session));
+        creds.set(SESSION_FIELD, Json::String(session));
         creds
     }
 }
@@ -261,8 +261,9 @@ impl Executor for OpencodeExecutor {
         // TODO: Implement TLS fingerprinting using opencodeTlsFetch when available
         // For now, use the standard base_execute path
 
+        let mut req_creds = credentials;
         base_execute(self, ExecRequest {
-            credentials: &credentials,
+            credentials: &mut req_creds,
             ..req
         }).await
     }

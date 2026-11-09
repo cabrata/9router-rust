@@ -13,8 +13,7 @@ static EMPTY: LazyLock<Json> = LazyLock::new(|| Json::Object(Default::default())
 
 /// Strip Unicode property escapes (\p{...}) from JSON schema patterns (Codex limitation).
 fn has_unicode_property_escape(pattern: &str) -> bool {
-    let re = regex::Regex::new(r#"(^|[^\\])(\\\\)*\\[pP]\{"#).unwrap_or_default();
-    re.is_match(pattern)
+    regex::Regex::new(r#"(^|[^\\])(\\\\)*\\[pP]\{"#).is_ok_and(|re| re.is_match(pattern))
 }
 
 fn strip_unicode_patterns(schema: &Json, stats: &mut usize) -> Json {
@@ -57,7 +56,7 @@ fn strip_unicode_patterns(schema: &Json, stats: &mut usize) -> Json {
                     *v = cleaned;
                 }
             }
-            if changed { result } else { schema.clone() }
+            if changed { Json::Object(result) } else { schema.clone() }
         }
         Json::Array(arr) => {
             let mut result = Vec::with_capacity(arr.len());
@@ -105,7 +104,7 @@ impl BaseHooks for CodexExecutor {
             .or_else(|| body.get("conversation_id"))
             .and_then(Json::as_str)
             .map(|s| s.to_string())
-            .unwrap_or_else(|| creds.connection_id.clone().unwrap_or_else(|| "default".into()));
+            .unwrap_or_else(|| creds.connection_id().unwrap_or("default").into());
 
         headers.insert("session_id".into(), session_id);
         headers.insert("originator".into(), "codex_cli_rs".into());
@@ -138,7 +137,7 @@ impl BaseHooks for CodexExecutor {
 
         // Strip server-generated item IDs (backend can't resolve with store=false)
         if let Some(Json::Array(input)) = result.get_mut("input") {
-            let re = regex::Regex::new(r#"^(rs|fc|resp|msg)_"#).unwrap_or_default();
+            let re = regex::Regex::new(r#"^(rs|fc|resp|msg)_"#).expect("static regex");
             input.retain(|item| {
                 match item {
                     Json::String(s) => !re.is_match(s),

@@ -78,9 +78,9 @@ async fn normalize_quota_response(response: nr_core::http::UpstreamResponse) -> 
 
     // Rewrite as 429 with a rate_limit_error
     let mut headers = response.headers.clone();
-    headers.shift_remove("content-length");
-    headers.shift_remove("content-encoding");
-    headers.insert("content-type".into(), "application/json".into());
+    headers.remove(http::header::CONTENT_LENGTH);
+    headers.remove(http::header::CONTENT_ENCODING);
+    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
 
     let error_body = serde_json::json!({
         "type": "error",
