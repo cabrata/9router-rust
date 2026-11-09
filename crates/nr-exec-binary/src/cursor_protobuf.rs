@@ -1,7 +1,7 @@
 //! Port of open-sse/utils/cursorProtobuf.js
 //! Protobuf encoding/decoding for Cursor API
 
-use serde_json::{json, Value, Value as Json};
+use serde_json::{Value, Value as Json};
 use std::collections::BTreeMap;
 
 /// Wire type constants

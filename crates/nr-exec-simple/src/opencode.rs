@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use nr_core::{ExecRequest, ExecResult, Executor, Json, Result, Error, Credentials};
+use nr_core::{ExecRequest, ExecResult, Executor, Json, Result, Credentials};
 use nr_exec_base::base::{base_execute, BaseHooks};
 use std::sync::LazyLock;
 

@@ -103,7 +103,7 @@ impl Executor for AzureExecutor {
 }
 
 /// Executor for the canonical provider id (aliases are resolved in nr-executors).
-pub fn create(provider: &str) -> Arc<dyn Executor> {
+pub fn create(_provider: &str) -> Arc<dyn Executor> {
     Arc::new(AzureExecutor::new())
 }
 

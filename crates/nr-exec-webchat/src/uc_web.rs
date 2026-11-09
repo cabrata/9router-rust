@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
-use http::HeaderMap;
 use nr_core::http::UpstreamResponse;
 use nr_core::{ExecRequest, ExecResult, Executor, Result};
 use serde_json::{json, Value};

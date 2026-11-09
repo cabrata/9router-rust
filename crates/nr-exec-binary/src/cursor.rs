@@ -153,7 +153,7 @@ fn transform_protobuf_to_json(buffer: &[u8], model: &str, body: &Json) -> Result
     let mut reasoning = String::new();
     let mut tool_calls: Vec<Json> = Vec::new();
     let mut finish_reason = "stop";
-    let mut error: Option<String> = None;
+    let error: Option<String> = None;
 
     let mut offset = 0;
     loop {
@@ -508,7 +508,7 @@ impl nr_core::Executor for CursorExecutor {
         BaseHooks::no_auth(self)
     }
 
-    async fn execute(&self, mut req: ExecRequest<'_>) -> Result<ExecResult> {
+    async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecResult> {
         // AgentService handles text-only turns; image parts need the legacy
         // protobuf chat path.
         if is_agent_capable_request(&req.body) {

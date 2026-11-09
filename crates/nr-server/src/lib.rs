@@ -16,7 +16,6 @@ pub use routes::api::api_routes;
 
 use std::net::SocketAddr;
 
-use axum::Extension;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;

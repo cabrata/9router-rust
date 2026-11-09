@@ -13,7 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine;
 use nr_core::http::{HeaderList, UpstreamResponse};
-use nr_core::{ExecRequest, ExecResult, Executor, Json, Result};
+use nr_core::{ExecRequest, ExecResult, Executor, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 

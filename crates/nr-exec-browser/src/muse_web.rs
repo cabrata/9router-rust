@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{stream, StreamExt};
-use nr_core::http::{BodyStream, HeaderList, UpstreamResponse};
+use futures::StreamExt;
+use nr_core::http::{HeaderList, UpstreamResponse};
 use nr_core::{ExecRequest, ExecResult, Executor, Json, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -553,7 +553,7 @@ impl Executor for MuseWebExecutor {
         }
 
         // Renew session over HTTP
-        let session = match renew_session(&cookie, true).await {
+        let _session = match renew_session(&cookie, true).await {
             Ok(s) => s,
             Err(e) => {
                 let status = if e.to_string().contains("rejected") || e.to_string().contains("401") {

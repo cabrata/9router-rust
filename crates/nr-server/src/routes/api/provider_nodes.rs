@@ -237,7 +237,7 @@ pub async fn delete_provider_node_by_id(
         Err(resp) => return resp,
     };
 
-    let node = match get_provider_node_by_id(&db, &id) {
+    let _node = match get_provider_node_by_id(&db, &id) {
         Ok(Some(n)) => n,
         Ok(None) => return not_found("Provider node not found"),
         Err(e) => return internal_error(format!("Failed to fetch provider node: {e}")),

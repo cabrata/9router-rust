@@ -6,8 +6,8 @@
 //! - Poll `/backend-api/conversation/{id}` until `is_complete`
 //! - Tool calling rides the `<tool>` contract (injected by translator)
 
-use crate::delta_v1::{ChatGptWebDeltaV1Decoder, SseEvent};
-use crate::sentinel::{fetch_sentinel_headers, SENTINEL_HEADERS};
+use crate::delta_v1::ChatGptWebDeltaV1Decoder;
+use crate::sentinel::fetch_sentinel_headers;
 use nr_core::Result;
 use regex::Regex;
 use serde_json::{json, Value as Json};
@@ -257,7 +257,7 @@ pub async fn run_chat_gpt_web_http_turn(
     body: &Json,
     has_tools: bool,
     requested_tools: Vec<String>,
-    signal: Option<&tokio::sync::Notify>,
+    _signal: Option<&tokio::sync::Notify>,
 ) -> Result<ChatHttpTurnResult, String> {
     if access_token.is_empty() {
         return Err("ChatGPT session has no access token".to_string());
@@ -383,7 +383,7 @@ pub async fn run_chat_gpt_web_http_turn(
 
     // Read SSE stream with deadline
     let mut sse_text = String::new();
-    let mut decoder = ChatGptWebDeltaV1Decoder::new();
+    let _decoder = ChatGptWebDeltaV1Decoder::new();
     let deadline = Instant::now() + Duration::from_millis(SSE_DEADLINE_MS);
     let mut stream = conversation_resp.bytes_stream();
     use futures::StreamExt;

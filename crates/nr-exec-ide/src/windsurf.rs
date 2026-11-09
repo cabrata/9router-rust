@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{stream, StreamExt};
+use futures::stream;
 use nr_core::http::{BodyStream, HeaderList, UpstreamResponse};
 use nr_core::{ExecRequest, ExecResult, Executor, Json, Result};
 use serde_json::json;

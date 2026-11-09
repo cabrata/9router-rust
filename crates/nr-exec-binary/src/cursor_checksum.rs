@@ -3,7 +3,6 @@
 
 use sha2::{Sha256, Digest};
 use uuid::{uuid, Uuid};
-use std::fmt::Write;
 
 /// Generate SHA-256 hash (64-char hex)
 pub fn generate_hashed64_hex(input: &str, salt: &str) -> String {
@@ -45,7 +44,7 @@ pub fn generate_cursor_checksum(machine_id: &str) -> String {
     // Jyh cipher obfuscation
     let mut t = 165u8;
     for i in 0..byte_array.len() {
-        byte_array[i] = (((byte_array[i] ^ t).wrapping_add(i as u8)) & 0xFF);
+        byte_array[i] = ((byte_array[i] ^ t).wrapping_add(i as u8)) & 0xFF;
         t = byte_array[i];
     }
 

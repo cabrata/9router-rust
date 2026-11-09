@@ -218,7 +218,7 @@ pub async fn remove_dns_entry(tool: &str, password: &str) -> Result<()> {
 
     let current = std::fs::read_to_string(hosts_file())
         .map_err(|e| Error::other(format!("read hosts: {e}")))?;
-    let eol = if cfg!(windows) { "\r\n" } else { "\n" };
+    let _eol = if cfg!(windows) { "\r\n" } else { "\n" };
     let next = filter_hosts(&current, &present);
     write_hosts(&next, password)
         .await

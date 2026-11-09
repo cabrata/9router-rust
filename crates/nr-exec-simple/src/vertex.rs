@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use nr_core::{ExecRequest, ExecResult, Executor, Result, Credentials, Json};
 use nr_exec_base::base::{base_execute, BaseHooks};
-use serde_json::json;
 
 static EMPTY: LazyLock<Json> = LazyLock::new(|| Json::Object(Default::default()));
 

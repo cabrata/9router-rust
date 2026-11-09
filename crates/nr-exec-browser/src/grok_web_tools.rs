@@ -8,7 +8,7 @@
 //! the best-matching declared tool by name/description/schema scoring — in both
 //! cases emitting standard OpenAI tool_calls back to the client.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use indexmap::IndexMap;
@@ -629,7 +629,7 @@ pub fn adapt_arguments(tool_name: &str, args: Json, registry: &ToolRegistry, int
     let required = get_schema_required(&tool.parameters);
     let mut out: Map<String, Json> = args.as_object().cloned().unwrap_or_default();
 
-    let mut alias = |out: &mut Map<String, Json>, target: &str, sources: &[&str]| {
+    let alias = |out: &mut Map<String, Json>, target: &str, sources: &[&str]| {
         if !properties.contains_key(target) {
             return;
         }

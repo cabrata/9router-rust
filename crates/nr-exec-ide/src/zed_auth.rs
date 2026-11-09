@@ -110,7 +110,7 @@ pub fn decrypt_zed_access_token(
                     }
                     Ok(token)
                 }
-                Err(pkcs1_err) => Err(Error::other(format!(
+                Err(_pkcs1_err) => Err(Error::other(format!(
                     "Failed to decrypt Zed access token (tried OAEP and PKCS#1): {}",
                     oaep_err
                 ))),
@@ -247,7 +247,7 @@ pub fn resolve_zed_organization_id(
 pub async fn fetch_zed_authenticated_user(
     credentials: &Credentials,
     base_url: &str,
-    proxy_options: Option<&nr_core::http::ProxyOptions>,
+    _proxy_options: Option<&nr_core::http::ProxyOptions>,
 ) -> Result<JsonValue> {
     let client = reqwest::Client::new();
     let auth_header = build_zed_user_auth_header(credentials)?;
@@ -383,7 +383,7 @@ pub async fn zed_llm_fetch(
 
     let client = reqwest::Client::new();
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-    let mut req = client.get(&url).header("Authorization", format!("Bearer {}", token));
+    let req = client.get(&url).header("Authorization", format!("Bearer {}", token));
 
     // TODO(dedupe): apply fetch_options headers and method
     let response = req

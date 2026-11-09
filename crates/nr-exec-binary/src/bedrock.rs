@@ -8,12 +8,12 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine};
 use bytes::Bytes;
 use futures::channel::mpsc;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use nr_core::http::{proxy_fetch, FetchRequest, HeaderList, UpstreamResponse};
 use nr_core::{Credentials, Error, ExecRequest, ExecResult, Json, Result};
-use nr_exec_base::base::{base_execute, BaseHooks};
+use nr_exec_base::base::BaseHooks;
 
-use crate::aws_credentials::{resolve_aws_credentials, resolve_region, ResolvedAwsCredentials};
+use crate::aws_credentials::{resolve_aws_credentials, resolve_region};
 use crate::aws_event_stream::{crc32, parse_event_frame, EventHeaderValue};
 use crate::aws_sigv4::{escape_uri, sign_aws_request, AwsCredentials, SigningOptions};
 

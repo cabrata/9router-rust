@@ -907,7 +907,7 @@ pub async fn dynamic_post(
 async fn handle_post(
     provider: &str,
     action: &str,
-    query: HashMap<String, String>,
+    _query: HashMap<String, String>,
     body: Option<Value>,
 ) -> nr_core::Result<Response> {
     let log = nr_core::Logger::new();
@@ -1276,7 +1276,7 @@ async fn handle_exchange(
         .unwrap_or("")
         .trim()
         .to_string();
-    let redirect_uri = body
+    let _redirect_uri = body
         .and_then(|b| b.get("redirectUri"))
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string());

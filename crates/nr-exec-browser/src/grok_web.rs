@@ -3,14 +3,12 @@
 //! Auth: Grok cookies (sso, __cf_bm, cf_clearance)
 //! Response: NDJSON stream with tool call parsing
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
 use bytes::Bytes;
 use futures::{stream, StreamExt};
-use http::HeaderMap;
 use nr_core::http::{BodyStream, HeaderList, UpstreamResponse};
 use nr_core::{ExecRequest, ExecResult, Executor, Json, Result};
 use rand::Rng;
@@ -436,7 +434,7 @@ impl Executor for GrokWebExecutor {
             // Check for tool calls in complete output
             let (_, tool_calls) = extract_tool_calls_from_markup(&full_text);
             if !tool_calls.is_empty() {
-                for (i, tc) in tool_calls.iter().enumerate() {
+                for (_i, tc) in tool_calls.iter().enumerate() {
                     let tc_chunk = json!({
                         "id": cid,
                         "object": "chat.completion.chunk",
@@ -486,7 +484,7 @@ impl Executor for GrokWebExecutor {
 
         // Non-streaming response collection
         let mut full_text = String::new();
-        let mut thinking_text = String::new();
+        let thinking_text = String::new();
 
         for line in body_text.lines() {
             let trimmed = line.trim();

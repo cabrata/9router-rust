@@ -5,9 +5,8 @@
 //! - `POST /v1beta/models/{model}:generateContent` – non-streaming generate
 //! - `POST /v1beta/models/{model}:streamGenerateContent` – SSE streaming
 
-use axum::body::Body;
 use axum::extract::Path;
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};

@@ -4,7 +4,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use nr_db::{get_pricing, reset_all_pricing, reset_pricing, update_pricing, Db};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::common::{bad_request, get_db, internal_error};
 

@@ -1,7 +1,7 @@
 //! Port of open-sse/utils/awsEventStream.js
 //! AWS EventStream binary framing: CRC32 and single-frame decoding/encoding.
 
-use serde_json::{json, Value as Json};
+use serde_json::Value as Json;
 use std::collections::BTreeMap;
 
 /// AWS EventStream constants from config/awsConstants.js

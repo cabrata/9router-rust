@@ -701,7 +701,7 @@ pub async fn get_providers_client(
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.pageSize.unwrap_or(20).clamp(1, 500);
 
-    let mut eligible: Vec<Value> = all_conns
+    let eligible: Vec<Value> = all_conns
         .into_iter()
         .filter(|c| {
             let p = c.get("provider").and_then(Value::as_str).unwrap_or("");

@@ -91,7 +91,7 @@ pub fn normalize_content(content: &Json) -> Json {
             let mut text_parts: Vec<String> = Vec::new();
             let mut has_image = false;
 
-            let mut push_text = |text: &str, blocks: &mut Vec<Json>, text_parts: &mut Vec<String>, has_image: &mut bool| {
+            let push_text = |text: &str, blocks: &mut Vec<Json>, text_parts: &mut Vec<String>, has_image: &mut bool| {
                 if text.is_empty() {
                     return;
                 }
@@ -514,7 +514,7 @@ pub fn wrap_sse(reader: LineReader, model: &str) -> UpstreamResponse {
     // Re-process every byte the peek consumed, then continue from the socket.
     let mut buffer = reader.consumed[reader.scan.min(reader.consumed.len())..].to_string();
     let mut stream = reader.stream;
-    let mut upstream_done = reader.upstream_done;
+    let upstream_done = reader.upstream_done;
 
     tokio::spawn(async move {
         let mut coalescer = QoderSseCoalescer::new(model.clone());
@@ -865,7 +865,7 @@ impl Executor for QoderExecutor {
         let wait_started = Instant::now();
         let mut status_polls_enabled = true;
         let mut ready_replay_used = false;
-        let mut attempt_payload = built.payload.clone();
+        let attempt_payload = built.payload.clone();
 
         loop {
             let sent = match self.send_once(&attempt_payload, credentials, &url, &proxy, &cancel).await {

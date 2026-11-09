@@ -13,7 +13,6 @@ use nr_core::http::{proxy_fetch, FetchRequest, HeaderList};
 use nr_core::{ExecRequest, ExecResult, Executor, Json, Result, Credentials};
 use nr_exec_base::default_executor::DefaultExecutor;
 use nr_exec_base::base::{BaseHooks};
-use rand::Rng;
 use sha1::{Digest, Sha1};
 
 const COOKIE_KEY: &str = "__mimoAccountCookie";
@@ -162,7 +161,7 @@ fn invalidate_cookie_cache() {
 async fn acquire_service_cookie(
     pass_jar: &HashMap<String, String>,
     proxy: Option<&nr_core::http::ProxyOptions>,
-    api_base: &str,
+    _api_base: &str,
     region: &str,
 ) -> Option<String> {
     // CN is ALWAYS direct (ignores proxy even if set).
@@ -402,7 +401,7 @@ impl Executor for XiaomiMimoExecutor {
             model,
             body,
             stream,
-            mut credentials,
+            credentials,
             provider_session_id,
             client_tool,
             cancel,

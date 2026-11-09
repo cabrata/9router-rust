@@ -316,7 +316,7 @@ pub async fn post_proxy_pools_vercel_deploy(
         Err(resp) => return resp,
     };
 
-    let vercel_token = match body.get("vercelToken").and_then(Value::as_str) {
+    let _vercel_token = match body.get("vercelToken").and_then(Value::as_str) {
         Some(t) if !t.trim().is_empty() => t.trim(),
         _ => return bad_request("Vercel API token is required"),
     };

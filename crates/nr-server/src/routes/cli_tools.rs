@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 

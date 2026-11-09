@@ -3,8 +3,7 @@
 //! All POST routes dispatch through [`nr_engine::handle_chat`]; the
 //! endpoint path tells the engine which translator format to target.
 
-use axum::body::Body;
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};

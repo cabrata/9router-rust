@@ -2,7 +2,7 @@
 //!
 //! Stateful decoder for ChatGPT's compact `delta_encoding: v1` document stream.
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 const UNSAFE_POINTER_SEGMENTS: &[&str] = &["__proto__", "constructor", "prototype"];
 const DELTA_OPERATIONS: &[&str] = &["add", "append", "patch", "replace"];
@@ -348,7 +348,7 @@ fn parse_chatgpt_web_encoded_item(encoded_item: &str) -> Result<Vec<SseEvent>, S
     let mut event_name = "message".to_string();
     let mut data_lines = vec![];
 
-    let mut dispatch = |events: &mut Vec<SseEvent>, event_name: &str, data_lines: &[String]| {
+    let dispatch = |events: &mut Vec<SseEvent>, event_name: &str, data_lines: &[String]| {
         if data_lines.is_empty() {
             return;
         }

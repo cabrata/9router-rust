@@ -11,7 +11,6 @@
 use aes::cipher::{BlockEncryptMut, KeyIvInit};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use md5::{Digest as Md5Digest, Md5};
-use rand::Rng;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use sha2::Sha256;

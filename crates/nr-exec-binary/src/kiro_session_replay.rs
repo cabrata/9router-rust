@@ -4,7 +4,6 @@
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use tokio::time::{sleep, Duration, Instant};
 
 const MAX_SESSION_STARTS: usize = 5000;
 const DEFAULT_SESSION_TTL_MS: u64 = 5 * 60 * 1000; // 5 minutes

@@ -3,16 +3,13 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use chrono::Utc;
 use futures::stream::StreamExt;
 use nr_core::http::HeaderList;
 use nr_core::{Credentials, ExecRequest, ExecResult, Json};
 use nr_exec_base::BaseHooks;
 use regex::Regex;
-use serde_json::{json, Value as JsonValue};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
-use tokio::sync::RwLock;
+use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::aws_event_stream::{crc32, parse_event_frame, EventFrame, EventHeaderValue};
@@ -162,7 +159,7 @@ impl KiroExecutor {
 
     fn get_ordered_base_urls(&self, creds: &Credentials) -> Vec<String> {
         let base_urls = self.base_urls();
-        let auth_method = creds
+        let _auth_method = creds
             .psd()
             .and_then(|psd| psd.get("authMethod").and_then(|v| v.as_str()));
 
@@ -197,7 +194,7 @@ impl KiroExecutor {
         };
 
         // Split into q (api-key priority) and others
-        let mut amazon: Vec<String> = base_urls
+        let amazon: Vec<String> = base_urls
             .iter()
             .filter(|u| u.contains("amazonaws.com"))
             .map(|u| regionalize(u))

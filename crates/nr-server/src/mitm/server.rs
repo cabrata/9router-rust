@@ -17,7 +17,7 @@ use axum::body::Body;
 use axum::response::Response;
 use axum::Router;
 use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, StatusCode};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;

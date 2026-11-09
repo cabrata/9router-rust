@@ -2,7 +2,6 @@
 //! Per-provider login configuration for web-cookie auth flows
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Token source for credential harvesting
 #[derive(Debug, Clone, Serialize, Deserialize)]

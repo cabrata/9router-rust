@@ -368,7 +368,7 @@ impl Executor for MinimaxCodeExecutor {
         self.default.no_auth()
     }
 
-    async fn execute(&self, mut req: ExecRequest<'_>) -> Result<ExecResult> {
+    async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecResult> {
         // Lease connections carry no stored token — borrow one from the desktop broker.
         if is_lease_connection(req.credentials) {
             let lease = get_lease_token(req.credentials).await?;

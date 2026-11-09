@@ -11,7 +11,6 @@
 //! `super::oauth_flow`, next to the dynamic provider flows they share helpers
 //! with.
 
-use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
