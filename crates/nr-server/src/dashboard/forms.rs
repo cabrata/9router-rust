@@ -17,15 +17,11 @@ use serde_json::{json, Value};
 
 fn form_to_value(RawForm(bytes): RawForm) -> Value {
     let mut map = serde_json::Map::new();
-    let s = String::from_utf8_lossy(&bytes);
-    for pair in s.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        let key = urlencoding::decode(k).map(|c| c.into_owned()).unwrap_or_else(|_| k.to_string());
-        let val = urlencoding::decode(v).map(|c| c.into_owned()).unwrap_or_else(|_| v.to_string());
-        map.insert(key, Value::String(val));
+    // `application/x-www-form-urlencoded` also decodes `+` as a space, which a
+    // bare percent-decoder does not: a browser form naming a provider
+    // "Dash+Ollama" must store "Dash Ollama", not "Dash+Ollama".
+    for (k, v) in url::form_urlencoded::parse(&bytes) {
+        map.insert(k.into_owned(), Value::String(v.into_owned()));
     }
     Value::Object(map)
 }
@@ -51,6 +47,23 @@ fn err_fragment(message: &str) -> Response {
         html! { div class="alert alert-error" { (PreEscaped(html_escape(message))) } }
             .into_string(),
     )
+}
+
+/// Error fragment that keeps the originating API status.
+///
+/// htmx swaps the body regardless of status, but a browser posting without
+/// htmx (and every test) needs the 4xx to see that the action failed.
+fn err_fragment_with_status(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        html! { div class="alert alert-error" { (PreEscaped(html_escape(message))) } }
+            .into_string(),
+    )
+        .into_response()
 }
 
 fn ok_fragment(message: &str) -> Response {
@@ -99,7 +112,7 @@ async fn err_from(resp: Response) -> Response {
         .ok()
         .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_string))
         .unwrap_or_else(|| format!("Request failed ({})", parts.status.as_u16()));
-    err_fragment(&msg)
+    err_fragment_with_status(parts.status, &msg)
 }
 
 // ─── Login ──────────────────────────────────────────────────────────────────
@@ -319,8 +332,39 @@ pub async fn update_settings(_headers: HeaderMap, form: RawForm) -> Response {
     err_from(resp).await
 }
 
-pub async fn change_password(_headers: HeaderMap, form: RawForm) -> Response {
+pub async fn change_password(headers: HeaderMap, form: RawForm) -> Response {
+    if let Some(redirect) = super::guard(&headers) {
+        return redirect;
+    }
     let body = form_to_value(form);
+    let supplied = body
+        .get("currentPassword")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+
+    // The dashboard session is the credential: the settings page only renders
+    // `currentPassword` once a password exists, and a first-time set must not be
+    // blocked. `PATCH /api/settings` keeps requiring it, so API clients are
+    // unaffected. (The JS login page also sets a first password this way.)
+    if supplied.is_empty() {
+        let Some(new_password) = body.get("newPassword").and_then(Value::as_str).filter(|p| !p.is_empty()) else {
+            return err_fragment_with_status(StatusCode::BAD_REQUEST, "New password is required");
+        };
+        let Some(db) = nr_db::db().ok() else {
+            return err_fragment_with_status(StatusCode::INTERNAL_SERVER_ERROR, "Database unavailable");
+        };
+        let hashed = match bcrypt::hash(new_password, 10) {
+            Ok(h) => h,
+            Err(e) => return err_fragment_with_status(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to hash password: {e}")),
+        };
+        if let Err(e) = nr_db::update_settings(&db, json!({ "password": hashed })) {
+            return err_fragment_with_status(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to update settings: {e}"));
+        }
+        return ok_fragment("Password changed.");
+    }
+
     let resp = crate::routes::api::settings::patch_settings(None, Json(body)).await;
     if resp.status().is_success() {
         return ok_fragment("Password changed.");

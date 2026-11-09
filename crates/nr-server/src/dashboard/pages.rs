@@ -164,7 +164,10 @@ pub async fn root_page(headers: HeaderMap) -> Response {
         let active_keys = keys.iter().filter(|k| k.get("isActive").and_then(Value::as_bool) != Some(false)).count();
 
         html! {
-            div class="grid grid-3" {
+            // Live counters: re-fetch this page and swap just the grid so the
+            // status page stays current without a manual reload.
+            div id="status-stats" class="grid grid-3"
+                hx-get="/" hx-select="#status-stats" hx-swap="outerHTML" hx-trigger="every 30s" {
                 div class="card" { div class="stat-label" { "Version" } div class="stat-value mono" { "v" (version) } }
                 div class="card" { div class="stat-label" { "Providers" } div class="stat-value" { (active_conns) " / " (conns.len()) } }
                 div class="card" { div class="stat-label" { "API Keys" } div class="stat-value" { (active_keys) " / " (keys.len()) } }
@@ -560,7 +563,11 @@ pub async fn usage_page(headers: HeaderMap) -> Response {
         let cost = stats.get("totalCost").and_then(Value::as_f64).unwrap_or(0.0);
 
         html! {
-            div class="grid grid-3" {
+            // Live counters, same pattern as the status page: refetch /usage and
+            // swap the grid so the numbers track new requests without a reload
+            // (the JS build polls /api/usage/stream for the same effect).
+            div id="usage-stats" class="grid grid-3"
+                hx-get="/usage" hx-select="#usage-stats" hx-swap="outerHTML" hx-trigger="every 30s" {
                 div class="card" { div class="stat-label" { "Requests (7d)" } div class="stat-value" { (fmt_int(&total_req)) } }
                 div class="card" { div class="stat-label" { "Prompt tokens" } div class="stat-value" { (fmt_int(&prompt)) } }
                 div class="card" { div class="stat-label" { "Completion tokens" } div class="stat-value" { (fmt_int(&completion)) } }
