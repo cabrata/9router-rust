@@ -191,6 +191,21 @@ fn gemini_web_never_fabricates_a_reply() {
 }
 
 #[test]
+fn muse_web_never_fabricates_a_reply() {
+    // Regression: muse-web used to answer with a sentence about the vm_status
+    // instead of the model's output.
+    let source = include_str!("../src/muse_web.rs");
+    assert!(
+        !source.contains("Completed prompt via muse.ai"),
+        "muse-web must read the reply from the page, never invent one"
+    );
+    // The DOM contract the JS client relies on.
+    assert!(source.contains("hatch-agent-bubble-bg"));
+    assert!(source.contains("hatch-inline-approval-card"));
+    assert!(source.contains("hatch-shell-hydration-state"));
+}
+
+#[test]
 fn gemini_web_stream_chunk_is_openai_shaped() {
     let chunk = nr_exec_browser::gemini_web::format_stream_chunk("hello", "gemini-2.5-pro");
     let parsed: Json = serde_json::from_str(&chunk).expect("valid SSE payload");

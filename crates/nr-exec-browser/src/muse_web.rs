@@ -247,6 +247,222 @@ pub fn flatten_messages(messages: &[Json]) -> (String, Vec<String>) {
     (blocks.join("\n\n"), images)
 }
 
+// ── muse.ai DOM contract (port of executers/muse-web/dom.js) ────────────────
+
+const MUSE_INPUT: &str = "textarea";
+const MUSE_AGENT_BUBBLE: &str = "div[class*=\"hatch-agent-bubble-bg\"]";
+const MUSE_STOP_BUTTON: &str = "button[aria-label*=\"Stop\" i]";
+const MUSE_APPROVAL_CARD: &str = "[data-testid=\"hatch-inline-approval-card\"]";
+const MUSE_LOGIN_HINTS: [&str; 4] = ["log in", "sign in", "create an account", "use another account"];
+const MUSE_STALL_HINTS: [&str; 2] = ["Still sending", "Connecting..."];
+
+const MUSE_POLL_INTERVAL_MS: u64 = 400;
+const MUSE_STABLE_POLLS_DONE: u32 = 5;
+const MUSE_STABLE_POLLS_FORCE: u32 = 20;
+const MUSE_FIRST_TOKEN_TIMEOUT_MS: u64 = 30000;
+const MUSE_CHAT_TIMEOUT_MS: u64 = 120000;
+const MUSE_STALL_AFTER_MS: u64 = 6000;
+
+const MUSE_PAGE_STATE: &str = r#"(() => {
+  const body = document.body ? document.body.innerText : '';
+  const hydration = document.querySelector('[data-hatch-shell-hydration-state]');
+  return {
+    ready: document.readyState === 'complete' && !!document.querySelector('textarea')
+           && (!hydration || hydration.getAttribute('data-hatch-shell-hydration-state') === 'hydrated')
+           && !body.includes('Connecting...'),
+    hasInput: !!document.querySelector('textarea'),
+    path: location.pathname,
+    head: body.slice(0, 800),
+  };
+})()"#;
+
+const MUSE_CHAT_STATE: &str = r#"(() => {
+  const scrollers = [...document.querySelectorAll('*')].filter(e => {
+    const s = getComputedStyle(e);
+    return (s.overflowY === 'auto' || s.overflowY === 'scroll') && e.scrollHeight > e.clientHeight + 50;
+  });
+  scrollers.forEach(e => { e.scrollTop = e.scrollHeight; });
+  const bubbles = [...document.querySelectorAll('div[class*="hatch-agent-bubble-bg"]')];
+  const last = bubbles.length ? (bubbles[bubbles.length - 1].innerText || '').trim() : '';
+  const tail = document.body ? document.body.innerText.slice(-600) : '';
+  return { agentCount: bubbles.length, lastText: last,
+           generating: !!document.querySelector('button[aria-label*="Stop" i]'),
+           approval: !!document.querySelector('[data-testid="hatch-inline-approval-card"]'),
+           tail };
+})()"#;
+
+/// Click "Deny" on every pending approval card; the agent then carries on
+/// without the action (and the result stays private instead of becoming a
+/// public link).
+const MUSE_DENY_APPROVALS: &str = r#"(() => {
+  const denied = [];
+  for (const card of document.querySelectorAll('[data-testid="hatch-inline-approval-card"]')) {
+    const btn = [...card.querySelectorAll('button,[role=button]')]
+      .find(b => /^(deny|decline|reject|don.t allow)$/i.test((b.innerText || '').trim()));
+    if (btn && !btn.disabled) { btn.click(); denied.push(true); }
+  }
+  return denied;
+})()"#;
+
+const MUSE_CLICK_SEND: &str = r#"(() => {
+  const btn = [...document.querySelectorAll('button,[role=button]')]
+    .filter(b => b.offsetParent !== null)
+    .find(b => /send|发送/i.test((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('data-testid') || '')));
+  if (!btn) return 'missing';
+  if (btn.disabled) return 'disabled';
+  btn.click();
+  return 'clicked';
+})()"#;
+
+/// Snapshot of the conversation used to detect new output after sending.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MuseChatState {
+    pub agent_count: usize,
+    pub last_text: String,
+    pub generating: bool,
+    pub approval: bool,
+    pub tail: String,
+}
+
+async fn read_muse_chat_state(page: &Arc<dyn crate::cdp::Page>) -> MuseChatState {
+    let Ok(value) = page.evaluate(MUSE_CHAT_STATE, None).await else {
+        return MuseChatState::default();
+    };
+    MuseChatState {
+        agent_count: value.get("agentCount").and_then(Json::as_u64).unwrap_or(0) as usize,
+        last_text: value.get("lastText").and_then(Json::as_str).unwrap_or("").trim().to_string(),
+        generating: value.get("generating").and_then(Json::as_bool).unwrap_or(false),
+        approval: value.get("approval").and_then(Json::as_bool).unwrap_or(false),
+        tail: value.get("tail").and_then(Json::as_str).unwrap_or("").to_string(),
+    }
+}
+
+/// `waitForThreadReady` — poll until the Hatch shell hydrated and the composer
+/// exists, naming a login redirect instead of timing out opaquely.
+pub async fn wait_for_thread_ready(page: &Arc<dyn crate::cdp::Page>, timeout_ms: u64) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut last_head = String::new();
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Ok(state) = page.evaluate(MUSE_PAGE_STATE, None).await {
+            if state.get("ready").and_then(Json::as_bool).unwrap_or(false) {
+                return Ok(());
+            }
+            last_head = state.get("head").and_then(Json::as_str).unwrap_or("").to_lowercase();
+        }
+    }
+    if MUSE_LOGIN_HINTS.iter().any(|h| last_head.contains(h)) {
+        return Err("muse.ai redirected to login; cookies are no longer valid".into());
+    }
+    Err("muse.ai page did not become ready".into())
+}
+
+/// `sendPrompt` — set the textarea through the native setter so React sees it,
+/// then click Send (falling back to Enter).
+pub async fn send_muse_prompt(page: &Arc<dyn crate::cdp::Page>, prompt: &str) -> Result<(), String> {
+    let script = format!(
+        r#"(() => {{
+  const ta = document.querySelector('{MUSE_INPUT}');
+  if (!ta) return {{ ok: false, err: 'no-input' }};
+  ta.focus();
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
+  setter.call(ta, {prompt});
+  ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
+  return {{ ok: true, len: ta.value.length }};
+}})()"#,
+        prompt = serde_json::to_string(prompt).unwrap_or_else(|_| "\"\"".into())
+    );
+    let result = page.evaluate(&script, None).await?;
+    if result.get("ok").and_then(Json::as_bool) != Some(true) {
+        return Err(format!(
+            "cannot fill muse.ai chat input: {}",
+            result.get("err").and_then(Json::as_str).unwrap_or("unknown")
+        ));
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if page.evaluate(MUSE_CLICK_SEND, None).await.ok().and_then(|v| v.as_str().map(String::from)).as_deref()
+            == Some("clicked")
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Fall back to Enter, then verify the composer actually cleared.
+    page.press_key("Enter").await?;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let empty = page
+        .evaluate("!(document.querySelector('textarea') || { value: '' }).value", None)
+        .await
+        .map(|v| crate::cdp::js_truthy(&v))
+        .unwrap_or(false);
+    if !empty {
+        return Err("send button not found and Enter did not submit".into());
+    }
+    Ok(())
+}
+
+/// `pollChat` — wait for the assistant bubble that follows the sent prompt.
+pub async fn poll_muse_chat<F: FnMut(&str)>(
+    page: &Arc<dyn crate::cdp::Page>,
+    base: &MuseChatState,
+    mut on_delta: F,
+) -> Result<String, String> {
+    let started = tokio::time::Instant::now();
+    let mut emitted = String::new();
+    let mut last: Option<String> = None;
+    let mut stable = 0u32;
+    let mut got_first = false;
+
+    loop {
+        let elapsed = started.elapsed().as_millis() as u64;
+        if elapsed > MUSE_CHAT_TIMEOUT_MS {
+            return Err("assistant reply timed out".into());
+        }
+        if !got_first && elapsed > MUSE_FIRST_TOKEN_TIMEOUT_MS {
+            return Err("no first token from assistant".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(MUSE_POLL_INTERVAL_MS)).await;
+
+        let state = read_muse_chat_state(page).await;
+        if state.approval {
+            // Nobody answers the card here, so deny it and let the agent carry on.
+            let _ = page.evaluate(MUSE_DENY_APPROVALS, None).await;
+            continue;
+        }
+
+        let text = state.last_text.clone();
+        let is_new = state.agent_count > base.agent_count
+            || (!text.is_empty() && text != base.last_text);
+        if !is_new || text.is_empty() {
+            if elapsed > MUSE_STALL_AFTER_MS && MUSE_STALL_HINTS.iter().any(|h| state.tail.contains(h)) {
+                return Err("upstream workspace is stuck connecting".into());
+            }
+            continue;
+        }
+
+        got_first = true;
+        if last.as_deref() != Some(text.as_str()) {
+            let delta = match text.strip_prefix(emitted.as_str()) {
+                Some(rest) => rest.to_string(),
+                None => text.clone(),
+            };
+            if !delta.is_empty() {
+                emitted = text.clone();
+                on_delta(&delta);
+            }
+            last = Some(text);
+            stable = 0;
+        } else {
+            stable += 1;
+            if (!state.generating && stable >= MUSE_STABLE_POLLS_DONE) || stable >= MUSE_STABLE_POLLS_FORCE {
+                return Ok(emitted);
+            }
+        }
+    }
+}
+
 /// MuseWebExecutor — muse.ai Hatch agent executor
 pub struct MuseWebExecutor {
     pub provider: String,
@@ -385,45 +601,24 @@ impl Executor for MuseWebExecutor {
                             wait_until: "domcontentloaded".to_string(),
                             timeout_ms: 45000,
                         };
-                        let _ = page.goto(NEW_THREAD_URL, goto_opts).await;
-                        // For a live browser page: type prompt, poll state
-                        let _ = page.insert_text(&prompt).await;
-                        let _ = page.press_key("Enter").await;
-
-                        let content = format!("Completed prompt via muse.ai (vm_status={:?})", session.meta.session_status);
-
-                        if req.stream {
-                            let mut sse = String::new();
-                            let init_chunk = json!({
-                                "id": cid,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }]
-                            });
-                            sse.push_str(&format!("data: {init_chunk}\n\n"));
-                            let delta_chunk = json!({
-                                "id": cid,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{ "index": 0, "delta": { "content": content }, "finish_reason": null }]
-                            });
-                            sse.push_str(&format!("data: {delta_chunk}\n\n"));
-                            let stop_chunk = json!({
-                                "id": cid,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
-                            });
-                            sse.push_str(&format!("data: {stop_chunk}\n\n"));
-                            sse.push_str("data: [DONE]\n\n");
-
-                            let bytes = Bytes::from(sse);
-                            let body_stream: BodyStream = Box::pin(stream::once(async move { Ok(bytes) }));
+                        if let Err(e) = page.goto(NEW_THREAD_URL, goto_opts).await {
                             return Ok(ExecResult {
-                                response: UpstreamResponse::sse(body_stream),
+                                response: UpstreamResponse::json(
+                                    502,
+                                    &json!({ "error": { "message": format!("muse.ai navigation failed: {e}"), "type": "browser_error" } }),
+                                ),
+                                url: NEW_THREAD_URL.to_string(),
+                                headers: HeaderList::new(),
+                                transformed_body: req.body,
+                                response_format: None,
+                            });
+                        }
+                        if let Err(e) = wait_for_thread_ready(&page, 30_000).await {
+                            return Ok(ExecResult {
+                                response: UpstreamResponse::json(
+                                    502,
+                                    &json!({ "error": { "message": e, "type": "browser_error" } }),
+                                ),
                                 url: NEW_THREAD_URL.to_string(),
                                 headers: HeaderList::new(),
                                 transformed_body: req.body,
@@ -431,27 +626,132 @@ impl Executor for MuseWebExecutor {
                             });
                         }
 
-                        let completion = json!({
-                            "id": cid,
-                            "object": "chat.completion",
-                            "created": created,
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "message": { "role": "assistant", "content": content },
-                                "finish_reason": "stop",
-                                "logprobs": null
-                            }],
-                            "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
-                        });
+                        let base = read_muse_chat_state(&page).await;
+                        if let Err(e) = send_muse_prompt(&page, &prompt).await {
+                            return Ok(ExecResult {
+                                response: UpstreamResponse::json(
+                                    502,
+                                    &json!({ "error": { "message": e, "type": "browser_error" } }),
+                                ),
+                                url: NEW_THREAD_URL.to_string(),
+                                headers: HeaderList::new(),
+                                transformed_body: req.body,
+                                response_format: None,
+                            });
+                        }
 
-                        return Ok(ExecResult {
-                            response: UpstreamResponse::json(200, &completion),
-                            url: NEW_THREAD_URL.to_string(),
-                            headers: HeaderList::new(),
-                            transformed_body: req.body,
-                            response_format: None,
-                        });
+                        if req.stream {
+                            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+                            let cid_owned = cid.clone();
+                            let model_owned = model.to_string();
+                            tokio::spawn(async move {
+                                let init = json!({
+                                    "id": cid_owned,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model_owned,
+                                    "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": Json::Null }]
+                                });
+                                let _ = tx.send(Ok(Bytes::from(format!("data: {init}\n\n")))).await;
+
+                                // Deltas must reach the client while the bubble is
+                                // still growing, so the sink is a non-blocking send.
+                                let sink = tx.clone();
+                                let model_for_delta = model_owned.clone();
+                                let cid_for_delta = cid_owned.clone();
+                                let outcome = poll_muse_chat(&page, &base, |delta| {
+                                    let chunk = json!({
+                                        "id": cid_for_delta,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_for_delta,
+                                        "choices": [{ "index": 0, "delta": { "content": delta }, "finish_reason": Json::Null }]
+                                    });
+                                    let _ = sink.try_send(Ok(Bytes::from(format!("data: {chunk}\n\n"))));
+                                })
+                                .await;
+
+                                match outcome {
+                                    Ok(_) => {
+                                        let stop = json!({
+                                            "id": cid_owned,
+                                            "object": "chat.completion.chunk",
+                                            "created": created,
+                                            "model": model_owned,
+                                            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+                                        });
+                                        let _ = tx.send(Ok(Bytes::from(format!("data: {stop}\n\ndata: [DONE]\n\n")))).await;
+                                    }
+                                    Err(e) => {
+                                        let err = json!({ "error": { "message": e } });
+                                        let _ = tx.send(Ok(Bytes::from(format!("data: {err}\n\ndata: [DONE]\n\n")))).await;
+                                    }
+                                }
+                                let _ = page.close().await;
+                            });
+
+                            let headers = {
+                                let mut headers = http::HeaderMap::new();
+                                for (k, v) in nr_common::sse_constants::SSE_HEADERS_NO_BUFFER {
+                                    if let (Ok(name), Ok(value)) = (
+                                        http::header::HeaderName::try_from(*k),
+                                        http::header::HeaderValue::try_from(*v),
+                                    ) {
+                                        headers.insert(name, value);
+                                    }
+                                }
+                                headers
+                            };
+                            return Ok(ExecResult {
+                                response: UpstreamResponse::from_stream(200, headers, Box::pin(futures::stream::poll_fn({
+                                    let mut rx = rx;
+                                    move |cx| rx.poll_recv(cx)
+                                }))),
+                                url: NEW_THREAD_URL.to_string(),
+                                headers: HeaderList::new(),
+                                transformed_body: req.body,
+                                response_format: None,
+                            });
+                        }
+
+                        match poll_muse_chat(&page, &base, |_| {}).await {
+                            Ok(content) => {
+                                let _ = page.close().await;
+                                let completion = json!({
+                                    "id": cid,
+                                    "object": "chat.completion",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "message": { "role": "assistant", "content": content },
+                                        "finish_reason": "stop",
+                                        "logprobs": Json::Null
+                                    }],
+                                    "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+                                });
+                                return Ok(ExecResult {
+                                    response: UpstreamResponse::json(200, &completion),
+                                    url: NEW_THREAD_URL.to_string(),
+                                    headers: HeaderList::new(),
+                                    transformed_body: req.body,
+                                    response_format: None,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = page.close().await;
+                                return Ok(ExecResult {
+                                    response: UpstreamResponse::json(
+                                        502,
+                                        &json!({ "error": { "message": e, "type": "browser_error" } }),
+                                    ),
+                                    url: NEW_THREAD_URL.to_string(),
+                                    headers: HeaderList::new(),
+                                    transformed_body: req.body,
+                                    response_format: None,
+                                });
+                            }
+                        }
                     }
                     Err(e) => {
                         let err = json!({
