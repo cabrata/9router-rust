@@ -138,6 +138,11 @@ pub fn translate_request(
     // TODO(dedupe): stripContentTypes requires PROVIDER_MODELS[provider].strip; deferred
     // until caller threads `provider` through translate_request (currently not in signature).
 
+    // Role the client actually ended on, before any translator drops an emptied
+    // turn. detectClientLastRole: not every source uses messages[] (Gemini uses
+    // contents[], Responses/Codex use input[]).
+    let client_last_role = detect_client_last_role(&body);
+
     // Pre-translation: normalize provider-native thinking config against last message role.
     provider::normalize_thinking_config(&mut body);
 
@@ -161,7 +166,11 @@ pub fn translate_request(
                 preserve_cache_control: options.preserve_cache_control,
             });
         }
-        thinkingUnified::apply_thinking(target_format, model, &mut body, None, thinking_intent.as_ref());
+        let kiro_mapped = target_format == formats::KIRO
+            && (source_format == formats::OPENAI || source_format == formats::CLAUDE);
+        if !kiro_mapped {
+            thinkingUnified::apply_thinking(target_format, model, &mut body, None, thinking_intent.as_ref());
+        }
         return body;
     }
 
@@ -188,8 +197,15 @@ pub fn translate_request(
         }
     }
 
-    // Post-translation: apply thinking, Claude prep, cloaking
-    thinkingUnified::apply_thinking(target_format, model, &mut body, None, thinking_intent.as_ref());
+    // Post-translation: apply thinking, Claude prep, cloaking.
+    // Kiro's GenerateAssistantResponse request does not accept the generic
+    // top-level `thinking` field; its translators map thinking intent to
+    // KAS-compatible systemPrompt/additionalModelRequestFields instead.
+    let kiro_thinking_mapped_by_translator = target_format == formats::KIRO
+        && (source_format == formats::OPENAI || source_format == formats::CLAUDE);
+    if !kiro_thinking_mapped_by_translator {
+        thinkingUnified::apply_thinking(target_format, model, &mut body, None, thinking_intent.as_ref());
+    }
     if target_format == formats::OPENAI {
         crate::formats::openai::filter_to_openai_format(&mut body, &crate::formats::openai::FilterOptions {
             preserve_cache_control: options.preserve_cache_control,
@@ -206,10 +222,33 @@ pub fn translate_request(
             None,
             None,
         );
+        if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+            let mut owned = std::mem::take(messages);
+            crate::formats::claude::ensure_trailing_user_turn(&mut owned, client_last_role.as_deref());
+            *messages = owned;
+        }
         crate::formats::claude::anchor_claude_cache(&mut body);
     }
 
     body
+}
+
+/// Port of JS `detectClientLastRole`: the role the client's conversation ended
+/// on, in the source format's own shape. Only an explicit trailing
+/// model/assistant turn counts as real prefill.
+fn detect_client_last_role(body: &Json) -> Option<String> {
+    if let Some(messages) = body.get("messages").and_then(|v| v.as_array()) {
+        return messages.last().and_then(|m| m.get("role")).and_then(|v| v.as_str()).map(|s| s.to_string());
+    }
+    let items = body
+        .get("contents")
+        .and_then(|v| v.as_array())
+        .or_else(|| body.get("input").and_then(|v| v.as_array()))?;
+    let role = items.last().and_then(|m| m.get("role")).and_then(|v| v.as_str());
+    if role == Some(crate::schema::roles::ASSISTANT) || role == Some("model") {
+        return Some(crate::schema::roles::ASSISTANT.to_string());
+    }
+    None
 }
 
 /// Translate response chunk: target format → OpenAI format → source format.
@@ -487,5 +526,61 @@ mod tests {
         let chunk = json!({"choices": [{"delta": {"tool_calls": [{"id": "t1", "function": {"name": "other"}}]}}]});
         let restored = restore_tool_names(vec![chunk], Some(&map()));
         assert_eq!(restored[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "other");
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_detect_client_last_role_shapes() {
+        let openai = json!({"messages": [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]});
+        assert_eq!(detect_client_last_role(&openai).as_deref(), Some("assistant"));
+
+        let gemini = json!({"contents": [{"role": "user", "parts": []}, {"role": "model", "parts": []}]});
+        assert_eq!(detect_client_last_role(&gemini).as_deref(), Some("assistant"));
+
+        // A trailing function output must not read as prefill.
+        let responses = json!({"input": [{"type": "function_call_output", "call_id": "c1", "output": "x"}]});
+        assert_eq!(detect_client_last_role(&responses), None);
+
+        assert_eq!(detect_client_last_role(&json!({})), None);
+    }
+
+    #[test]
+    fn test_translate_request_claude_gets_trailing_user_turn() {
+        // Client ends on an assistant turn that the translator empties: Claude
+        // rejects a trailing assistant message, so the placeholder is added.
+        let body = json!({"messages": [{"role": "user", "content": "hi"}], "tools": []});
+        let out = translate_request("openai", "claude", "claude-sonnet-4-5", body, true, None, &TranslationOptions::default());
+        let messages = out["messages"].as_array().unwrap();
+        assert_eq!(messages.last().unwrap()["role"], "user");
+    }
+
+    #[test]
+    fn test_translate_request_kiro_skips_generic_thinking_field() {
+        let body = json!({"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "high"});
+        let out = translate_request("openai", "kiro", "kiro-claude-sonnet-4", body, true, None, &TranslationOptions::default());
+        assert!(!out.is_null(), "{out}");
+        // Kiro keeps thinking out of the generic top-level field.
+        assert!(out.get("thinking").is_none(), "{out}");
+        assert!(out.get("reasoning_effort").is_none(), "{out}");
+        assert!(out["conversationState"].is_object(), "{out}");
+    }
+
+    #[test]
+    fn test_translate_request_openai_to_openai_filters() {
+        // `store` is an OpenAI-native field (kept); `developer` role is
+        // normalized to `system` because most providers reject it.
+        let body = json!({"model": "x", "messages": [
+            {"role": "developer", "content": "sys"},
+            {"role": "user", "content": "hi"}
+        ], "store": true});
+        let out = translate_request("openai", "openai", "x", body, true, None, &TranslationOptions::default());
+        assert_eq!(out["messages"][0]["role"], "system");
+        assert_eq!(out["messages"][1]["content"], "hi");
+        assert_eq!(out["store"], true);
     }
 }
