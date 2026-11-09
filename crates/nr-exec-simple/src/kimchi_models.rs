@@ -104,7 +104,15 @@ pub fn normalize_kimchi_model(item: &Json) -> Option<Json> {
         .unwrap_or_default();
 
     let limits = obj.get("limits").filter(|v| v.is_object());
-    let number = |v: Option<&Value>| v.and_then(Value::as_f64).filter(|n| *n != 0.0);
+    // JS `Number()` keeps integer identity, so read integers as integers and
+    // only fall back to f64 for fractional limits.
+    let number = |v: Option<&Value>| {
+        let v = v?;
+        if let Some(i) = v.as_i64() {
+            return (i != 0).then(|| json!(i));
+        }
+        v.as_f64().filter(|n| *n != 0.0).map(|n| json!(n))
+    };
     let limit = |key: &str| limits.and_then(|l| l.get(key));
     let context_length = number(limit("context_window"))
         .or_else(|| number(obj.get("contextLength")))
@@ -128,11 +136,11 @@ pub fn normalize_kimchi_model(item: &Json) -> Option<Json> {
     let mut capabilities = serde_json::Map::new();
     capabilities.insert("vision".into(), json!(vision));
     capabilities.insert("reasoning".into(), json!(reasoning));
-    if let Some(ctx) = context_length {
-        capabilities.insert("contextWindow".into(), json!(ctx));
+    if let Some(ref ctx) = context_length {
+        capabilities.insert("contextWindow".into(), ctx.clone());
     }
-    if let Some(max) = max_output_tokens {
-        capabilities.insert("maxOutput".into(), json!(max));
+    if let Some(ref max) = max_output_tokens {
+        capabilities.insert("maxOutput".into(), max.clone());
     }
     if !upstream_provider.is_empty() {
         capabilities.insert("upstreamProvider".into(), json!(upstream_provider));
@@ -337,7 +345,13 @@ pub fn catalog_payload(entry: &KimchiCatalog) -> Value {
 /// `truthy` re-export guard: keeps the JSON-truthiness helper honest for callers
 /// that build catalog entries from JS-shaped values.
 pub fn has_entries(value: &Json) -> bool {
-    truthy(get_path(value, &["models"]).unwrap_or(&Json::Null))
+    // The JS guards on a non-empty model list; an empty array is truthy in JS,
+    // so plain `truthy` is not enough here.
+    match get_path(value, &["models"]) {
+        Some(Json::Array(models)) => !models.is_empty(),
+        Some(other) => truthy(other),
+        None => false,
+    }
 }
 
 #[cfg(test)]
