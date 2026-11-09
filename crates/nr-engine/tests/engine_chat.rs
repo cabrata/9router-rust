@@ -381,7 +381,9 @@ async fn streaming_request_scoped_error_emits_sse_error_frame() {
     let engine = RealChatEngine::new(db);
     let resp = engine.handle_chat(chat_req("openai/gpt-4o", true)).await.unwrap();
     assert_eq!(resp.status, 400);
-    assert_eq!(resp.content_type(), "application/json", "error frames stay JSON-typed");
+    // The body is SSE frames, so the type must be text/event-stream: a client
+    // that trusted application/json here would try to JSON-parse `data:` lines.
+    assert_eq!(resp.content_type(), "text/event-stream", "error frames are SSE");
 
     let data = nr_core::http::collect_sse_data(resp.body).await.unwrap();
     let joined = data.join("|");

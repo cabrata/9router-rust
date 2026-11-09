@@ -120,7 +120,6 @@ pub fn transform_sse_to_client(
 
     tokio::spawn(async move {
         let mut upstream = body;
-        let mut done_sent = false;
         let mut aborted = false;
         // Small line buffer: upstream frames may be split across TCP chunks.
         let mut line_buf = String::new();
@@ -157,7 +156,9 @@ pub fn transform_sse_to_client(
                         }
                         let payload = line.strip_prefix("data:").map(str::trim_start).unwrap_or("");
                         if payload == "[DONE]" {
-                            done_sent = true;
+                            // The sentinel is consumed here, never forwarded; the
+                            // terminal frame is synthesized below (JS passthrough
+                            // does the same: forward, then append `data: [DONE]`).
                             continue;
                         }
                         let Ok(parsed) = serde_json::from_str::<Json>(payload) else { continue };
@@ -189,7 +190,10 @@ pub fn transform_sse_to_client(
             send!(Ok(build_stream_error_bytes(504, "Upstream stream aborted", client_format)));
             return;
         }
-        if !done_sent && client_format != "claude" {
+        // Terminate the stream: some clients (OpenClaw) hang without the OpenAI
+        // sentinel. Claude closes on the translator's message_stop instead, and
+        // Gemini-family clients reject the sentinel outright.
+        if client_format != "claude" {
             send!(Ok(Bytes::from_static(SSE_DONE.as_bytes())));
         }
     });

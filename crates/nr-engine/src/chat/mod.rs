@@ -261,6 +261,13 @@ async fn execute_on_account(
         )
     };
 
+    // chatCore always writes the resolved upstream id back onto the body after
+    // translation (`translatedBody.model = stripThinkingSuffix(upstreamModel)`):
+    // the client sent `provider/model`, the upstream wants the bare id.
+    if let Some(obj) = translated_body.as_object_mut() {
+        obj.insert("model".into(), json!(model));
+    }
+
     // RTK token saver: compress tool_result blobs on the final body
     // (chatCore applies it post-translate for non-cursor providers).
     let rtk_enabled = settings.get("rtkEnabled").and_then(Json::as_bool).unwrap_or(false);
@@ -343,11 +350,13 @@ async fn execute_on_account(
         // A request-scoped 4xx on a streaming request: hand back a clean SSE error
         // frame so the client sees the real cause rather than a truncated stream.
         let bytes = build_stream_error_bytes(status, &error_text, source_format);
-        let headers = error_headers();
+        let headers = sse_error_headers();
         return Err(AttemptError::Fatal(UpstreamResponse::from_bytes(status, headers, bytes)));
     }
     if decision.request_scoped {
-        let payload = json_error(status, &error_text);
+        // JS `errorResponse` body: `buildErrorBody(...)` keeps the details under
+        // an `error` key, so clients read `error.message`, not `message`.
+        let payload = serde_json::json!({ "error": json_error(status, &error_text) });
         return Err(AttemptError::Fatal(UpstreamResponse::json(status, &payload)));
     }
 
@@ -378,9 +387,9 @@ fn finish_response(
     response
 }
 
-fn error_headers() -> http::HeaderMap {
+fn sse_error_headers() -> http::HeaderMap {
     let mut headers = http::HeaderMap::new();
-    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("application/json"));
+    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("text/event-stream"));
     headers
 }
 

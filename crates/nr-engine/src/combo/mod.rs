@@ -64,7 +64,15 @@ pub async fn handle_combo_chat(
                 last_error = e.to_string();
                 last_status = e.status();
                 if is_last(i) {
-                    return ComboOutcome::Exhausted { status: last_status, error: last_error, response: None };
+                    // JS `handleComboChat` always receives a Response from
+                    // `handleSingleModelChat` (never a throw), so the last
+                    // member's failure still reaches the client as its own
+                    // status + error envelope. Rebuild that here.
+                    return ComboOutcome::Exhausted {
+                        status: last_status,
+                        response: Some(error_response(last_status, &last_error)),
+                        error: last_error,
+                    };
                 }
                 continue;
             }
@@ -130,6 +138,11 @@ fn extract_message(body: &str) -> Option<String> {
         .and_then(|e| e.get("message").and_then(Json::as_str).map(str::to_string))
         .or_else(|| v.get("error").and_then(Json::as_str).map(str::to_string))
         .or_else(|| v.get("message").and_then(Json::as_str).map(str::to_string))
+}
+
+/// OpenAI error envelope with the given status (JS `errorResponse`).
+fn error_response(status: u16, message: &str) -> UpstreamResponse {
+    UpstreamResponse::json(status, &serde_json::json!({ "error": crate::stream::json_error(status, message) }))
 }
 
 /// Round-robin: derive a per-combo counter and rotate the starting seat.
