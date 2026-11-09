@@ -30,6 +30,10 @@ use crate::launcher_process::PidRecord;
 
 /// Check if a process with the given PID is alive.
 pub fn is_pid_alive(pid: u32) -> bool {
+    // pid 0 means "the whole process group" to kill(2), not a real process.
+    if pid == 0 {
+        return false;
+    }
     #[cfg(unix)]
     {
         // On Unix, kill with signal 0 returns 0 if process exists, ESRCH if not
