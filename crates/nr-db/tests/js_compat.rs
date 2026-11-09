@@ -615,7 +615,10 @@ fn opens_database_written_by_the_js_app() {
     assert_eq!(stats["totalPromptTokens"], json!(10));
     assert_eq!(stats["totalCompletionTokens"], json!(20));
 
-    assert_eq!(get_chart_data(&db, Some("7d")).unwrap().len(), 1);
+    // getChartData("7d") always returns 7 buckets, empty days zero-filled.
+    let chart = get_chart_data(&db, Some("7d")).unwrap();
+    assert_eq!(chart.len(), 7);
+    assert!(chart.iter().all(|b| b.get("label").is_some()));
     // usageRepo's text lines (JS `getRecentLogs`): "date | model | PROVIDER | ...".
     let recent = nr_db::repos::usage::get_recent_logs(&db, 10).unwrap();
     assert_eq!(recent.len(), 1);
@@ -662,4 +665,95 @@ fn opens_database_written_by_the_js_app() {
             "accessAllow",
         ]
     );
+}
+
+/// Read-only probe of a *real* `~/.9router` database checked into this machine,
+/// kept as `#[ignore]` so CI never depends on it. It copies the file first, so
+/// the live database is never opened, migrated or written.
+///
+///   NR_REAL_DB=~/.9router/db/data.sqlite \
+///     cargo test -p nr-db --test js_compat -- --ignored --nocapture real_database
+#[test]
+#[ignore]
+fn real_database_probe() {
+    let Some(src) = std::env::var_os("NR_REAL_DB") else {
+        eprintln!("NR_REAL_DB not set; nothing to probe");
+        return;
+    };
+    let src = std::path::PathBuf::from(src);
+    let dir = TempDir::new().unwrap();
+
+    // Copy main + WAL + SHM so uncommitted WAL frames are visible, and so the
+    // original is untouched.
+    for suffix in ["", "-wal", "-shm"] {
+        let from = std::path::PathBuf::from(format!("{}{}", src.display(), suffix));
+        if from.exists() {
+            let to = dir.path().join(format!("data.sqlite{suffix}"));
+            std::fs::copy(&from, &to).unwrap();
+        }
+    }
+    let copy = dir.path().join("data.sqlite");
+
+    // Read the on-disk state before handing the file to the Rust layer.
+    let raw = rusqlite::Connection::open(&copy).unwrap();
+    let js_version: String = raw
+        .query_row("SELECT value FROM _meta WHERE key='schemaVersion'", [], |r| r.get(0))
+        .unwrap();
+    let app_version: String = raw
+        .query_row("SELECT value FROM _meta WHERE key='appVersion'", [], |r| r.get(0))
+        .unwrap();
+    let mut counts: Vec<(String, i64)> = Vec::new();
+    for table in [
+        "_meta", "settings", "providerConnections", "providerNodes", "proxyPools", "apiKeys",
+        "combos", "kv", "usageHistory", "usageDaily", "requestDetails", "requestLogs",
+    ] {
+        let n: i64 = raw
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        counts.push((table.to_string(), n));
+    }
+    drop(raw);
+
+    println!("appVersion={app_version} schemaVersion={js_version}");
+    for (table, n) in &counts {
+        println!("{table}: {n}");
+    }
+
+    // Now open it through the Rust layer; this runs the ported migrations.
+    let db = Db::open(&copy).unwrap();
+    let rust_version: String = db
+        .query_row("SELECT value FROM _meta WHERE key='schemaVersion'", &[], |r| r.get(0))
+        .unwrap()
+        .unwrap();
+    println!("after Rust open: schemaVersion={rust_version}");
+
+    // Versions agree: a file already at or past this port's newest migration is
+    // never downgraded, and one behind it is brought up to date.
+    let js_v: i32 = js_version.parse().unwrap();
+    let rust_v: i32 = rust_version.parse().unwrap();
+    let latest = nr_db::migrate::latest_version();
+    assert_eq!(rust_v, js_v.max(latest), "migration must be monotonic");
+
+    // Every repo read path must survive the real file.
+    let _ = get_settings(&db).unwrap();
+    let conns = get_provider_connections(&db, None).unwrap();
+    let _ = get_provider_nodes(&db, None).unwrap();
+    let _ = get_proxy_pools(&db, None).unwrap();
+    let keys = get_api_keys(&db).unwrap();
+    let _ = get_combos(&db).unwrap();
+    let _ = get_model_aliases(&db).unwrap();
+    let _ = get_custom_models(&db).unwrap();
+    let _ = get_mitm_alias(&db, None).unwrap();
+    let _ = get_pricing(&db).unwrap();
+    let _ = get_disabled_models(&db).unwrap();
+    let _ = get_usage_history(&db, None).unwrap();
+    let _ = get_usage_stats(&db, Some("all")).unwrap();
+    let _ = get_chart_data(&db, Some("30d")).unwrap();
+    let _ = get_request_details_page(&db, None).unwrap();
+    let _ = get_request_logs(&db, &RequestLogFilter::from_json(None)).unwrap();
+    let _ = nr_db::repos::usage::get_recent_logs(&db, 50).unwrap();
+    let _ = nr_db::repos::request_logs::get_recent_logs(&db, 50).unwrap();
+
+    println!("connections={} apiKeys={}", conns.len(), keys.len());
+    assert_eq!(conns.len(), counts.iter().find(|(t, _)| t == "providerConnections").unwrap().1 as usize);
 }
