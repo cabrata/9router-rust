@@ -54,12 +54,14 @@ pub struct ParsedModel {
     pub model: Option<String>,
     /// True when the string had no `/` (a model alias, not provider/model).
     pub is_alias: bool,
+    /// The raw text before the `/` (JS `providerAlias`), before alias resolution.
+    pub provider_alias: Option<String>,
 }
 
 /// Parse `alias/model`, `provider/model`, or a bare alias (JS `parseModel`).
 pub fn parse_model(model_str: &str) -> ParsedModel {
     if model_str.is_empty() {
-        return ParsedModel { provider: None, model: None, is_alias: false };
+        return ParsedModel { provider: None, model: None, is_alias: false, provider_alias: None };
     }
     if let Some(slash) = model_str.find('/') {
         let provider_or_alias = &model_str[..slash];
@@ -68,9 +70,60 @@ pub fn parse_model(model_str: &str) -> ParsedModel {
             provider: Some(resolve_provider_alias(provider_or_alias)),
             model: Some(model.to_string()),
             is_alias: false,
+            provider_alias: Some(provider_or_alias.to_string()),
         };
     }
-    ParsedModel { provider: None, model: Some(model_str.to_string()), is_alias: true }
+    ParsedModel { provider: None, model: Some(model_str.to_string()), is_alias: true, provider_alias: None }
+}
+
+/// Provider ids/aliases that a user-defined node prefix must not shadow
+/// (JS `RESERVED_PROVIDER_PREFIXES` + `LOCAL_PROVIDER_ALIASES`).
+fn reserved_provider_prefixes() -> &'static std::collections::HashSet<String> {
+    use std::sync::LazyLock;
+    static SET: LazyLock<std::collections::HashSet<String>> = LazyLock::new(|| {
+        let mut set: std::collections::HashSet<String> = ["xmtp", "xiaomi-tokenplan"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for entry in nr_data::registry() {
+            if let Some(id) = entry.get("id").and_then(Json::as_str) {
+                set.insert(id.to_string());
+            }
+            if let Some(alias) = entry.get("alias").and_then(Json::as_str) {
+                set.insert(alias.to_string());
+            }
+            if let Some(aliases) = entry.get("aliases").and_then(Json::as_array) {
+                for a in aliases.iter().filter_map(Json::as_str) {
+                    set.insert(a.to_string());
+                }
+            }
+        }
+        set
+    });
+    &SET
+}
+
+/// Match a `provider/model` prefix against user-defined provider nodes
+/// (JS `getModelInfo` in src/sse/services/model.js): the node `prefix` wins over
+/// the built-in alias map, except for reserved provider ids/aliases.
+fn resolve_node_prefix(db: &Db, parsed: &ParsedModel) -> Option<(String, String)> {
+    let alias = parsed.provider_alias.as_deref()?;
+    if reserved_provider_prefixes().contains(alias) {
+        return None;
+    }
+    for node_type in ["openai-compatible", "anthropic-compatible", "custom-embedding"] {
+        let nodes = nr_db::repos::get_provider_nodes(db, Some(&serde_json::json!({ "type": node_type })))
+            .unwrap_or_default();
+        if let Some(node) = nodes
+            .iter()
+            .find(|n| n.get("prefix").and_then(Json::as_str) == Some(alias))
+        {
+            if let Some(id) = node.get("id").and_then(Json::as_str) {
+                return Some((id.to_string(), parsed.model.clone().unwrap_or_default()));
+            }
+        }
+    }
+    None
 }
 
 /// Builtin model aliases (BUILTIN_MODEL_ALIASES).
@@ -128,6 +181,11 @@ fn resolve_model_alias_from_map(alias: &str, aliases: &Json) -> Option<(String, 
 pub fn get_model_info(db: &Db, model_str: &str) -> (Option<String>, String) {
     let parsed = parse_model(model_str);
     if !parsed.is_alias {
+        // Provider-node prefixes are user-defined; they win over the alias map
+        // but must not shadow built-in provider ids/aliases (JS getModelInfo).
+        if let Some(resolved) = resolve_node_prefix(db, &parsed) {
+            return (Some(resolved.0), resolved.1);
+        }
         return (parsed.provider, parsed.model.unwrap_or_default());
     }
     let alias = parsed.model.clone().unwrap_or_default();
@@ -225,5 +283,35 @@ mod tests {
             Some(("anthropic".into(), "claude-3-haiku".into()))
         );
         assert_eq!(resolve_model_alias_from_map("missing", &aliases), None);
+    }
+
+    /// A user-defined node prefix routes to that node's provider id; reserved
+    /// provider ids/aliases are never shadowed (JS getModelInfo).
+    #[test]
+    fn node_prefix_routes_to_node_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = Db::open_in(dir.path()).unwrap();
+        nr_db::repos::create_provider_node(
+            &db,
+            &serde_json::json!({
+                "id": "openai-compatible-chat-abc123",
+                "type": "openai-compatible",
+                "prefix": "mock",
+                "apiType": "chat",
+                "baseUrl": "http://127.0.0.1:9/v1",
+                "name": "mock",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_model_info(&db, "mock/mock-model"),
+            (Some("openai-compatible-chat-abc123".into()), "mock-model".into())
+        );
+        // Reserved built-in prefix keeps its normal alias resolution.
+        assert_eq!(
+            get_model_info(&db, "openai/gpt-4o"),
+            (Some("openai".into()), "gpt-4o".into())
+        );
     }
 }
