@@ -136,6 +136,9 @@ pub async fn patch_settings(ext: Option<Extension<Db>>, Json(mut body): Json<Val
         Err(e) => return internal_error(format!("Failed to update settings: {e}")),
     };
 
+    // `initializeApp` re-arms the tunnel supervisor whenever settings change.
+    crate::routes::tunnel::configure_tunnel_monitoring(&updated);
+
     let oidc_configured = updated.get("oidcIssuerUrl").and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty())
         && updated.get("oidcClientId").and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty())
         && updated.get("oidcClientSecret").and_then(|v| v.as_str()).map_or(false, |s| !s.is_empty());

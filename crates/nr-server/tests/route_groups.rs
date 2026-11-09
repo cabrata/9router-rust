@@ -328,6 +328,40 @@ async fn tunnel_disable_and_tailscale_disable_succeed() {
     assert_eq!(body["success"], true);
 }
 
+/// The test host has no tailscale binary. `tailscale-enable` must report that
+/// instead of faking a tunnel (the JS flow would fall through to the installer).
+#[tokio::test]
+async fn tunnel_tailscale_enable_reports_missing_binary() {
+    if which("tailscale").is_some() {
+        return; // developer machine with tailscale installed: not our case
+    }
+    let (status, body) = call("POST", "/api/tunnel/tailscale-enable", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let message = body["error"].as_str().unwrap_or("");
+    assert!(message.contains("not installed"), "unexpected error: {body}");
+}
+
+/// A disable when nothing runs is still a success (the JS clears state and
+/// settings unconditionally).
+#[tokio::test]
+async fn tunnel_disable_clears_settings() {
+    let db = test_db();
+    let _ = nr_db::update_settings(&db, json!({ "tunnelEnabled": true, "tunnelUrl": "https://x" }));
+    let (status, body) = call("POST", "/api/tunnel/disable", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["success"], true);
+    let settings = nr_db::get_settings(&db).unwrap();
+    assert_eq!(settings["tunnelEnabled"], false);
+    assert_eq!(settings["tunnelUrl"], "");
+}
+
+fn which(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
 // ─── mcp ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]

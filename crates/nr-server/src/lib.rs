@@ -45,6 +45,8 @@ pub fn app() -> Router {
     // Without this the gateway falls back to nr-engine's stub pass-through
     // engine and answers every chat with a canned "pass-through" completion.
     nr_engine::install_real_engines(db.clone());
+    // Auto-resume an already-enabled Cloudflare/Tailscale tunnel (initializeApp).
+    routes::tunnel::init_monitoring();
     Router::new()
         .route("/health", get(|| async { Json(json!({ "ok": true })) }))
         .merge(v1::v1_router())

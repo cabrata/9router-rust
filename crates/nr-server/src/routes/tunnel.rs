@@ -24,10 +24,29 @@ const HEALTH_INTERVAL_MS: u64 = 2000;
 const CLOUDFLARE_HEALTH_TIMEOUT_MS: u64 = 60_000;
 const TAILSCALE_ENABLE_TIMEOUT_MS: u64 = 20_000;
 const FETCH_TIMEOUT_MS: u64 = 5000;
+/// `HEALTH_CHECK.dnsTimeoutMs` (cloudflare/config.js and tailscale/config.js).
+const DNS_TIMEOUT_MS: u64 = 3000;
 const STATUS_CACHE_TTL_MS: u64 = 3000;
 const PROBE_TTL_MS: u64 = 10_000;
 const DNS_WARMUP_DELAY_MS: u64 = 8000;
 const STARTUP_TIMEOUT_MS: u64 = 90_000;
+
+// ─── shared/watchdogConfig.js ───────────────────────────────────────────────
+
+/// Cooldown for repeating watchdog restarts (anti hammer-loop).
+const RESTART_COOLDOWN_MS: u64 = 120_000;
+/// Wait for DHCP/DNS to settle after a network change.
+const NETWORK_SETTLE_MS: u64 = 2500;
+const WATCHDOG_INTERVAL_MS: u64 = 60_000;
+const NETWORK_CHECK_INTERVAL_MS: u64 = 5000;
+
+/// `FORCE_RESTART_REASONS`: one-shot transitions bypass the cooldown.
+fn is_force_restart_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "startup" | "netchange" | "sleep" | "sleep+netchange" | "online" | "unexpected-exit"
+    )
+}
 
 fn tunnel_dir() -> PathBuf {
     nr_core::paths::data_dir().join("tunnel")
@@ -145,6 +164,38 @@ unsafe fn libc_kill(pid: i32, sig: i32) -> i32 {
 fn is_cloudflared_running() -> bool {
     load_pid().map(is_pid_alive).unwrap_or(false)
 }
+
+/// `killCloudflaredByPort(port)`: kill any cloudflared whose command line
+/// targets this port. The boundary class (`:20128` must not match `:201280`)
+/// is what makes the pattern safe.
+fn kill_cloudflared_by_port(port: u16) {
+    let pattern = format!("cloudflared.*:{}[^0-9]", port);
+    let _ = Command::new("pkill")
+        .args(["-f", &pattern])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// `killCloudflared(localPort)`: stop the tracked child, the recorded PID, and
+/// anything else serving the port.
+fn kill_cloudflared(local_port: Option<u16>) {
+    INTENTIONAL_KILL.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(pid) = load_pid() {
+        #[cfg(unix)]
+        unsafe {
+            libc_kill(pid as i32, 15)
+        };
+        clear_pid();
+    }
+    if let Some(port) = local_port {
+        kill_cloudflared_by_port(port);
+    }
+}
+
+/// Set while a deliberate kill is in flight so a child exit is not treated as
+/// an unexpected exit (`intentionalKill` in cloudflared.js).
+static INTENTIONAL_KILL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ─── cloudflared download ───────────────────────────────────────────────────
 
@@ -329,9 +380,97 @@ async fn download_file(url: &str, dest: &Path) -> Result<(), String> {
 
 // ─── tunnel health probes ───────────────────────────────────────────────────
 
+/// Build a DNS A-record query packet for `hostname` (recursion desired).
+///
+/// `shared/dnsResolver.js` asks public resolvers directly so the OS negative
+/// cache (mDNSResponder holds NXDOMAIN) cannot make a freshly registered
+/// quick tunnel look dead. Same wire format, hand-rolled to avoid a DNS dep.
+fn build_dns_query(hostname: &str, txid: u16) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(32);
+    packet.extend_from_slice(&txid.to_be_bytes());
+    packet.extend_from_slice(&0x0100u16.to_be_bytes()); // RD=1
+    packet.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    packet.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    packet.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    packet.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    for label in hostname.trim_end_matches('.').split('.') {
+        let len = label.len().min(63);
+        packet.push(len as u8);
+        packet.extend_from_slice(&label.as_bytes()[..len]);
+    }
+    packet.push(0);
+    packet.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+    packet.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+    packet
+}
+
+/// `true` when the reply is a NOERROR answer with at least one A record.
+fn dns_reply_resolved(reply: &[u8], txid: u16) -> bool {
+    if reply.len() < 12 {
+        return false;
+    }
+    if u16::from_be_bytes([reply[0], reply[1]]) != txid {
+        return false;
+    }
+    let rcode = reply[3] & 0x0f;
+    let answers = u16::from_be_bytes([reply[6], reply[7]]);
+    rcode == 0 && answers > 0
+}
+
+/// `resolveDns(hostname, timeoutMs)`: public resolvers first, OS resolver after.
+async fn resolve_dns(hostname: &str, timeout_ms: u64) -> bool {
+    if hostname.is_empty() {
+        return false;
+    }
+    // A literal IP always "resolves".
+    if hostname.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+
+    const PUBLIC_RESOLVERS: [&str; 3] = ["1.1.1.1:53", "1.0.0.1:53", "8.8.8.8:53"];
+    for server in PUBLIC_RESOLVERS {
+        let Ok(bind) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else { continue };
+        if bind.connect(server).await.is_err() {
+            continue;
+        }
+        let txid = (now_ms() & 0xffff) as u16;
+        let query = build_dns_query(hostname, txid);
+        if bind.send(&query).await.is_err() {
+            continue;
+        }
+        let mut buf = [0u8; 512];
+        match tokio::time::timeout(Duration::from_millis(timeout_ms), bind.recv(&mut buf)).await {
+            Ok(Ok(n)) if dns_reply_resolved(&buf[..n], txid) => return true,
+            Ok(Ok(_)) => continue, // NOERROR/empty → try the next resolver
+            _ => continue,
+        }
+    }
+
+    // Fall back to the OS resolver, like `dns.promises.resolve4`.
+    let lookup = tokio::net::lookup_host((hostname, 0));
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), lookup).await {
+        Ok(Ok(mut addrs)) => {
+            let mut found = false;
+            for addr in addrs.by_ref() {
+                if addr.is_ipv4() {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        }
+        _ => false,
+    }
+}
+
 /// `probeUrlAlive(url)`: `GET {url}/api/health` returns 2xx.
 async fn probe_url_alive(url: &str) -> bool {
     if url.is_empty() {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(url) else { return false };
+    let Some(hostname) = parsed.host_str() else { return false };
+    if !resolve_dns(hostname, DNS_TIMEOUT_MS).await {
         return false;
     }
     let Ok(client) = nr_core::http::client_for(None, false) else { return false };
@@ -344,6 +483,18 @@ async fn probe_url_alive(url: &str) -> bool {
         Ok(Ok(res)) => res.status().is_success(),
         _ => false,
     }
+}
+
+/// `checkInternet()`: TCP connect to 1.1.1.1:443 within 3 s.
+async fn check_internet() -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(3000),
+            tokio::net::TcpStream::connect(("1.1.1.1", 443))
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 /// `waitForHealth(url, cancelToken)`.
@@ -393,6 +544,20 @@ fn write_settings(ext: &Option<Extension<Db>>, updates: Value) {
 static CANCEL: std::sync::LazyLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
     std::sync::LazyLock::new(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
+/// The last port an enable flow targeted (`svc.activeLocalPort`).
+static ACTIVE_LOCAL_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+/// `svc.spawnInProgress`: an enable flow is mid-flight.
+static SPAWN_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// `svc.lastRestartAt` in epoch ms; 0 = never.
+static LAST_RESTART_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn active_local_port() -> Option<u16> {
+    match ACTIVE_LOCAL_PORT.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => None,
+        p => Some(p),
+    }
+}
+
 struct TunnelError {
     status: StatusCode,
     message: String,
@@ -409,6 +574,20 @@ async fn enable_tunnel(ext: &Option<Extension<Db>>, local_port: u16) -> Result<V
     CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
     let cancel = CANCEL.clone();
     cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    ACTIVE_LOCAL_PORT.store(local_port, std::sync::atomic::Ordering::SeqCst);
+    SPAWN_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let result = enable_tunnel_inner(ext, local_port, &cancel).await;
+    SPAWN_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+    result
+}
+
+async fn enable_tunnel_inner(
+    ext: &Option<Extension<Db>>,
+    local_port: u16,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Value, TunnelError> {
+    let cancel = cancel.clone();
 
     if is_cloudflared_running() {
         if let Some(existing) = load_state() {
@@ -431,13 +610,8 @@ async fn enable_tunnel(ext: &Option<Extension<Db>>, local_port: u16) -> Result<V
     }
 
     // killCloudflared(localPort)
-    if let Some(pid) = load_pid() {
-        #[cfg(unix)]
-        unsafe {
-            libc_kill(pid as i32, 15)
-        };
-        clear_pid();
-    }
+    kill_cloudflared(Some(local_port));
+    INTENTIONAL_KILL.store(false, std::sync::atomic::Ordering::SeqCst);
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(TunnelError::new(StatusCode::INTERNAL_SERVER_ERROR, "tunnel cancelled"));
     }
@@ -589,13 +763,8 @@ fn quick_tunnel_url(line: &str) -> Option<String> {
 /// `disableTunnel()`.
 fn disable_tunnel(ext: &Option<Extension<Db>>) -> Value {
     CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
-    if let Some(pid) = load_pid() {
-        #[cfg(unix)]
-        unsafe {
-            libc_kill(pid as i32, 15)
-        };
-        clear_pid();
-    }
+    kill_cloudflared(active_local_port());
+    INTENTIONAL_KILL.store(false, std::sync::atomic::Ordering::SeqCst);
     if let Some(state) = load_state() {
         let short_id = state.get("shortId").cloned().unwrap_or(Value::Null);
         save_state(&json!({ "shortId": short_id, "tunnelUrl": Value::Null }));
@@ -644,12 +813,26 @@ fn get_tailscale_bin() -> Option<String> {
         if Path::new(well_known).exists() {
             return Some(well_known.to_string());
         }
-        return None;
+        return find_in_path(if cfg!(windows) { "tailscale.exe" } else { "tailscale" });
     }
     unix_tailscale_candidates()
         .iter()
         .find(|p| Path::new(p).exists())
         .map(|p| (*p).to_string())
+        .or_else(|| find_in_path("tailscale"))
+}
+
+/// `which <name>`: resolve a binary on `$PATH` (`bgRefreshBin` in tailscale.js
+/// trusts `which` when the well-known install paths miss).
+fn find_in_path(name: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 fn is_tailscale_installed() -> bool {
@@ -820,6 +1003,27 @@ fn is_custom_daemon_running() -> bool {
         .unwrap_or(false)
 }
 
+/// `isDaemonTunMode()`: `pgrep -af "tailscaled.*<socket>"`, `None` when absent.
+fn daemon_tun_mode() -> Option<bool> {
+    let socket = tailscale_socket().to_string_lossy().into_owned();
+    let out = Command::new("pgrep")
+        .args(["-af", &format!("tailscaled.*{socket}")])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let line = text.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(!line.contains("--tun=userspace-networking"))
+}
+
+/// `isDaemonAlive()`: a tailscaled process exists for our socket, regardless of
+/// funnel state (mirrors the cloudflared PID check).
+fn is_daemon_alive() -> bool {
+    daemon_tun_mode().is_some()
+}
+
 fn has_brew() -> bool {
     Command::new("which")
         .arg("brew")
@@ -890,7 +1094,7 @@ fn start_daemon(password: &str) {
 /// polling `status --json` for the auth URL.
 async fn start_login(hostname: &str) -> Value {
     let Some(bin) = get_tailscale_bin() else {
-        return json!({ "error": "Tailscale not installed" });
+        return json!({ "error": "Tailscale is not installed. Run the Tailscale installer first." });
     };
     let mut args = custom_socket_args();
     args.push("up".into());
@@ -1009,6 +1213,14 @@ fn stop_funnel() {
 
 /// `enableTailscale(localPort)`.
 async fn enable_tailscale(ext: &Option<Extension<Db>>, local_port: u16) -> Result<Value, TunnelError> {
+    // Never fake success when the CLI is missing: the dashboard needs to offer
+    // the installer instead (`installTailscale` in the JS build).
+    if !is_tailscale_installed() {
+        return Err(TunnelError::new(
+            StatusCode::BAD_REQUEST,
+            "Tailscale is not installed. Run the Tailscale installer first.",
+        ));
+    }
     let password = crate::mitm::manager::cached_password().unwrap_or_default();
     start_daemon(&password);
 
@@ -1099,6 +1311,299 @@ fn tailscale_status(ext: &Option<Extension<Db>>) -> Value {
     })
 }
 
+// ─── watchdog + network monitor (initializeApp.js) ──────────────────────────
+//
+// Both managers self-reconnect (cloudflared `--retries 99`, tailscaled is an OS
+// daemon), so the supervisor only intervenes when the process is gone.
+
+struct MonitoringState {
+    /// Spawned watchdog task; dropping the sender stops it.
+    watchdog: Option<tokio::task::JoinHandle<()>>,
+    monitor: Option<tokio::task::JoinHandle<()>>,
+    /// `g.lastNetworkFingerprint`.
+    last_fingerprint: Option<String>,
+    /// `g.lastOnline`: `None` until the first reachability probe.
+    last_online: Option<bool>,
+    /// `g.lastWatchdogTick`.
+    last_tick_ms: u64,
+}
+
+static MONITOR: std::sync::LazyLock<parking_lot::Mutex<MonitoringState>> =
+    std::sync::LazyLock::new(|| {
+        parking_lot::Mutex::new(MonitoringState {
+            watchdog: None,
+            monitor: None,
+            last_fingerprint: None,
+            last_online: None,
+            last_tick_ms: 0,
+        })
+    });
+
+/// `VIRTUAL_IFACE_REGEX`: skip interfaces that flap and cause false netchange.
+fn is_virtual_iface(name: &str) -> bool {
+    const PREFIXES: [&str; 13] = [
+        "utun", "awdl", "llw", "anpi", "bridge", "gif", "stf", "ipsec", "ap", "tun", "tap", "vmnet",
+        "veth",
+    ];
+    let lower = name.to_ascii_lowercase();
+    PREFIXES.iter().any(|p| lower.starts_with(p)) || lower.starts_with("docker")
+}
+
+/// `getNetworkFingerprint()`: sorted `iface:ipv4` of non-internal interfaces.
+fn network_fingerprint() -> String {
+    let mut entries: Vec<String> = match if_addrs_v4() {
+        Some(list) => list
+            .into_iter()
+            .filter(|(name, _)| !is_virtual_iface(name))
+            .map(|(name, ip)| format!("{name}:{ip}"))
+            .collect(),
+        None => Vec::new(),
+    };
+    entries.sort();
+    entries.join("|")
+}
+
+/// IPv4 addresses per interface. Reads `/sys/class/net` on Linux; elsewhere the
+/// monitor degrades to "no fingerprint" and only the online edge triggers a
+/// restart. (A netlink/getifaddrs dependency is not worth it for a supervisor.)
+fn if_addrs_v4() -> Option<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let entries = std::fs::read_dir("/sys/class/net").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Linux exposes one directory per assigned address under the interface.
+        let Ok(addrs) = std::fs::read_dir(entry.path()) else { continue };
+        for addr in addrs.flatten() {
+            let ip = addr.file_name().to_string_lossy().into_owned();
+            if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                out.push((name.clone(), ip));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `safeRestartTunnel(reason)`.
+async fn safe_restart_tunnel(reason: &str) {
+    let ext = db_extension();
+    let settings = settings_of(&ext);
+    if settings.get("tunnelEnabled").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    if CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    if SPAWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+
+    // A live process is trusted: cloudflared self-reconnects and keeps its URL.
+    if is_cloudflared_running() {
+        return;
+    }
+
+    let force = is_force_restart_reason(reason);
+    let last = LAST_RESTART_AT.load(std::sync::atomic::Ordering::SeqCst);
+    if !force && now_ms().saturating_sub(last) < RESTART_COOLDOWN_MS {
+        tracing::info!("[Tunnel] degraded but cooldown active, skip ({reason})");
+        return;
+    }
+    if !check_internet().await {
+        return;
+    }
+
+    tracing::info!("[Tunnel] safeRestart ({reason}) — tunnel unreachable");
+    match enable_tunnel(&ext, active_local_port().unwrap_or(20128)).await {
+        Ok(_) => {
+            LAST_RESTART_AT.store(now_ms(), std::sync::atomic::Ordering::SeqCst);
+            tracing::info!("[Tunnel] restart success");
+        }
+        Err(e) => {
+            if !e.message.contains("cloudflared killed") && !e.message.contains("tunnel cancelled") {
+                tracing::warn!("[Tunnel] restart failed: {}", e.message);
+            }
+        }
+    }
+}
+
+/// `safeRestartTailscale(reason)`.
+async fn safe_restart_tailscale(reason: &str) {
+    let ext = db_extension();
+    let settings = settings_of(&ext);
+    if settings.get("tailscaleEnabled").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    if CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    if SPAWN_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+
+    let running = if reason == "startup" {
+        is_tailscale_running_strict()
+    } else {
+        is_tailscale_running()
+    };
+    if running {
+        return;
+    }
+
+    // Daemon alive but funnel dropped: recover the funnel only, never restart
+    // the daemon (that would drop the login).
+    if is_daemon_alive() {
+        if let Some(port) = active_local_port() {
+            match start_funnel(port).await {
+                Ok(_) => {
+                    LAST_RESTART_AT.store(now_ms(), std::sync::atomic::Ordering::SeqCst);
+                    tracing::info!("[Tailscale] funnel re-established (daemon alive)");
+                }
+                Err(e) => tracing::warn!("[Tailscale] funnel recovery failed: {e}"),
+            }
+            return;
+        }
+    }
+
+    let force = is_force_restart_reason(reason);
+    let last = LAST_RESTART_AT.load(std::sync::atomic::Ordering::SeqCst);
+    if !force && now_ms().saturating_sub(last) < RESTART_COOLDOWN_MS {
+        tracing::info!("[Tailscale] degraded but cooldown active, skip ({reason})");
+        return;
+    }
+    if !check_internet().await {
+        return;
+    }
+
+    tracing::info!("[Tailscale] safeRestart ({reason}) — daemon not running");
+    match enable_tailscale(&ext, active_local_port().unwrap_or(20128)).await {
+        Ok(_) => {
+            LAST_RESTART_AT.store(now_ms(), std::sync::atomic::Ordering::SeqCst);
+            tracing::info!("[Tailscale] restart success");
+        }
+        Err(e) => tracing::warn!("[Tailscale] restart failed: {}", e.message),
+    }
+}
+
+/// A DB handle for background work (`None` when the database cannot be opened).
+fn db_extension() -> Option<Extension<Db>> {
+    get_db(None).ok().map(Extension)
+}
+
+fn stop_watchdog() {
+    if let Some(handle) = MONITOR.lock().watchdog.take() {
+        handle.abort();
+    }
+}
+
+fn stop_network_monitor() {
+    let mut monitor = MONITOR.lock();
+    if let Some(handle) = monitor.monitor.take() {
+        handle.abort();
+    }
+    monitor.last_fingerprint = None;
+    monitor.last_online = None;
+}
+
+fn start_watchdog() {
+    let mut state = MONITOR.lock();
+    if state.watchdog.is_some() {
+        return;
+    }
+    state.watchdog = Some(tokio::spawn(async {
+        let mut ticker = tokio::time::interval(Duration::from_millis(WATCHDOG_INTERVAL_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick is immediate; skip it so startup is not restarted twice.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            safe_restart_tunnel("watchdog").await;
+            safe_restart_tailscale("watchdog").await;
+        }
+    }));
+}
+
+fn start_network_monitor() {
+    let mut state = MONITOR.lock();
+    if state.monitor.is_some() {
+        return;
+    }
+    state.last_fingerprint = Some(network_fingerprint());
+    state.last_tick_ms = now_ms();
+    state.last_online = None;
+    state.monitor = Some(tokio::spawn(async {
+        let mut ticker = tokio::time::interval(Duration::from_millis(NETWORK_CHECK_INTERVAL_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let now = now_ms();
+            let (elapsed, previous_fp) = {
+                let mut monitor = MONITOR.lock();
+                let elapsed = now.saturating_sub(monitor.last_tick_ms);
+                monitor.last_tick_ms = now;
+                (elapsed, monitor.last_fingerprint.clone())
+            };
+
+            let current = network_fingerprint();
+            let network_changed = previous_fp.as_deref() != Some(current.as_str());
+            let was_sleep = elapsed > NETWORK_CHECK_INTERVAL_MS * 6;
+            if network_changed {
+                MONITOR.lock().last_fingerprint = Some(current);
+            }
+
+            let online = check_internet().await;
+            let was_offline = MONITOR.lock().last_online == Some(false);
+            MONITOR.lock().last_online = Some(online);
+            if !online {
+                continue;
+            }
+
+            let online_edge = was_offline;
+            if !network_changed && !was_sleep && !online_edge {
+                continue;
+            }
+
+            // Let DHCP/DNS settle before probing.
+            tokio::time::sleep(Duration::from_millis(NETWORK_SETTLE_MS)).await;
+
+            let reason = if online_edge {
+                "online"
+            } else if was_sleep && network_changed {
+                "sleep+netchange"
+            } else if was_sleep {
+                "sleep"
+            } else {
+                "netchange"
+            };
+            safe_restart_tunnel(reason).await;
+            safe_restart_tailscale(reason).await;
+        }
+    }));
+}
+
+/// `configureTunnelMonitoring(settings)`: run the supervisor only while at
+/// least one tunnel type is enabled in settings.
+pub fn configure_tunnel_monitoring(settings: &Value) {
+    let enabled = settings.get("tunnelEnabled").and_then(Value::as_bool) == Some(true)
+        || settings.get("tailscaleEnabled").and_then(Value::as_bool) == Some(true);
+    if enabled {
+        start_watchdog();
+        start_network_monitor();
+    } else {
+        stop_watchdog();
+        stop_network_monitor();
+    }
+}
+
+/// Startup entry point: read settings and arm the supervisor. Called from
+/// `app()` so an already-enabled tunnel recovers after a restart.
+pub fn init_monitoring() {
+    let settings = match get_db(None) {
+        Ok(db) => settings_of(&Some(Extension(db))),
+        Err(_) => return,
+    };
+    configure_tunnel_monitoring(&settings);
+}
+
 // ─── status cache ───────────────────────────────────────────────────────────
 
 struct StatusCache {
@@ -1147,6 +1652,7 @@ pub async fn post_enable(ext: Option<Extension<Db>>) -> Response {
         Ok(result) => {
             // DNS warmup so the Cloudflare edge has the route before the UI probes it.
             tokio::time::sleep(Duration::from_millis(DNS_WARMUP_DELAY_MS)).await;
+            refresh_monitoring(&ext);
             Json(result).into_response()
         }
         Err(e) => (e.status, Json(json!({ "error": e.message }))).into_response(),
@@ -1155,20 +1661,33 @@ pub async fn post_enable(ext: Option<Extension<Db>>) -> Response {
 
 /// POST /api/tunnel/disable
 pub async fn post_disable(ext: Option<Extension<Db>>) -> Response {
-    Json(disable_tunnel(&ext)).into_response()
+    let result = disable_tunnel(&ext);
+    refresh_monitoring(&ext);
+    Json(result).into_response()
 }
 
 /// POST /api/tunnel/tailscale-enable
 pub async fn post_tailscale_enable(ext: Option<Extension<Db>>) -> Response {
     match enable_tailscale(&ext, 20128).await {
-        Ok(result) => Json(result).into_response(),
+        Ok(result) => {
+            refresh_monitoring(&ext);
+            Json(result).into_response()
+        }
         Err(e) => (e.status, Json(json!({ "error": e.message }))).into_response(),
     }
 }
 
 /// POST /api/tunnel/tailscale-disable
 pub async fn post_tailscale_disable(ext: Option<Extension<Db>>) -> Response {
-    Json(disable_tailscale(&ext)).into_response()
+    let result = disable_tailscale(&ext);
+    refresh_monitoring(&ext);
+    Json(result).into_response()
+}
+
+/// Re-read settings and re-arm the supervisor, like the JS routes'
+/// `getSettings().then(configureTunnelMonitoring)`.
+fn refresh_monitoring(ext: &Option<Extension<Db>>) {
+    configure_tunnel_monitoring(&settings_of(ext));
 }
 
 /// GET /api/tunnel/tailscale-check
@@ -1424,5 +1943,84 @@ mod tests {
     fn public_url_is_empty_without_short_id() {
         assert_eq!(public_url(""), "");
         assert_eq!(public_url("abc234"), "https://rabc234.abc-tunnel.us");
+    }
+
+    #[test]
+    fn dns_query_encodes_labels() {
+        let packet = build_dns_query("a.example.com", 0xbeef);
+        assert_eq!(&packet[0..2], &[0xbe, 0xef]);
+        assert_eq!(&packet[2..4], &[0x01, 0x00], "recursion desired");
+        assert_eq!(&packet[4..6], &[0x00, 0x01], "one question");
+        assert_eq!(packet[12], 1);
+        assert_eq!(&packet[13..14], b"a");
+        // QTYPE A + QCLASS IN at the tail.
+        let tail = &packet[packet.len() - 4..];
+        assert_eq!(tail, &[0x00, 0x01, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn dns_reply_requires_matching_id_and_answers() {
+        let mut reply = vec![0u8; 12];
+        reply[0..2].copy_from_slice(&7u16.to_be_bytes());
+        reply[3] = 0; // rcode NOERROR
+        reply[6..8].copy_from_slice(&1u16.to_be_bytes()); // ANCOUNT = 1
+        assert!(dns_reply_resolved(&reply, 7));
+        assert!(!dns_reply_resolved(&reply, 8), "wrong transaction id");
+
+        reply[6..8].copy_from_slice(&0u16.to_be_bytes());
+        assert!(!dns_reply_resolved(&reply, 7), "no answers");
+
+        reply[6..8].copy_from_slice(&1u16.to_be_bytes());
+        reply[3] = 3; // NXDOMAIN
+        assert!(!dns_reply_resolved(&reply, 7), "NXDOMAIN is not resolved");
+        assert!(!dns_reply_resolved(&reply[..8], 7), "short packet");
+    }
+
+    #[tokio::test]
+    async fn resolve_dns_accepts_literal_ip() {
+        assert!(resolve_dns("203.0.113.9", 50).await);
+        assert!(!resolve_dns("", 50).await);
+    }
+
+    #[test]
+    fn virtual_interfaces_are_skipped() {
+        for name in ["utun3", "awdl0", "bridge100", "docker0", "veth12a", "tun0", "tap1"] {
+            assert!(is_virtual_iface(name), "{name} should be virtual");
+        }
+        for name in ["eth0", "en0", "wlan0", "enp3s0"] {
+            assert!(!is_virtual_iface(name), "{name} is physical");
+        }
+    }
+
+    #[test]
+    fn network_fingerprint_is_stable_and_sorted() {
+        let first = network_fingerprint();
+        let second = network_fingerprint();
+        assert_eq!(first, second, "two immediate reads must agree");
+        if first.contains('|') {
+            let parts: Vec<&str> = first.split('|').collect();
+            let mut sorted = parts.clone();
+            sorted.sort();
+            assert_eq!(parts, sorted);
+        }
+    }
+
+    #[test]
+    fn force_restart_reasons_match_js() {
+        for reason in ["startup", "netchange", "sleep", "sleep+netchange", "online", "unexpected-exit"] {
+            assert!(is_force_restart_reason(reason), "{reason} bypasses cooldown");
+        }
+        assert!(!is_force_restart_reason("watchdog"));
+        assert!(!is_force_restart_reason(""));
+    }
+
+    // `configureTunnelMonitoring` must be idempotent and must not need a runtime
+    // when turning monitoring off.
+    #[test]
+    fn configure_monitoring_off_is_a_noop() {
+        configure_tunnel_monitoring(&json!({}));
+        configure_tunnel_monitoring(&json!({ "tunnelEnabled": false, "tailscaleEnabled": false }));
+        assert!(MONITOR.lock().watchdog.is_none());
+        assert!(MONITOR.lock().monitor.is_none());
     }
 }
