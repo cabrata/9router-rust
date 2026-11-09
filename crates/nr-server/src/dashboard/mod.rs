@@ -9,6 +9,9 @@
 pub mod assets;
 pub mod forms;
 pub mod pages;
+pub mod dash_providers;
+pub mod dash_ops;
+pub mod dash_tools;
 
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -159,6 +162,9 @@ pub fn bare_layout(title: &str, body: Markup) -> Markup {
 
 pub fn router() -> Router {
     Router::new()
+        .merge(dash_providers::router())
+        .merge(dash_ops::router())
+        .merge(dash_tools::router())
         .route("/static/{*path}", get(assets::static_handler))
         .route("/favicon.ico", get(|| async {
             ([(header::CONTENT_TYPE, "image/svg+xml")], assets::FAVICON)
