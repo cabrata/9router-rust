@@ -6,6 +6,7 @@ pub mod browser_executable_check;
 pub mod cdp;
 pub mod gemini_web;
 pub mod grok_web;
+pub mod grok_web_tools;
 pub mod muse_web;
 pub mod veoaifree_web;
 pub mod services;
@@ -18,6 +19,7 @@ pub use browser_executable_check::{
 pub use services::{
     acquire_browser_context, release_browser_context,
     get_browser_pool_status, get_browser_pool_metrics,
+    BrowserPoolStatus, PoolMetrics,
     ContextOptions, DEFAULT_USER_AGENT,
 };
 pub use cdp::{Browser, BrowserContext, Page};
