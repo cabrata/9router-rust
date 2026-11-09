@@ -4,6 +4,8 @@
 //!
 //! FROZEN for the CLI: [`ServerOptions`] and [`run`].
 
+pub mod routes;
+
 use std::net::SocketAddr;
 
 use axum::routing::get;
