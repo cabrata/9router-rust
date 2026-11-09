@@ -72,7 +72,7 @@ struct Args {
     port: u16,
 
     /// Interface to bind
-    #[arg(short = 'H', long, env = "HOSTNAME", default_value = DEFAULT_HOST)]
+    #[arg(short = 'H', long = "host", visible_alias = "hostname", env = "HOSTNAME", default_value = DEFAULT_HOST)]
     hostname: String,
 
     /// Don't open browser automatically

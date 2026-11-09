@@ -87,24 +87,50 @@ pub fn is_free_model(model: Option<&str>) -> bool {
 }
 
 /// Match a model ID against a glob pattern (* = wildcard). Case-insensitive.
+///
+/// Equivalent to the JS `globToRegex(pattern).test(model)`, but this runs for
+/// every catalog entry on `/api/models` (1491 models x 164 patterns), so
+/// compiling a regex per call made that route take >15s. A direct
+/// two-pointer glob matcher is exact, allocation-free and fast.
 pub fn match_pattern(pattern: &str, model: Option<&str>) -> bool {
     let model = match model {
         Some(m) => m,
         None => return false,
     };
+    glob_match_ci(pattern, model)
+}
 
-    // Escape regex special chars except *
-    let escaped = pattern
-        .split('*')
-        .map(|s| regex::escape(s))
-        .collect::<Vec<_>>()
-        .join(".*");
+/// Case-insensitive glob match where `*` matches any (possibly empty) run.
+fn glob_match_ci(pattern: &str, text: &str) -> bool {
+    let p = pattern.as_bytes();
+    let t = text.as_bytes();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // Backtrack point: the pattern index just after the last `*` and the text
+    // position it was first tried against.
+    let mut star_p: Option<usize> = None;
+    let mut star_t = 0usize;
 
-    if let Ok(regex) = Regex::new(&format!("(?i)^{}$", escaped)) {
-        regex.is_match(model)
-    } else {
-        false
+    while ti < t.len() {
+        if pi < p.len() && p[pi] != b'*' && p[pi].eq_ignore_ascii_case(&t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star_p = Some(pi + 1);
+            star_t = ti;
+            pi += 1;
+        } else if let Some(sp) = star_p {
+            // Mismatch after a `*`: let the star consume one more character.
+            pi = sp;
+            star_t += 1;
+            ti = star_t;
+        } else {
+            return false;
+        }
     }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Resolve pricing for a model using the 4-step fallback chain:
@@ -274,6 +300,48 @@ mod tests {
         assert!(match_pattern("*claude*", Some("claude-opus-4")));
         assert!(match_pattern("gpt-*", Some("gpt-4-turbo")));
         assert!(!match_pattern("gpt-*", Some("claude-opus")));
+    }
+
+    /// Glob semantics must match the previous regex build `^<escaped>$` with
+    /// `*` -> `.*`, including case-insensitivity and edge cases.
+    #[test]
+    fn test_glob_edge_cases() {
+        assert!(match_pattern("*", Some("anything")));
+        assert!(match_pattern("**", Some("anything")));
+        assert!(match_pattern("", Some("")));
+        assert!(!match_pattern("", Some("x")));
+        assert!(match_pattern("*-codex-high", Some("gpt-5-codex-high")));
+        assert!(!match_pattern("*-codex-high", Some("gpt-5-codex-highx")));
+        assert!(match_pattern("kimi-*-thinking", Some("kimi-k2-thinking")));
+        assert!(match_pattern("*CLAUDE*", Some("claude-opus-4")));
+        assert!(match_pattern("Gemini-*-Flash-Lite", Some("gemini-2.5-flash-lite")));
+        // Regex metacharacters in the pattern are literal.
+        assert!(match_pattern("a.b", Some("a.b")));
+        assert!(!match_pattern("a.b", Some("axb")));
+        assert!(match_pattern("x(y)", Some("x(y)")));
+        assert!(!match_pattern("x(y)", Some("xy")));
+        assert!(!match_pattern("*claude*", None));
+    }
+
+    /// Regression: `/api/models` calls this 1491 x 164 times; per-call regex
+    /// compilation made the route take 15s.
+    #[test]
+    fn test_match_pattern_is_cheap() {
+        let start = std::time::Instant::now();
+        let mut hits = 0usize;
+        for _ in 0..2_000 {
+            for pat in ["*-codex-mini-*", "*claude*opus-5*", "gemini-*-flash-lite"] {
+                if match_pattern(pat, Some("claude-opus-5-20250101")) {
+                    hits += 1;
+                }
+            }
+        }
+        assert_eq!(hits, 2_000);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(500),
+            "glob matching too slow: {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

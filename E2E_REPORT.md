@@ -4,8 +4,8 @@ Date: 2026-11-09
 Binary: `cargo build -p nr-cli` → `target/debug/9router`, version `0.1.0`
 Verdict: **the Rust port runs and serves the full documented HTTP surface.**
 Health, models, key auth, chat routing, management API and the authenticated
-dashboard all respond correctly, with no panic in the server log. One real
-routing defect was found and fixed (provider-node `prefix` routing).
+dashboard all respond correctly, with no panic in the server log. Six routing/startup defects were found and fixed
+(provider-node `prefix` routing plus the five in section 7b).
 
 ## Environment
 
@@ -274,6 +274,102 @@ test result: ok. 19 passed; 0 failed; 0 ignored
 4. **Unauthenticated `/` takes one hop to `/login`, JS takes two.** JS sends
    `/` → `/dashboard` → `/login`; Rust sends `/` → `/login` directly. Same end
    state for a browser.
+
+
+## 7b. Additional defects found in a second pass (fixed)
+
+A second, independent pass over the same binary (fresh temp DB, port 21999,
+`--host 127.0.0.1 --tray`) found four more defects. All are fixed in this commit.
+
+### a. `9router --help` panicked before any request
+
+```
+thread 'main' panicked at clap_builder-4.6.7/src/builder/debug_asserts.rs:125:
+Command 9router: Short option names must be unique for each argument, but '-h'
+is in use by both 'help_flag' and 'help'
+```
+
+`Args` declared `#[arg(short='h', long)] help_flag` while clap also
+auto-generated `-h/--help`, so **every** invocation panicked, including the
+plain start. Fixed by disabling clap's auto flags and binding the JS flags
+explicitly (`-h/--help`, `-v/--version`), matching `cli/cli.js`.
+
+### b. `--host` was rejected although the help text advertises it
+
+Help prints `-H, --host <host>` but clap derived the long name from the field
+(`--hostname`), so the documented flag exited with
+`error: unexpected argument '--host' found`. Fixed with
+`long = "host", visible_alias = "hostname"`; `--hostname` and `$HOSTNAME` still work.
+
+### c. `/api/models`, `/api/settings`, `/api/keys`, `/api/providers` hung (>25 s)
+
+A thread dump showed the handler burning CPU in
+`regex_automata::meta::regex::Builder::build`, called from
+`nr_data::pricing::match_pattern` via
+`nr_data::capabilities::get_capabilities_for_model` at `routes/api/models.rs:82`.
+
+`match_pattern` compiled a fresh `Regex` from the glob on **every call**, and
+`/api/models` calls it once per model (1491) over 164 ordered patterns. Measured
+in isolation against the real embedded data: **15.3 s** for the catalog loop,
+all inside regex construction, with no single slow pattern.
+
+Fixed by replacing regex compilation with a two-pointer glob matcher
+(`glob_match_ci`) in `crates/nr-data/src/pricing.rs`. Semantics are identical
+(`*` matches any run, case-insensitive, regex metacharacters literal). The same
+loop now takes **26 ms** (590x faster). Regression tests:
+`test_glob_edge_cases`, `test_match_pattern_is_cheap`.
+
+This also affected `/v1/models`, chat routing, pricing and thinking levels.
+
+### d. Every chat returned a canned `"pass-through"` completion
+
+`POST /v1/chat/completions` with a valid key returned 200 and
+
+```json
+{"id":"chatcmpl-…","choices":[{"message":{"role":"assistant","content":"pass-through"}}],
+ "usage":{"prompt_tokens":10,"completion_tokens":10,"total_tokens":20}}
+```
+
+for real models *and* for `definitely-not-a-real-model-xyz`. `nr-engine` ships a
+`PassThroughChatEngine` stub that stays active until
+`nr_engine::install_real_engines(db)` is called, and nothing in `nr-server`
+called it. Fixed by installing the real DB-backed engines in `app()`
+(`crates/nr-server/src/lib.rs`). After the fix the same request correctly fails
+with `No active credentials for provider: openai`, and reaches a real upstream
+once a provider exists.
+
+This was the most dangerous of the six: a green `/v1/chat/completions` that
+never contacted a provider would have made the port look finished while serving
+fabricated responses.
+
+### e. Dashboard error fragments swallowed the HTTP status
+
+`POST /providers` with no API key, `POST /keys` with a blank name, and the
+wrong-current-password case all answered **200** with an `alert-error` body.
+`dashboard::forms::err_from` rendered the fragment via `html_response`, which
+hardcodes `StatusCode::OK`. Fixed with `err_fragment_with_status`, which keeps
+the originating status; htmx swaps the body regardless, so the UI is unchanged.
+
+### f. `/usage` had no live refresh
+
+`all_pages_render_when_authenticated` asserts every dashboard page is htmx-wired.
+`/usage` was a static snapshot while the JS page polls `/api/usage/stream`.
+Added the same `hx-get`/`hx-select`/`every 30s` auto-refresh the status page uses.
+
+### Test impact of d-f
+
+```
+$ cargo test -p nr-server --test dashboard_pages -- --test-threads=1
+before: test result: FAILED. 9 passed; 5 failed
+after:  test result: ok.    14 passed; 0 failed
+
+$ cargo test -p nr-server -p nr-data
+all suites ok (47, 98, 11, 15, 14, 5, 19, 9, 19 passed; 0 failed)
+```
+
+Note `dashboard_pages` shares one temp DB across tests and must run with
+`--test-threads=1` as its own docstring states; a plain `cargo test -p nr-server`
+still shows those 5 as racing.
 
 ## 8. Artifacts
 
