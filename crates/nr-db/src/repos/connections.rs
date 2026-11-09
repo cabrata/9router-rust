@@ -81,7 +81,7 @@ fn upsert_connection(tx: &DbTx, conn: &Value) -> Result<()> {
 
 /// Reorder connections to have contiguous priorities (must be called in transaction)
 fn reorder_connections_in_tx(tx: &DbTx, provider: &str) -> Result<()> {
-    let mut conns = tx.query_all(
+    let conns = tx.query_all(
         "SELECT id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt FROM providerConnections WHERE provider = ? ORDER BY priority ASC, updatedAt DESC",
         &[&provider],
         |row| {
@@ -374,7 +374,7 @@ pub fn create_provider_connection(db: &Db, data: &Value) -> Result<Value> {
         }
 
         // Handle existing connection
-        if let Some(mut existing) = existing_option {
+        if let Some(existing) = existing_option {
             if !allow_overwrite {
                 return Err(nr_core::Error::other(
                     format!(

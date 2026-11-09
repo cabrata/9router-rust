@@ -16,6 +16,13 @@ use uuid::Uuid;
 
 const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
 
+/// One `GROK_CLI_*` export from the embedded dump of open-sse/config/grokCli.js.
+pub fn grok_cli_const(key: &str) -> Option<String> {
+    nr_data::export("open-sse/config/grokCli", key)
+        .and_then(Json::as_str)
+        .map(str::to_string)
+}
+
 /// Count user turns in a Responses `input` array (≈ user messages).
 pub(crate) fn count_user_turns(input: Option<&Json>) -> usize {
     let Some(arr) = input.and_then(Json::as_array) else {

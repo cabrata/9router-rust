@@ -19,8 +19,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use nr_common::session_manager::resolve_session_id;
-use nr_core::{ExecRequest, ExecResult, Executor, Json, JsonMap, Result};
-use nr_exec_base::base::BaseHooks;
+use nr_core::http::HeaderList;
+use nr_core::{Credentials, ExecRequest, ExecResult, Executor, Json, JsonMap, Result};
+use nr_exec_base::base::{base_execute, BaseHooks};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -205,6 +206,331 @@ fn strip_blacklisted(obj: &mut JsonMap) {
     }
 }
 
+/// Prompt fragments competing-client branding that Antigravity flags with a
+/// detail-free 429 RESOURCE_EXHAUSTED.
+/// Port of `ANTIGRAVITY_PROMPT_REWRITES` (open-sse/config/appConstants.js).
+const ANTIGRAVITY_PROMPT_REWRITES: &[(&str, &str)] = &[
+    ("You are a Claude agent, built on Anthropic's Claude Agent SDK.", ""),
+    ("opencode", "antigravity"),
+];
+
+fn rewrite_system_instruction(request: &mut Json) {
+    let Some(parts) = request
+        .get_mut("systemInstruction")
+        .and_then(|s| s.get_mut("parts"))
+        .and_then(Json::as_array_mut)
+    else {
+        return;
+    };
+    for part in parts {
+        let Some(text) = part.get("text").and_then(Json::as_str) else { continue };
+        let mut rewritten = text.to_string();
+        for (from, to) in ANTIGRAVITY_PROMPT_REWRITES {
+            rewritten = rewritten.replace(from, to);
+        }
+        // Hermes branding and the Anthropic billing header are regex-only.
+        if let Ok(re) = regex::Regex::new(
+            r"(?i)You are Hermes(?: Agent)?(?:,\s*(?:an intelligent AI assistant|an AI assistant|an AI agent))?(?:,?\s*(?:built|created)\s+by\s+Nous Research)?\.",
+        ) {
+            rewritten = re.replace_all(&rewritten, "You are an AI assistant.").into_owned();
+        }
+        if let Ok(re) = regex::Regex::new(r"(?im)^x-anthropic-billing-header:[^\n]*(?:\r?\n)*") {
+            rewritten = re.replace_all(&rewritten, "").into_owned();
+        }
+        part["text"] = Json::String(rewritten);
+    }
+}
+
+/// `AntigravityExecutor.transformRequest` — build the `v1internal` envelope.
+pub fn transform_request(
+    exec: &AntigravityExecutor,
+    model: &str,
+    body: &Json,
+    stream: bool,
+    credentials: &Credentials,
+) -> Json {
+    use nr_common::session_manager::{resolve_session_id, to_numeric_session_id};
+
+    let project_id = credentials
+        .psd_str("projectId")
+        .map(String::from)
+        .unwrap_or_else(AntigravityExecutor::generate_project_id);
+
+    let mut body = body.clone();
+
+    // Google rejects `stream_options` on non-streaming generateContent.
+    if !stream {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("stream_options");
+        }
+    }
+
+    // ─── Image generation: a completely different request shape ───
+    if is_image_model(model) {
+        let image_config = AntigravityExecutor::parse_image_config(model);
+        let clean_model = regex::Regex::new(r"-\d+x\d+$")
+            .map(|re| re.replace(model, "").into_owned())
+            .unwrap_or_else(|_| model.to_string());
+
+        let src_contents = body
+            .get("request")
+            .and_then(|r| r.get("contents"))
+            .or_else(|| body.get("contents"))
+            .and_then(Json::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut contents = Vec::new();
+        for c in &src_contents {
+            let mut image_parts = Vec::new();
+            for p in c.get("parts").and_then(Json::as_array).into_iter().flatten() {
+                if p.get("text").is_some() {
+                    image_parts.push(json!({ "text": p["text"] }));
+                } else if p.get("inlineData").and_then(|i| i.get("data")).is_some() {
+                    image_parts.push(json!({ "inlineData": p["inlineData"] }));
+                }
+            }
+            if !image_parts.is_empty() {
+                let role = c.get("role").and_then(Json::as_str).unwrap_or("user");
+                contents.push(json!({ "role": role, "parts": image_parts }));
+            }
+        }
+
+        let connection = credentials
+            .psd_str("email")
+            .or_else(|| credentials.connection_id());
+        let session_id = resolve_session_id(None, &body, connection, None, "antigravity");
+
+        let request = json!({
+            "contents": contents,
+            "generationConfig": {
+                "temperature": 1.0,
+                "topP": 0.95,
+                "topK": 40,
+                "maxOutputTokens": 8192,
+                "imageConfig": { "aspectRatio": image_config },
+            },
+            "sessionId": session_id,
+        });
+
+        let request_id = build_ide_request_id(&body, credentials, &clean_model, "image_gen");
+        return json!({
+            "project": project_id,
+            "model": clean_model,
+            "userAgent": "antigravity",
+            "requestType": "image_gen",
+            "requestId": request_id,
+            "request": request,
+        });
+    }
+
+    // ─── Standard (agent) request ───
+    let raw_session_id = body
+        .get("request")
+        .and_then(|r| r.get("sessionId"))
+        .and_then(Json::as_str)
+        .map(String::from)
+        .unwrap_or_else(|| {
+            let connection = credentials
+                .psd_str("email")
+                .or_else(|| credentials.connection_id());
+            resolve_session_id(None, &body, connection, None, "antigravity")
+        });
+    let session_id = to_numeric_session_id(&raw_session_id).unwrap_or(raw_session_id);
+
+    let raw_contents = body
+        .get("request")
+        .and_then(|r| r.get("contents"))
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut contents = Vec::new();
+    for c in raw_contents {
+        let mut role = c.get("role").and_then(Json::as_str).unwrap_or("user").to_string();
+        let parts_in = c.get("parts").and_then(Json::as_array).cloned().unwrap_or_default();
+
+        // functionResponse turns must be role "user" for Claude models.
+        if parts_in.iter().any(|p| p.get("functionResponse").is_some()) {
+            role = "user".to_string();
+        }
+
+        // Drop thought-only parts; Gemini 3+ needs thoughtSignature on functionCall parts.
+        let kept: Vec<Json> = parts_in
+            .into_iter()
+            .filter(|p| {
+                let has_call = p.get("functionCall").is_some();
+                if p.get("thought").and_then(Json::as_bool).unwrap_or(false) && !has_call {
+                    return false;
+                }
+                if p.get("thoughtSignature").is_some() && !has_call && p.get("text").is_none() {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        let mut first_call_seen = false;
+        let mut parts = Vec::with_capacity(kept.len());
+        for mut p in kept {
+            if p.get("functionCall").is_none() {
+                parts.push(p);
+                continue;
+            }
+            let call_id = p
+                .get("functionCall")
+                .and_then(|f| f.get("id"))
+                .and_then(Json::as_str)
+                .map(String::from);
+            let cached = call_id.as_deref().and_then(|id| {
+                nr_common::thought_signature_store::get_sync(
+                    id,
+                    Some(&session_id),
+                    body.get("model").and_then(Json::as_str).or(Some(model)),
+                )
+            });
+            let existing = p.get("thoughtSignature").and_then(Json::as_str).map(String::from);
+            let fallback = if first_call_seen {
+                None
+            } else {
+                Some(nr_data::export(
+                    "open-sse/config/defaultThinkingSignature",
+                    "DEFAULT_THINKING_AG_SIGNATURE",
+                )
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default())
+                .filter(|s| !s.is_empty())
+            };
+            first_call_seen = true;
+
+            if let Some(sig) = existing.or(cached).or(fallback) {
+                p["thoughtSignature"] = Json::String(sig);
+            } else if p.get("thoughtSignature").is_some() {
+                // Unsigned sibling call: strip the stale signature.
+                if let Some(obj) = p.as_object_mut() {
+                    obj.remove("thoughtSignature");
+                }
+            }
+            parts.push(p);
+        }
+
+        let mut normalized = c.clone();
+        normalized["role"] = Json::String(role);
+        normalized["parts"] = Json::Array(parts);
+        contents.push(normalized);
+    }
+
+    let contents = nr_translator::formats::gemini::normalize_gemini_contents(&contents, Some(model));
+
+    // ─── Sanitize tools ───
+    let mut tools: Option<Vec<Json>> = None;
+    if let Some(groups) = body
+        .get("request")
+        .and_then(|r| r.get("tools"))
+        .and_then(Json::as_array)
+    {
+        let mut seen = HashSet::new();
+        let mut declarations = Vec::new();
+        for group in groups {
+            for f in group
+                .get("functionDeclarations")
+                .and_then(Json::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let name = AntigravityExecutor::sanitize_function_name(
+                    f.get("name").and_then(Json::as_str).unwrap_or(""),
+                );
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let mut decl = f.clone();
+                decl["name"] = Json::String(name);
+                decl["parameters"] = match f.get("parameters") {
+                    Some(p) => p.clone(),
+                    None => json!({
+                        "type": "object",
+                        "properties": { "reason": { "type": "string", "description": "Brief explanation" } },
+                        "required": ["reason"]
+                    }),
+                };
+                declarations.push(decl);
+            }
+        }
+        tools = Some(if declarations.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({ "functionDeclarations": declarations })]
+        });
+    }
+
+    // Request without tools/toolConfig, with blacklisted fields stripped.
+    let mut request = body
+        .get("request")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = request.as_object_mut() {
+        obj.remove("tools");
+        obj.remove("toolConfig");
+        strip_blacklisted(obj);
+    }
+    rewrite_system_instruction(&mut request);
+
+    // Clamp maxOutputTokens.
+    let cfg = request.get("generationConfig").cloned().unwrap_or_else(|| json!({}));
+    let mut generation_config = cfg;
+    if let Some(max) = generation_config.get("maxOutputTokens").and_then(Json::as_i64) {
+        if max > MAX_ANTIGRAVITY_OUTPUT_TOKENS {
+            generation_config["maxOutputTokens"] = json!(MAX_ANTIGRAVITY_OUTPUT_TOKENS);
+        }
+    }
+
+    if let Some(obj) = request.as_object_mut() {
+        obj.insert("generationConfig".into(), generation_config);
+        obj.insert("contents".into(), Json::Array(contents));
+        obj.insert("sessionId".into(), Json::String(session_id.clone()));
+        obj.remove("safetySettings");
+        match &tools {
+            Some(t) if !t.is_empty() => {
+                obj.insert("tools".into(), Json::Array(t.clone()));
+                obj.insert(
+                    "toolConfig".into(),
+                    json!({ "functionCallingConfig": { "mode": "VALIDATED" } }),
+                );
+            }
+            Some(_) => {
+                obj.remove("tools");
+            }
+            None => {}
+        }
+    }
+
+    // Strip thinking fields that clients set at the body root.
+    // The official client omits requestType on the agent path.
+    if let Some(obj) = body.as_object_mut() {
+        strip_blacklisted(obj);
+        obj.remove("requestType");
+    }
+
+    let request_id = build_ide_request_id(&body, credentials, model, "agent");
+    let _ = exec;
+    let model_out = body
+        .get("model")
+        .and_then(Json::as_str)
+        .unwrap_or(model)
+        .to_string();
+
+    if let Some(body_obj) = body.as_object_mut() {
+        body_obj.insert("project".into(), Json::String(project_id));
+        body_obj.insert("model".into(), Json::String(model_out));
+        body_obj.insert("userAgent".into(), Json::String("antigravity".into()));
+        body_obj.insert("requestId".into(), Json::String(request_id));
+        body_obj.insert("request".into(), request);
+    }
+
+    body
+}
+
 /// Check if model is an image generation model
 fn is_image_model(model: &str) -> bool {
     let m_lower = model.to_lowercase();
@@ -220,7 +546,7 @@ impl AntigravityExecutor {
     pub fn new(provider: &str) -> Self {
         let config = nr_data::provider(provider)
             .or_else(|| nr_data::provider("antigravity"))
-            .unwrap_or_else(|| Box::leak(Box::new(Json::Object(IndexMap::new()))));
+            .unwrap_or_else(|| Box::leak(Box::new(Json::Object(serde_json::Map::new()))));
         Self {
             provider: provider.to_string(),
             config,
@@ -510,7 +836,9 @@ impl AntigravityExecutor {
 
         // Build cloaked body
         let mut cloaked_body = body.clone();
-        cloaked_body.insert("request".into(), Json::Object(cloaked_request));
+        if let Some(obj) = cloaked_body.as_object_mut() {
+            obj.insert("request".into(), Json::Object(cloaked_request));
+        }
 
         let map_option = if tool_name_map.is_empty() {
             None
@@ -530,6 +858,38 @@ impl BaseHooks for AntigravityExecutor {
     fn config(&self) -> &nr_core::Json {
         self.config
     }
+
+    /// Image generation must use non-streaming `generateContent`.
+    fn build_url(&self, model: &str, stream: bool, url_index: usize, _creds: &Credentials) -> Result<String> {
+        let urls = BaseHooks::base_urls(self);
+        let base = urls.get(url_index).or_else(|| urls.first()).cloned().unwrap_or_default();
+        let base = base.trim_end_matches('/');
+        let force_non_stream = is_image_model(model);
+        let action = if stream && !force_non_stream {
+            "streamGenerateContent?alt=sse"
+        } else {
+            "generateContent"
+        };
+        Ok(format!("{base}/v1internal:{action}"))
+    }
+
+    fn build_headers(&self, creds: &Credentials, _stream: bool, _url: &str, _model: &str, _body: &Json) -> Result<HeaderList> {
+        let mut headers = HeaderList::new();
+        headers.insert("Content-Type".into(), "application/json".into());
+        if let Some(token) = creds.access_token() {
+            headers.insert("Authorization".into(), format!("Bearer {token}"));
+        }
+        let ua = self.config.get("headers")
+            .and_then(|h| h.get("User-Agent"))
+            .and_then(Json::as_str)
+            .unwrap_or("antigravity");
+        headers.insert("User-Agent".into(), ua.to_string());
+        Ok(headers)
+    }
+
+    fn transform_request(&self, model: &str, body: &Json, stream: bool, creds: &Credentials) -> Result<Json> {
+        Ok(crate::antigravity::transform_request(self, model, body, stream, creds))
+    }
 }
 
 #[async_trait]
@@ -543,12 +903,7 @@ impl Executor for AntigravityExecutor {
     }
 
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecResult> {
-        // TODO(dedupe): Implement full antigravity flow using DefaultExecutor's base
-        // along with transformRequest, buildHeaders, and tool cloaking.
-        // For now, delegate to default executor which handles the basic execution.
-        nr_exec_base::default_executor::create("antigravity")
-            .execute(req)
-            .await
+        base_execute(self, req).await
     }
 }
 
@@ -604,7 +959,7 @@ mod tests {
     #[test]
     fn antigravity_executor_creates() {
         let executor = AntigravityExecutor::new("antigravity");
-        assert_eq!(executor.provider(), "antigravity");
+        assert_eq!(nr_core::Executor::provider(&executor), "antigravity");
     }
 
     #[test]

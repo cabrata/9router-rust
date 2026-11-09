@@ -22,6 +22,7 @@ const CACHE_TTL_MS: u64 = 5 * 60 * 1000; // 5 minutes
 struct CatalogCacheEntry {
     expires_at: u64,
     models: Vec<JsonValue>,
+    raw_models: Vec<JsonValue>,
 }
 
 pub struct KiroModelsService {
@@ -58,15 +59,15 @@ impl KiroModelsService {
 
     fn build_kiro_fingerprint_headers(credentials: &Credentials) -> HashMap<String, String> {
         let seed = credentials
-            .provider_specific_data()
+            .psd()
             .and_then(|psd| psd.get("clientId").and_then(|v| v.as_str()))
-            .or_else(|| credentials.refresh_token().map(|t| t.as_str()))
+            .or_else(|| credentials.refresh_token())
             .or_else(|| {
                 credentials
-                    .provider_specific_data()
+                    .psd()
                     .and_then(|psd| psd.get("profileArn").and_then(|v| v.as_str()))
             })
-            .or_else(|| credentials.access_token().map(|t| t.as_str()))
+            .or_else(|| credentials.access_token())
             .unwrap_or("kiro-anonymous");
 
         let mut hasher = Sha256::new();
@@ -102,7 +103,8 @@ impl KiroModelsService {
 
     fn build_variants(upstream_id: &str, display_name: Option<&str>) -> Vec<JsonValue> {
         let safe_upstream = Self::strip_synthetic_suffixes(upstream_id);
-        let display = display_name.unwrap_or(&format!("Kiro {}", safe_upstream));
+        let fallback = format!("Kiro {}", safe_upstream);
+        let display = display_name.unwrap_or(&fallback);
         let is_auto = safe_upstream == "auto";
 
         let mut variants = vec![
@@ -154,6 +156,7 @@ impl KiroModelsService {
         &self,
         credentials: &Credentials,
         force_refresh: bool,
+        proxy: Option<&nr_core::http::ProxyOptions>,
     ) -> Option<(Vec<JsonValue>, Vec<JsonValue>)> {
         if credentials.access_token().is_none() {
             return None;
@@ -162,36 +165,165 @@ impl KiroModelsService {
         let key = self.cache_key(credentials);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
         if !force_refresh {
-            let cache = self.cache.lock().unwrap();
-            if let Some(entry) = cache.get(&key) {
-                if entry.expires_at > now {
-                    return Some((entry.models.clone(), entry.models.clone()));
-                }
+            let cached = {
+                let cache = self.cache.lock().unwrap();
+                cache
+                    .get(&key)
+                    .filter(|entry| entry.expires_at > now)
+                    .map(|entry| (entry.models.clone(), entry.raw_models.clone()))
+            };
+            if let Some(hit) = cached {
+                return Some(hit);
             }
         }
 
-        // TODO(dedupe): Fetch from Kiro API and cache results
-        // This requires:
-        // - HTTP client setup (reqwest)
-        // - Building ListAvailableModels URL with profileArn
-        // - Handling 401 with token refresh via nr_oauth::refresh_kiro_token
-        // - Parsing response and building variants
-        // - Caching per credential with TTL
-        None
+        // A 401 from Kiro is answered by one token refresh + retry; the
+        // in-memory credential is updated so later retry logic uses the fresh
+        // token.
+        let mut creds = credentials.clone();
+        let mut raw = match Self::fetch_catalog_raw(&creds, proxy).await {
+            Ok(raw) => raw,
+            Err(status) if status == 401 && credentials.refresh_token().is_some() => {
+                let refresh_token = credentials.refresh_token().unwrap_or("").to_string();
+                let refreshed = nr_oauth::token_refresh::refresh_kiro_token(
+                    &refresh_token,
+                    credentials.psd(),
+                    &nr_core::Logger::new(),
+                    proxy,
+                )
+                .await?;
+                let access = refreshed.get("accessToken").and_then(JsonValue::as_str)?.to_string();
+                creds.set("accessToken", JsonValue::String(access));
+                if let Some(rt) = refreshed.get("refreshToken").and_then(JsonValue::as_str) {
+                    creds.set("refreshToken", JsonValue::String(rt.to_string()));
+                }
+                match Self::fetch_catalog_raw(&creds, proxy).await {
+                    Ok(raw) => raw,
+                    Err(_) => return None,
+                }
+            }
+            Err(_) => return None,
+        };
+
+        let expanded = Self::expand(&raw);
+        raw.sort_by(|a, b| {
+            a.get("modelId").and_then(JsonValue::as_str).unwrap_or("")
+                .cmp(b.get("modelId").and_then(JsonValue::as_str).unwrap_or(""))
+        });
+
+        let mut cache = self.cache.lock().unwrap();
+        cache.insert(
+            key,
+            CatalogCacheEntry {
+                expires_at: now + CACHE_TTL_MS,
+                models: expanded.clone(),
+                raw_models: raw.clone(),
+            },
+        );
+        Some((expanded, raw))
+    }
+
+    /// Expand each upstream entry into the synthetic 9router variant set.
+    fn expand(raw: &[JsonValue]) -> Vec<JsonValue> {
+        let mut expanded = Vec::new();
+        for m in raw {
+            if !m.is_object() {
+                continue;
+            }
+            let upstream_id = m
+                .get("modelId")
+                .and_then(JsonValue::as_str)
+                .or_else(|| m.get("id").and_then(JsonValue::as_str));
+            let upstream_id = match upstream_id {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => continue,
+            };
+            let display = Self::format_display_name(
+                m.get("modelName").and_then(JsonValue::as_str),
+                &upstream_id,
+                m.get("rateMultiplier").and_then(JsonValue::as_f64),
+            );
+            let ctx = m
+                .pointer("/tokenLimits/maxInputTokens")
+                .and_then(JsonValue::as_i64)
+                .unwrap_or(200_000);
+            let rate = m
+                .get("rateMultiplier")
+                .and_then(JsonValue::as_f64)
+                .filter(|r| r.is_finite())
+                .unwrap_or(1.0);
+            let description = m.get("description").and_then(JsonValue::as_str).unwrap_or("");
+            for mut variant in Self::build_variants(&upstream_id, Some(&display)) {
+                if let Some(obj) = variant.as_object_mut() {
+                    obj.insert("contextLength".into(), JsonValue::from(ctx));
+                    obj.insert("rateMultiplier".into(), JsonValue::from(rate));
+                    obj.insert("upstreamModelId".into(), JsonValue::String(upstream_id.clone()));
+                    obj.insert("description".into(), JsonValue::String(description.to_string()));
+                }
+                expanded.push(variant);
+            }
+        }
+        expanded
+    }
+
+    /// `fetchKiroCatalogRaw`: GET ListAvailableModels, or Err(http_status).
+    async fn fetch_catalog_raw(
+        credentials: &Credentials,
+        proxy: Option<&nr_core::http::ProxyOptions>,
+    ) -> std::result::Result<Vec<JsonValue>, u16> {
+        let profile_arn = credentials.psd_str("profileArn").unwrap_or("").to_string();
+        let region = Self::region_from_profile_arn(Some(&profile_arn));
+
+        let mut params = vec![("origin".to_string(), "AI_EDITOR".to_string())];
+        if !profile_arn.is_empty() {
+            params.push(("profileArn".to_string(), profile_arn.clone()));
+        }
+        let query = params
+            .iter()
+            .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let request_url = format!("https://q.{region}.amazonaws.com/ListAvailableModels?{query}");
+
+        let mut headers = nr_core::http::HeaderList::new();
+        for (k, v) in Self::build_kiro_fingerprint_headers(credentials) {
+            headers.insert(k, v);
+        }
+        headers.insert(
+            "Authorization".into(),
+            format!("Bearer {}", credentials.access_token().unwrap_or("")),
+        );
+
+        let mut fetch = nr_core::http::FetchRequest::get(request_url);
+        fetch.headers = headers;
+        fetch.header_timeout = Some(std::time::Duration::from_millis(FETCH_TIMEOUT_MS));
+
+        let response = nr_core::http::proxy_fetch(fetch, proxy)
+            .await
+            .map_err(|_| 0u16)?;
+        if response.status != 200 {
+            return Err(response.status);
+        }
+        let body = response.bytes().await.map_err(|_| 0u16)?;
+        let data: JsonValue = serde_json::from_slice(&body).map_err(|_| 0u16)?;
+        Ok(data
+            .get("models")
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn cache_key(&self, credentials: &Credentials) -> String {
-        let psd = credentials.provider_specific_data().unwrap_or(&serde_json::json!({}));
+        let psd = credentials.psd();
         let seed = psd
-            .get("profileArn")
-            .and_then(|v| v.as_str())
-            .or_else(|| psd.get("clientId").and_then(|v| v.as_str()))
-            .or_else(|| credentials.refresh_token().map(|t| t.as_str()))
-            .or_else(|| credentials.access_token().map(|t| t.as_str()))
+            .and_then(|p| p.get("profileArn").and_then(|v| v.as_str()))
+            .or_else(|| psd.and_then(|p| p.get("clientId").and_then(|v| v.as_str())))
+            .or_else(|| credentials.refresh_token())
+            .or_else(|| credentials.access_token())
             .unwrap_or("anonymous");
 
         let mut hasher = Sha256::new();
@@ -208,5 +340,141 @@ impl KiroModelsService {
 impl Default for KiroModelsService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service() -> KiroModelsService {
+        KiroModelsService::new()
+    }
+
+    #[test]
+    fn strips_synthetic_suffixes() {
+        assert_eq!(KiroModelsService::strip_synthetic_suffixes("claude-sonnet-4.5-thinking"), "claude-sonnet-4.5");
+        assert_eq!(KiroModelsService::strip_synthetic_suffixes("auto-agentic"), "auto");
+        assert_eq!(
+            KiroModelsService::strip_synthetic_suffixes("glm-5-thinking-agentic"),
+            "glm-5"
+        );
+    }
+
+    #[test]
+    fn region_from_profile_arn() {
+        assert_eq!(
+            KiroModelsService::region_from_profile_arn(Some("arn:aws:codewhisperer:eu-central-1:1:profile/A")),
+            "eu-central-1"
+        );
+        assert_eq!(KiroModelsService::region_from_profile_arn(None), "us-east-1");
+        assert_eq!(KiroModelsService::region_from_profile_arn(Some("bogus")), "us-east-1");
+    }
+
+    #[test]
+    fn variants_for_regular_model() {
+        let variants = KiroModelsService::build_variants("claude-sonnet-4.5", None);
+        let ids: Vec<&str> = variants
+            .iter()
+            .filter_map(|v| v.get("id").and_then(JsonValue::as_str))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "claude-sonnet-4.5",
+                "claude-sonnet-4.5-thinking",
+                "claude-sonnet-4.5-agentic",
+                "claude-sonnet-4.5-thinking-agentic",
+            ]
+        );
+        assert_eq!(variants[0]["name"], "Kiro claude-sonnet-4.5");
+    }
+
+    #[test]
+    fn auto_skips_agentic_variants() {
+        let variants = KiroModelsService::build_variants("auto", None);
+        let ids: Vec<&str> = variants
+            .iter()
+            .filter_map(|v| v.get("id").and_then(JsonValue::as_str))
+            .collect();
+        assert_eq!(ids, vec!["auto", "auto-thinking"]);
+    }
+
+    #[test]
+    fn display_name_marks_non_unit_rate() {
+        assert_eq!(
+            KiroModelsService::format_display_name(Some("Sonnet 4.5"), "x", Some(1.0)),
+            "Kiro Sonnet 4.5"
+        );
+        assert_eq!(
+            KiroModelsService::format_display_name(Some("Sonnet 4.5"), "x", Some(1.4)),
+            "Kiro Sonnet 4.5 (1.4x credit)"
+        );
+        assert_eq!(KiroModelsService::format_display_name(None, "glm-5", None), "Kiro glm-5");
+    }
+
+    #[test]
+    fn fingerprint_headers_are_stable_per_seed() {
+        let creds = Credentials::from_value(serde_json::json!({
+            "providerSpecificData": { "clientId": "abc" },
+            "accessToken": "tok",
+        }));
+        let a = KiroModelsService::build_kiro_fingerprint_headers(&creds);
+        let b = KiroModelsService::build_kiro_fingerprint_headers(&creds);
+        assert_eq!(a["User-Agent"], b["User-Agent"]);
+        assert!(a["User-Agent"].contains("KiroIDE-0.10.32-"));
+        assert!(a["User-Agent"].contains("os/windows#10.0.26200"));
+        assert_eq!(a["x-amzn-kiro-agent-mode"], "vibe");
+        assert_ne!(a["amz-sdk-invocation-id"], b["amz-sdk-invocation-id"]);
+    }
+
+    #[test]
+    fn expands_raw_models_with_metadata() {
+        let raw = vec![serde_json::json!({
+            "modelId": "glm-5",
+            "modelName": "GLM 5",
+            "rateMultiplier": 0.4,
+            "description": "fast",
+            "tokenLimits": { "maxInputTokens": 128000 },
+        })];
+        let expanded = KiroModelsService::expand(&raw);
+        assert_eq!(expanded.len(), 4);
+        assert_eq!(expanded[0]["upstreamModelId"], "glm-5");
+        assert_eq!(expanded[0]["contextLength"], 128000);
+        assert_eq!(expanded[0]["description"], "fast");
+        assert_eq!(expanded[0]["name"], "Kiro GLM 5 (0.4x credit)");
+    }
+
+    #[test]
+    fn expand_skips_entries_without_id() {
+        let raw = vec![serde_json::json!({"modelName": "no id"})];
+        assert!(KiroModelsService::expand(&raw).is_empty());
+    }
+
+    #[test]
+    fn clear_cache_empties_store() {
+        let svc = service();
+        let creds = Credentials::from_value(serde_json::json!({"accessToken": "t"}));
+        svc.cache.lock().unwrap().insert(
+            svc.cache_key(&creds),
+            CatalogCacheEntry { expires_at: u64::MAX, models: vec![], raw_models: vec![] },
+        );
+        assert_eq!(svc.cache.lock().unwrap().len(), 1);
+        svc.clear_cache();
+        assert!(svc.cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cache_key_prefers_profile_arn() {
+        let svc = service();
+        let a = Credentials::from_value(serde_json::json!({
+            "accessToken": "1",
+            "providerSpecificData": { "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/A" },
+        }));
+        let b = Credentials::from_value(serde_json::json!({
+            "accessToken": "2",
+            "providerSpecificData": { "profileArn": "arn:aws:codewhisperer:us-east-1:1:profile/A" },
+        }));
+        assert_eq!(svc.cache_key(&a), svc.cache_key(&b));
     }
 }

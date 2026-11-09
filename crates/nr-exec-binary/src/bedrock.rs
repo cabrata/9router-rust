@@ -1,14 +1,26 @@
 //! Port of open-sse/executors/bedrock.js
 //! Bedrock executor for AWS Anthropic models and Grok on Bedrock.
 
-use crate::aws_sigv4;
-use async_trait::async_trait;
-use nr_core::http::HeaderList;
-use nr_core::{Credentials, ExecRequest, ExecResult, Json, Result};
-use nr_exec_base::BaseHooks;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// Bedrock executor for AWS Anthropic models.
+use async_trait::async_trait;
+use base64::{engine::general_purpose, Engine};
+use bytes::Bytes;
+use futures::channel::mpsc;
+use futures::{SinkExt, StreamExt};
+use nr_core::http::{proxy_fetch, FetchRequest, HeaderList, UpstreamResponse};
+use nr_core::{Credentials, Error, ExecRequest, ExecResult, Json, Result};
+use nr_exec_base::base::{base_execute, BaseHooks};
+
+use crate::aws_credentials::{resolve_aws_credentials, resolve_region, ResolvedAwsCredentials};
+use crate::aws_event_stream::{crc32, parse_event_frame, EventHeaderValue};
+use crate::aws_sigv4::{escape_uri, sign_aws_request, AwsCredentials, SigningOptions};
+
+const ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
+const BEDROCK_SERVICE: &str = "bedrock";
+
+/// Bedrock executor for AWS Anthropic models and Grok on Bedrock.
 pub struct BedrockExecutor {
     provider: String,
     config: Json,
@@ -35,7 +47,6 @@ impl BedrockExecutor {
     }
 }
 
-#[async_trait]
 impl BaseHooks for BedrockExecutor {
     fn provider(&self) -> &str {
         &self.provider
@@ -52,22 +63,13 @@ impl BaseHooks for BedrockExecutor {
         _url_index: usize,
         creds: &Credentials,
     ) -> Result<String> {
-        // TODO(dedupe): Use region resolution from nr_oauth::awsCredentials once ported
-        let region = resolve_region(creds)?;
-
-        let path = if stream {
-            "/model/{}/converse-stream"
-        } else {
-            "/model/{}/converse"
-        };
-
-        let escaped_model = aws_sigv4::escape_uri(model);
-        let url = format!(
-            "https://bedrock-runtime.{}.amazonaws.com{}",
-            region,
-            path.replace("{}", &escaped_model)
-        );
-        Ok(url)
+        let region = resolve_region(creds, None)?;
+        let action = if stream { "invoke-with-response-stream" } else { "invoke" };
+        let escaped_model = escape_uri(model);
+        Ok(format!(
+            "https://bedrock-runtime.{}.amazonaws.com/model/{}/{}",
+            region, escaped_model, action
+        ))
     }
 
     fn transform_request(
@@ -77,12 +79,13 @@ impl BaseHooks for BedrockExecutor {
         _stream: bool,
         _creds: &Credentials,
     ) -> Result<Json> {
-        // Remove model and stream fields (they go in URL/endpoint)
-        // shortcut: simplified transform, full version handles anthropic_version for claude wire
         let mut transformed = body.clone();
         if let Json::Object(ref mut obj) = transformed {
             obj.remove("model");
             obj.remove("stream");
+            if self.is_claude_wire {
+                obj.insert("anthropic_version".to_string(), Json::String(ANTHROPIC_VERSION.to_string()));
+            }
         }
         Ok(transformed)
     }
@@ -106,6 +109,176 @@ impl BaseHooks for BedrockExecutor {
     }
 }
 
+/// Convert AWS EventStream binary chunks to SSE lines (port of JS `eventStreamToSse`).
+async fn event_stream_to_sse(
+    mut response: UpstreamResponse,
+    is_claude_wire: bool,
+) -> UpstreamResponse {
+    let (mut tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(32);
+
+    tokio::spawn(async move {
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut saw_terminal_event = false;
+        let mut failed = false;
+
+        let emit = |controller_tx: &mut mpsc::Sender<std::io::Result<Bytes>>,
+                    event_type: Option<&str>,
+                    data: &Json| {
+            let frame = if is_claude_wire {
+                let t = event_type.unwrap_or("message");
+                format!("event: {t}\ndata: {data}\n\n")
+            } else {
+                format!("data: {data}\n\n")
+            };
+            let _ = controller_tx.try_send(Ok(Bytes::from(frame)));
+        };
+
+        let mut fail = |controller_tx: &mut mpsc::Sender<std::io::Result<Bytes>>,
+                        err_type: &str,
+                        message: &str| {
+            if failed {
+                return false;
+            }
+            failed = true;
+            let payload = if is_claude_wire {
+                serde_json::json!({"type": "error", "error": {"type": err_type, "message": message}})
+            } else {
+                serde_json::json!({"error": {"type": err_type, "message": message, "code": err_type}})
+            };
+            emit(controller_tx, Some("error"), &payload);
+            false
+        };
+
+        while let Some(chunk_res) = response.body.next().await {
+            let chunk = match chunk_res {
+                Ok(c) => c,
+                Err(e) => {
+                    fail(&mut tx, "api_error", &format!("Bedrock stream read failed: {e}"));
+                    break;
+                }
+            };
+            if chunk.is_empty() {
+                continue;
+            }
+            buffer.extend_from_slice(&chunk);
+
+            // Drain complete EventStream frames
+            let mut stop = false;
+            while buffer.len() >= 12 {
+                let prelude_crc = u32::from_be_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
+                if prelude_crc != crc32(&buffer[..8]) {
+                    fail(&mut tx, "api_error", "Bedrock EventStream prelude CRC mismatch");
+                    stop = true;
+                    break;
+                }
+                let total_length = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+                if total_length < 16 || total_length > crate::aws_event_stream::MAX_MESSAGE_BYTES {
+                    fail(&mut tx, "api_error", "Bedrock EventStream frame bounds are invalid");
+                    stop = true;
+                    break;
+                }
+                if buffer.len() < total_length {
+                    break; // Wait for rest of frame
+                }
+
+                let frame_bytes = buffer[..total_length].to_vec();
+                buffer.drain(..total_length);
+
+                let event = match parse_event_frame(&frame_bytes) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        fail(&mut tx, "api_error", &e);
+                        stop = true;
+                        break;
+                    }
+                };
+
+                let header_str = |k: &str| -> Option<String> {
+                    match event.headers.get(k) {
+                        Some(EventHeaderValue::String(s)) => Some(s.clone()),
+                        _ => None,
+                    }
+                };
+
+                let message_type = header_str(":message-type").unwrap_or_default();
+                if message_type == "exception" || message_type == "error" {
+                    let ex_type = header_str(":exception-type")
+                        .or_else(|| header_str(":error-code"))
+                        .unwrap_or_else(|| "api_error".to_string());
+                    let msg = header_str(":error-message")
+                        .unwrap_or_else(|| "Bedrock returned an EventStream error".to_string());
+                    fail(&mut tx, &ex_type, &msg);
+                    stop = true;
+                    break;
+                }
+
+                if header_str(":event-type").as_deref() != Some("chunk") {
+                    continue;
+                }
+
+                // Chunk frame carries {"bytes": "<base64>"}
+                let encoded_opt = event.payload.as_ref()
+                    .and_then(|p| p.get("bytes"))
+                    .and_then(Json::as_str);
+
+                let encoded = match encoded_opt {
+                    Some(s) => s,
+                    None => {
+                        fail(&mut tx, "api_error", "Bedrock chunk frame carried no payload bytes");
+                        stop = true;
+                        break;
+                    }
+                };
+
+                let decoded_bytes = match general_purpose::STANDARD.decode(encoded) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        fail(&mut tx, "api_error", &format!("Bedrock chunk was not valid base64 ({e})"));
+                        stop = true;
+                        break;
+                    }
+                };
+
+                let inner: Json = match serde_json::from_slice(&decoded_bytes) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        fail(&mut tx, "api_error", &format!("Bedrock chunk was not valid JSON ({e})"));
+                        stop = true;
+                        break;
+                    }
+                };
+
+                if is_claude_wire {
+                    let ev_type = inner.get("type").and_then(Json::as_str);
+                    emit(&mut tx, ev_type, &inner);
+                    if ev_type == Some("message_stop") {
+                        saw_terminal_event = true;
+                    }
+                } else {
+                    emit(&mut tx, None, &inner);
+                    if let Some(choices) = inner.get("choices").and_then(Json::as_array) {
+                        if choices.iter().any(|c| c.get("finish_reason").is_some() && !c.get("finish_reason").unwrap().is_null()) {
+                            saw_terminal_event = true;
+                        }
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+        }
+
+        if !failed && !saw_terminal_event && !is_claude_wire {
+            let _ = tx.try_send(Ok(Bytes::from("data: [DONE]\n\n")));
+        }
+    });
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::CONTENT_TYPE, http::HeaderValue::from_static("text/event-stream"));
+    headers.insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-cache"));
+    UpstreamResponse::from_stream(200, headers, Box::pin(rx))
+}
+
 #[async_trait]
 impl nr_core::Executor for BedrockExecutor {
     fn provider(&self) -> &str {
@@ -117,14 +290,68 @@ impl nr_core::Executor for BedrockExecutor {
     }
 
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecResult> {
-        // shortcut: Full implementation requires:
-        // - AWS credential resolution from profile or static keys via resolve_aws_credentials
-        // - SigV4 request signing via sign_aws_request (aws_sigv4 module)
-        // - EventStream frame decoding to SSE (for both Claude and OpenAI wire formats)
-        //   via event_stream_to_sse, which handles base64 payload unwrapping
-        // - Bidirectional streaming via tokio channels and custom BodyStream
-        // Current: delegates to base_execute for static credentials until credential resolution is ported.
-        nr_exec_base::base_execute(self, req).await
+        let resolved = resolve_aws_credentials(req.credentials).await?;
+
+        let url = self.build_url(req.model, req.stream, 0, req.credentials)?;
+        let transformed_body = self.transform_request(req.model, &req.body, req.stream, req.credentials)?;
+        let payload = transformed_body.to_string();
+
+        let mut base_headers = BTreeMap::new();
+        base_headers.insert("Content-Type".to_string(), "application/json".to_string());
+        if req.stream {
+            base_headers.insert("Accept".to_string(), "application/vnd.amazon.eventstream".to_string());
+        } else {
+            base_headers.insert("Accept".to_string(), "application/json".to_string());
+        }
+
+        let signed_headers = sign_aws_request(SigningOptions {
+            method: "POST".to_string(),
+            url: url.clone(),
+            headers: Some(base_headers),
+            body: Some(payload.as_bytes().to_vec()),
+            region: resolved.region.clone(),
+            service: BEDROCK_SERVICE.to_string(),
+            credentials: AwsCredentials {
+                access_key_id: resolved.access_key_id,
+                secret_access_key: resolved.secret_access_key,
+                session_token: resolved.session_token,
+            },
+            double_encode_path: true,
+            date: None,
+        }).map_err(|e| Error::Provider(format!("Bedrock SigV4 signing failed: {e}")))?;
+
+        let mut headers = HeaderList::new();
+        for (k, v) in signed_headers {
+            headers.insert(k, v);
+        }
+
+        let fetch = FetchRequest {
+            header_timeout: Some(self.header_timeout()),
+            cancel: Some(req.cancel.clone()),
+            ..FetchRequest::post_json(url.clone(), headers.clone(), &transformed_body)
+        };
+
+        let response = proxy_fetch(fetch, Some(&req.proxy)).await?;
+
+        // Streaming responses arrive as EventStream framing — decode to SSE
+        if req.stream && response.status == 200 {
+            let sse_response = event_stream_to_sse(response, self.is_claude_wire).await;
+            return Ok(ExecResult {
+                response: sse_response,
+                url,
+                headers,
+                transformed_body,
+                response_format: None,
+            });
+        }
+
+        Ok(ExecResult {
+            response,
+            url,
+            headers,
+            transformed_body,
+            response_format: None,
+        })
     }
 }
 
@@ -133,50 +360,31 @@ pub fn create(provider: &str) -> Arc<dyn nr_core::Executor> {
     Arc::new(BedrockExecutor::new(provider))
 }
 
-
-// Helper to resolve AWS region from credentials or environment.
-// TODO(dedupe): Use nr_oauth::awsCredentials::resolve_region once ported
-fn resolve_region(credentials: &Credentials) -> Result<String> {
-    // Try connection setting first
-    if let Some(region) = credentials.psd_str("region") {
-        let region = region.trim();
-        if validate_region(region) {
-            return Ok(region.to_string());
-        }
-    }
-
-    // Try environment variables
-    if let Ok(region) = std::env::var("AWS_REGION") {
-        if validate_region(&region) {
-            return Ok(region);
-        }
-    }
-    if let Ok(region) = std::env::var("AWS_DEFAULT_REGION") {
-        if validate_region(&region) {
-            return Ok(region);
-        }
-    }
-
-    // Default region
-    Ok("us-east-1".to_string())
-}
-
-fn validate_region(region: &str) -> bool {
-    // Region must be lowercase alphanumeric plus hyphens: us-east-1, eu-west-2, etc.
-    !region.is_empty() && region.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn region_validation() {
-        assert!(validate_region("us-east-1"));
-        assert!(validate_region("eu-west-2"));
-        assert!(!validate_region("US-EAST-1")); // uppercase
-        assert!(!validate_region("evil.com")); // not a region
-        assert!(!validate_region("")); // empty
+    fn bedrock_url_construction() {
+        let exec = BedrockExecutor::new("bedrock");
+        let creds = Credentials::from_value(serde_json::json!({
+            "providerSpecificData": { "region": "us-west-2" }
+        }));
+        let url = exec.build_url("anthropic.claude-v2", true, 0, &creds).unwrap();
+        assert_eq!(
+            url,
+            "https://bedrock-runtime.us-west-2.amazonaws.com/model/anthropic.claude-v2/invoke-with-response-stream"
+        );
+    }
+
+    #[test]
+    fn bedrock_transform_request_claude() {
+        let exec = BedrockExecutor::new("bedrock");
+        let creds = Credentials::new();
+        let body = serde_json::json!({ "model": "m", "stream": true, "messages": [] });
+        let transformed = exec.transform_request("m", &body, true, &creds).unwrap();
+        assert_eq!(transformed.get("anthropic_version").and_then(Json::as_str), Some(ANTHROPIC_VERSION));
+        assert!(transformed.get("model").is_none());
+        assert!(transformed.get("stream").is_none());
     }
 }

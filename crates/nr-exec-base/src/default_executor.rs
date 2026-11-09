@@ -738,15 +738,16 @@ fn strip_unsupported_params(provider: &str, model: &str, body: &mut Json) {
         }
     }
 
-    // GitHub Copilot Claude (except opus/sonnet 4.6): thinking + reasoning_effort rejected
-    if provider == "github" && model.to_lowercase().contains("claude")
-        && !model.to_lowercase().contains("opus") && !model.to_lowercase().contains("sonnet")
-        || (model.to_lowercase().contains("opus") || model.to_lowercase().contains("sonnet"))
-            && !model.contains("4.6")
-    {
-        if let Some(obj) = body.as_object_mut() {
-            obj.remove("thinking");
-            obj.remove("reasoning_effort");
+    // GitHub Copilot Claude (except opus/sonnet 4.6): thinking + reasoning_effort rejected.
+    // The provider gate must bind the whole condition: outside `github` neither
+    // field is rejected, and dropping them there silenced reasoning everywhere.
+    if provider == "github" {
+        let m = model.to_lowercase();
+        if m.contains("claude") && !m.contains("4.6") {
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("thinking");
+                obj.remove("reasoning_effort");
+            }
         }
     }
 

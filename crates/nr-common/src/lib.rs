@@ -19,6 +19,8 @@ pub mod model_markers;
 pub mod tag_blocks;
 pub mod debug_log;
 pub mod writable_data_dir;
+pub mod systemone_router;
+pub mod capacity_adapter;
 pub mod thought_signature_store;
 
 // Re-export key functions at crate level

@@ -20,6 +20,11 @@ pub use nodes::*;
 pub use pricing::*;
 pub use proxy_pools::*;
 pub use request_details::*;
+// `get_recent_logs` exists in both request_logs (compact dashboard projection)
+// and usage (text log lines). Re-export the request_logs one under the bare name
+// (that is what the dashboard routes call) and keep usage's text form qualified.
 pub use request_logs::*;
+pub use usage::get_recent_logs as get_recent_log_lines;
 pub use settings::*;
+#[allow(ambiguous_glob_reexports)]
 pub use usage::*;

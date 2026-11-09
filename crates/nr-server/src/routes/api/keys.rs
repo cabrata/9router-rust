@@ -3,7 +3,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use nr_db::{get_api_key_by_id, get_api_keys, normalize_api_key_limits, ApiKey, Db, KeyAccess};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
@@ -177,7 +176,8 @@ fn validate_key_access_input(val: &Value) -> Result<KeyAccess, String> {
         .and_then(|v| v.as_bool())
         .ok_or_else(|| "access.restricted must be a boolean".to_string())?;
 
-    let allow_val = obj.get("allow").unwrap_or(&Value::Array(vec![]));
+    let empty_arr = Value::Array(vec![]);
+    let allow_val = obj.get("allow").unwrap_or(&empty_arr);
     let allow_arr = allow_val
         .as_array()
         .ok_or_else(|| "access.allow must be an array of strings".to_string())?;

@@ -1,8 +1,6 @@
 //! Port of open-sse/executors/opencode-go.js.
 //!
 //! OpenCode Go handles session management for Muse Spark and other responses-format models.
-//! TODO(dedupe): Implement resolveSessionId and getModelTargetFormat from utils/sessionManager.js
-//! and config/providerModels.js once ported.
 
 use std::sync::Arc;
 
@@ -53,6 +51,21 @@ fn native_session(credentials: &Credentials) -> Option<String> {
     None
 }
 
+fn is_responses_model(model: &str) -> bool {
+    let clean = model.trim().chars().take_while(|&c| c != '(').collect::<String>().trim().to_string();
+    let base = if clean.contains('/') {
+        clean.split('/').last().unwrap_or(&clean)
+    } else {
+        &clean
+    };
+    if let Some(target) = nr_data::get_model_target_format("opencode-go", base) {
+        if target == "openai-responses" {
+            return true;
+        }
+    }
+    base.starts_with("muse-spark") || base.starts_with("grok-4.6") || base.starts_with("gpt-5.6")
+}
+
 struct OpencodeGoExecutor {
     config: &'static Json,
 }
@@ -80,10 +93,19 @@ impl OpencodeGoExecutor {
             return creds;
         }
 
-        // TODO: Implement resolveSessionId from utils/sessionManager.js
+        // Resolve session ID using session manager
+        let raw_headers = creds.get("rawHeaders").and_then(|h| h.as_object());
         let resolved = provider_session_id
             .and_then(|s| normalize_session(s))
-            .unwrap_or_else(|| "default-session".to_string());
+            .unwrap_or_else(|| {
+                nr_common::session_manager::resolve_session_id(
+                    raw_headers,
+                    body,
+                    creds.connection_id(),
+                    None,
+                    "opencode-go",
+                )
+            });
 
         let translated = translate_session_id(&resolved, client_tool.unwrap_or("generic"));
         creds.set(SESSION_FIELD, Json::String(translated));
@@ -107,9 +129,7 @@ impl BaseHooks for OpencodeGoExecutor {
         _url_index: usize,
         _creds: &Credentials,
     ) -> Result<String> {
-        // TODO: Implement isResponsesModel check from provider models
-        // For now, assume muse-spark models use responses
-        if model.contains("muse-spark") || model.contains("grok-4.6") || model.contains("gpt-5.6") {
+        if is_responses_model(model) {
             Ok(RESPONSES_BASE_URL.to_string())
         } else {
             Ok(format!("{}/chat/completions", "https://opencode.ai/inference/go/openai/v1"))
@@ -124,7 +144,7 @@ impl BaseHooks for OpencodeGoExecutor {
         _model: &str,
         _body: &Json,
     ) -> Result<nr_core::http::HeaderList> {
-        let mut headers = nr_exec_base::base::default_build_headers(self, credentials, stream)?;
+        let mut headers = nr_exec_base::base::default_build_headers(self, credentials, stream);
 
         if let Some(session) = credentials.get(SESSION_FIELD).and_then(Json::as_str) {
             headers.insert(SESSION_HEADER.to_string(), session.to_string());

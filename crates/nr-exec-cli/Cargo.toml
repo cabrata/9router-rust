@@ -11,7 +11,6 @@ nr-core.workspace = true
 nr-data.workspace = true
 nr-common.workspace = true
 nr-oauth.workspace = true
-nr-translator.workspace = true
 nr-exec-base.workspace = true
 async-trait.workspace = true
 base64.workspace = true

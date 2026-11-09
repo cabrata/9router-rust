@@ -9,16 +9,17 @@ fn sse_body(frames: &[&str]) -> nr_core::http::BodyStream {
     UpstreamResponse::from_bytes(200, Default::default(), text).body
 }
 
-fn collect(
+/// Drain the client stream. Must be awaited on the tokio runtime: the pump
+/// task and its tokio mpsc channel need a live reactor, so
+/// `futures::executor::block_on` here would deadlock the test.
+async fn collect(
     mut s: Pin<Box<dyn futures::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>>,
 ) -> String {
-    futures::executor::block_on(async {
-        let mut out = String::new();
-        while let Some(c) = s.next().await {
-            out.push_str(&String::from_utf8_lossy(&c.unwrap()));
-        }
-        out
-    })
+    let mut out = String::new();
+    while let Some(c) = s.next().await {
+        out.push_str(&String::from_utf8_lossy(&c.unwrap()));
+    }
+    out
 }
 
 #[test]
@@ -72,7 +73,7 @@ fn parse_line_handles_done_and_payload() {
 async fn openai_to_openai_passthrough_emits_frames_and_done() {
     let upstream = sse_body(&["{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}"]);
     let client = transform_sse_to_client(upstream, "openai", "openai", tokio_util::sync::CancellationToken::new());
-    let out = collect(client);
+    let out = collect(client).await;
     assert!(out.contains("\"content\":\"hi\""));
     assert!(out.ends_with("data: [DONE]\n\n"));
 }
@@ -81,7 +82,7 @@ async fn openai_to_openai_passthrough_emits_frames_and_done() {
 async fn openai_to_claude_translation_emits_named_events() {
     let upstream = sse_body(&["{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hey\"}}]}"]);
     let client = transform_sse_to_client(upstream, "openai", "claude", tokio_util::sync::CancellationToken::new());
-    let out = collect(client);
+    let out = collect(client).await;
     assert!(out.contains("event: content_block_delta"), "got: {out}");
     assert!(!out.contains("data: [DONE]"), "claude has no [DONE]");
 }
@@ -100,8 +101,11 @@ async fn abort_emits_terminal_error_frame() {
     // Give the pump a moment, then abort.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     cancel.cancel();
-    let out = collect(client);
+    let out = collect(client).await;
     assert!(out.contains("\"content\":\"a\""), "got: {out}");
-    assert!(out.contains("504") && out.contains("aborted"), "terminal frame after abort: {out}");
+    // The frame is the OpenAI error envelope (JS `buildErrorBody`): type/code
+    // carry the classification, the numeric status is not part of the body.
+    assert!(out.contains("aborted"), "terminal frame after abort: {out}");
+    assert!(out.contains("\"code\":\"gateway_timeout\""), "504 mapping: {out}");
     assert!(out.ends_with("\n\n"));
 }

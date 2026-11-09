@@ -14,7 +14,7 @@ use http::HeaderMap;
 use lazy_static::lazy_static;
 use nr_common::sse::sse_chunk;
 use nr_core::http::{proxy_fetch, FetchRequest, UpstreamResponse};
-use nr_core::{Credentials, ExecRequest, ExecResult, Executor, Json, JsonMap, Result};
+use nr_core::{ExecRequest, ExecResult, Executor, Result};
 use regex::Regex;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -440,10 +440,10 @@ impl Executor for PerplexityWebExecutor {
     }
 
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecResult> {
-        let messages = req.body.get("messages").and_then(|m| m.as_array()).ok_or_else(|| nr_core::Error::invalid_request("Missing or empty messages array"))?;
+        let messages = req.body.get("messages").and_then(|m| m.as_array()).ok_or_else(|| nr_core::Error::BadRequest("Missing or empty messages array".into()))?;
 
         if messages.is_empty() {
-            return Err(nr_core::Error::invalid_request("Missing or empty messages array"));
+            return Err(nr_core::Error::BadRequest("Missing or empty messages array".into()));
         }
 
         let thinking = req.body.get("thinking").and_then(|t| t.as_bool()).unwrap_or(false) || (req.body.get("reasoning_effort").is_some() && req.body.get("reasoning_effort") != Some(&json!("none")));
@@ -463,10 +463,10 @@ impl Executor for PerplexityWebExecutor {
         let parsed = parse_openai_messages(messages);
         let follow_up_uuid = session_lookup(&parsed.history, &parsed.current_msg);
 
-        let query = build_query(&parsed, follow_up_uuid.as_deref(), req.body.get("tools").and_then(|t| t.as_array()));
+        let query = build_query(&parsed, follow_up_uuid.as_deref(), req.body.get("tools").and_then(|t| t.as_array()).map(|v| v.as_slice()));
 
         if query.trim().is_empty() {
-            return Err(nr_core::Error::invalid_request("Empty query after processing"));
+            return Err(nr_core::Error::BadRequest("Empty query after processing".into()));
         }
 
         let pplx_body = build_pplx_request_body(&query, pplx_mode, model_pref, follow_up_uuid.as_deref());
@@ -480,9 +480,9 @@ impl Executor for PerplexityWebExecutor {
         headers.insert("X-App-ApiClient".to_string(), "default".to_string());
         headers.insert("X-App-ApiVersion".to_string(), PPLX_API_VERSION.to_string());
 
-        if let Some(access_token) = req.credentials.access_token.as_ref() {
+        if let Some(access_token) = req.credentials.access_token() {
             headers.insert("Authorization".to_string(), format!("Bearer {}", access_token));
-        } else if let Some(api_key) = req.credentials.api_key.as_ref() {
+        } else if let Some(api_key) = req.credentials.api_key() {
             headers.insert("Cookie".to_string(), format!("__Secure-next-auth.session-token={}", api_key));
         }
 

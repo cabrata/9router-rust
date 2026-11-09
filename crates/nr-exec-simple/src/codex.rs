@@ -1,6 +1,7 @@
 //! Port of open-sse/executors/codex.js + utils/codexToolSchema.js.
 //! Codex Responses API executor with tool schema sanitization and request normalization.
-//! shortcut: image prefetching skipped (upstream handles URLs directly), implement when needed
+//! Remote image URLs are inlined as base64 before the request: the Codex
+//! backend cannot fetch them itself (see `prefetch_images`).
 
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -151,7 +152,7 @@ impl BaseHooks for CodexExecutor {
         if let Some(Json::Array(tools)) = result.get_mut("tools") {
             for tool in tools.iter_mut() {
                 if let Json::Object(t) = tool {
-                    if let Some(Json::Object(params)) = t.get_mut("parameters") {
+                    if let Some(params) = t.get_mut("parameters") {
                         let mut stats = 0;
                         *params = strip_unicode_patterns(params, &mut stats);
                     }
@@ -188,10 +189,127 @@ impl Executor for CodexExecutor {
     }
 
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecResult> {
-        base_execute(self, req).await
+        // The Codex backend cannot fetch remote images, so any `image_url` part
+        // is inlined as a data URI before the request leaves this process.
+        let body = prefetch_images(req.body.clone()).await;
+        base_execute(self, ExecRequest { body, ..req }).await
     }
+}
+
+/// `prefetchImages`: rewrite `image_url` parts into `input_image` parts,
+/// inlining remote URLs as base64 data URIs. Unchanged parts pass through.
+async fn prefetch_images(body: Json) -> Json {
+    let mut body = body;
+    let Some(items) = body.get_mut("input").and_then(Json::as_array_mut) else {
+        return body;
+    };
+
+    for item in items.iter_mut() {
+        let Some(content) = item.get_mut("content").and_then(Json::as_array_mut) else {
+            continue;
+        };
+        let mut rewritten = Vec::with_capacity(content.len());
+        for part in content.iter() {
+            if part.get("type").and_then(Json::as_str) != Some("image_url") {
+                rewritten.push(part.clone());
+                continue;
+            }
+            let image_url = part.get("image_url").cloned().unwrap_or(Json::Null);
+            let url = match &image_url {
+                Json::String(s) => s.clone(),
+                other => other.get("url").and_then(Json::as_str).unwrap_or("").to_string(),
+            };
+            let detail = image_url
+                .get("detail")
+                .and_then(Json::as_str)
+                .unwrap_or("auto")
+                .to_string();
+            let resolved = if url.is_empty() {
+                url
+            } else if url.starts_with("data:") {
+                url
+            } else {
+                let options = nr_translator::concerns::image::FetchOptions {
+                    timeout_ms: 15_000,
+                    ..Default::default()
+                };
+                match nr_translator::concerns::image::fetch_image_as_base64(&url, &options).await {
+                    Some(fetched) => fetched.url,
+                    None => url,
+                }
+            };
+            rewritten.push(serde_json::json!({
+                "type": "input_image",
+                "image_url": resolved,
+                "detail": detail,
+            }));
+        }
+        if let Some(slot) = item.get_mut("content") {
+            *slot = Json::Array(rewritten);
+        }
+    }
+    body
 }
 
 pub fn create(_provider: &str) -> Arc<dyn Executor> {
     Arc::new(CodexExecutor::new())
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn data_uri_images_become_input_image() {
+        let body = json!({"input": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA", "detail": "high"}},
+            ],
+        }]});
+        let out = prefetch_images(body).await;
+        let parts = out["input"][0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[1]["image_url"], "data:image/png;base64,AAA");
+        assert_eq!(parts[1]["detail"], "high");
+    }
+
+    #[tokio::test]
+    async fn detail_defaults_to_auto() {
+        let body = json!({"input": [{"content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+        ]}]});
+        let out = prefetch_images(body).await;
+        assert_eq!(out["input"][0]["content"][0]["detail"], "auto");
+    }
+
+    #[tokio::test]
+    async fn unreachable_remote_url_keeps_the_original_url() {
+        // An unroutable host: the fetch fails and the URL is passed through,
+        // matching `fetched?.url || url`.
+        let body = json!({"input": [{"content": [
+            {"type": "image_url", "image_url": {"url": "http://127.0.0.1:9/x.png"}},
+        ]}]});
+        let out = prefetch_images(body).await;
+        assert_eq!(out["input"][0]["content"][0]["type"], "input_image");
+        assert_eq!(out["input"][0]["content"][0]["image_url"], "http://127.0.0.1:9/x.png");
+    }
+
+    #[tokio::test]
+    async fn bodies_without_input_are_untouched() {
+        let body = json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(prefetch_images(body.clone()).await, body);
+    }
+
+    #[tokio::test]
+    async fn string_image_url_shape_is_accepted() {
+        let body = json!({"input": [{"content": [
+            {"type": "image_url", "image_url": "data:image/png;base64,BBB"},
+        ]}]});
+        let out = prefetch_images(body).await;
+        assert_eq!(out["input"][0]["content"][0]["image_url"], "data:image/png;base64,BBB");
+    }
 }

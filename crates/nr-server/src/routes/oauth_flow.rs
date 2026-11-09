@@ -498,5 +498,5 @@ pub fn classify_device_poll(resp: &Value) -> DevicePollState {
 
 pub fn routes() -> Router {
     Router::new()
-        .route("/api/oauth/:provider/:action", get(dynamic_get).post(dynamic_post))
+        .route("/api/oauth/{provider}/{action}", get(dynamic_get).post(dynamic_post))
 }

@@ -64,10 +64,40 @@ pub fn should_refresh_credentials(provider: &str, creds: &Credentials, now_ms: i
         }
     }
 
-    // TODO(wave2): proactive stale refresh for providers with maxRefreshAgeMs (e.g. codex)
-    // if maxAgeMs is set and credentials.refreshToken exists and token is stale by age
+    // Proactive stale refresh for providers declaring oauth.maxRefreshAgeMs
+    // (e.g. codex, 8 days): refresh on age even when expiresAt looks fine.
+    if let Some(max_age_ms) = provider_oauth_u64(provider, "maxRefreshAgeMs") {
+        if creds.refresh_token().is_some()
+            && is_refresh_stale(creds, now_ms, max_age_ms as i64)
+        {
+            return true;
+        }
+    }
 
     false
+}
+
+/// `PROVIDER_OAUTH[provider].<key>` as u64.
+fn provider_oauth_u64(provider: &str, key: &str) -> Option<u64> {
+    nr_data::provider_oauth(provider)?
+        .get(key)
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)))
+}
+
+/// `PROVIDER_OAUTH[provider].trackRefreshAt === true`.
+fn provider_tracks_refresh_at(provider: &str) -> bool {
+    nr_data::provider_oauth(provider)
+        .and_then(|o| o.get("trackRefreshAt"))
+        .is_some_and(nr_core::json::truthy)
+}
+
+/// JS `isCodexRefreshStale(credentials, nowMs, maxAgeMs)`: no `lastRefreshAt`
+/// or older than `max_age_ms` counts as stale.
+pub fn is_refresh_stale(creds: &Credentials, now_ms: i64, max_age_ms: i64) -> bool {
+    match get_credential_last_refresh_ms(creds) {
+        None => true,
+        Some(last) => now_ms - last >= max_age_ms,
+    }
 }
 
 pub fn merge_provider_specific_data(existing: Option<&JsonMap>, next: Option<&JsonMap>) -> Option<JsonMap> {
@@ -85,7 +115,7 @@ pub fn merge_provider_specific_data(existing: Option<&JsonMap>, next: Option<&Js
 }
 
 pub fn merge_refreshed_credentials(
-    _provider: &str,
+    provider: &str,
     current_creds: &Credentials,
     refreshed: &Option<JsonMap>,
     now_ms: i64,
@@ -169,9 +199,10 @@ pub fn merge_refreshed_credentials(
         next.insert("copilotTokenExpiresAt".to_string(), cte.clone());
     }
 
-    // Track lastRefreshAt for staleness detection
-    // TODO(wave2): read trackRefreshAt from provider config
-    let should_track_refresh = next.get("accessToken").is_some()
+    // Track lastRefreshAt for staleness detection. Providers declaring
+    // oauth.trackRefreshAt (e.g. codex) always stamp it.
+    let should_track_refresh = provider_tracks_refresh_at(provider)
+        || next.get("accessToken").is_some()
         || next.get("apiKey").is_some()
         || next.get("token").is_some()
         || next.get("refreshToken").is_some()
@@ -223,24 +254,34 @@ where
 {
     let key = get_refresh_lock_key(provider, creds);
 
-    // Get or create lock for this key
+    // Get or create the lock for this key.
     let lock = {
         let mut locks = CREDENTIAL_REFRESH_LOCKS.write();
-        locks.entry(key.clone())
+        locks
+            .entry(key.clone())
             .or_insert_with(|| Arc::new(TokioMutex::new(())))
             .clone()
     };
 
-    // Acquire lock and execute refresh
-    let _guard = lock.lock().await;
-    let result = f().await;
+    let result = {
+        let _guard = lock.lock().await;
+        f().await
+    };
 
-    // Clean up lock if no longer needed (optional optimization)
-    // For now, keep locks cached for performance
+    // Drop the lock once nobody else holds or waits for it — JS deletes the
+    // pending promise in `finally`, so the next caller starts a fresh refresh.
+    {
+        let mut locks = CREDENTIAL_REFRESH_LOCKS.write();
+        if Arc::strong_count(&lock) <= 2 {
+            locks.remove(&key);
+        }
+    }
 
     result
 }
 
+/// JS `refreshProviderCredentials(provider, credentials, log)`: refresh under the
+/// per-credential lock and merge the result into a credentials patch.
 pub async fn refresh_provider_credentials(
     provider: &str,
     creds: &Credentials,
@@ -250,8 +291,15 @@ pub async fn refresh_provider_credentials(
         return None;
     }
 
-    // Dispatch to refresh_token_by_provider and merge result
-    let refreshed = crate::token_refresh::refresh_token_by_provider(provider, creds, log).await;
+    // The lock serializes refreshes for one credential; `refresh_token_by_provider`
+    // dedupes by provider+token underneath, so a caller that arrives while a
+    // refresh is in flight shares its result instead of sending a second
+    // request (single-use refresh tokens would otherwise be spent).
+    let refreshed = with_credential_refresh_lock(provider, creds, || {
+        crate::token_refresh::refresh_token_by_provider(provider, creds, log)
+    })
+    .await;
+
     merge_refreshed_credentials(provider, creds, &refreshed, Utc::now().timestamp_millis())
 }
 

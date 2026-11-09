@@ -51,15 +51,16 @@ static ERROR_RULES: &[ErrorRule] = &[
         cooldown_ms: MAX_RATE_LIMIT_COOLDOWN_MS,
         backoff: false,
     },
+    // Intl gateway blocks affect the account/IP, so let the connection back off.
     ErrorRule {
-        provider: Some("Claude Opus 5.5-intl"),
+        provider: Some("codebuddy-intl"),
         text: Some("request illegal"),
         status: None,
         cooldown_ms: 0,
         backoff: true,
     },
     ErrorRule {
-        provider: Some("Claude Opus 5.5-intl"),
+        provider: Some("codebuddy-intl"),
         text: Some("conversation id missing"),
         status: None,
         cooldown_ms: 0,

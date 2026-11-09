@@ -1,6 +1,5 @@
 //! Port of open-sse/executors/commandcode.js + shared/commandCodeHeaders.js.
 //! Handles CommandCode NDJSON upstream (no `data:` prefix), translates to OpenAI SSE.
-//! shortcut: x-session-id slugification uses simple rules instead of full @sindresorhus/slugify
 
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -11,14 +10,83 @@ use nr_exec_base::base::{base_execute, BaseHooks};
 
 static EMPTY: LazyLock<Json> = LazyLock::new(|| Json::Object(Default::default()));
 
-/// Simple slugify: lowercase, replace non-alphanumeric with dash, trim dashes
+/// Subset of @sindresorhus/slugify's built-in replacements, plus the
+/// transliterate table entries Unicode NFD decomposition does not cover.
+fn transliterate(value: &str) -> String {
+    const REPLACEMENTS: &[(&str, &str)] = &[
+        ("&", " and "),
+        ("\u{1F984}", " unicorn "),
+        ("\u{2665}", " love "),
+        ("\u{00DF}", "ss"),
+        ("\u{1E9E}", "Ss"),
+        ("\u{00E4}", "ae"),
+        ("\u{00C4}", "Ae"),
+        ("\u{00F6}", "oe"),
+        ("\u{00D6}", "Oe"),
+        ("\u{00FC}", "ue"),
+        ("\u{00DC}", "Ue"),
+        ("\u{00C6}", "AE"),
+        ("\u{00E6}", "ae"),
+        ("\u{00D8}", "O"),
+        ("\u{00F8}", "o"),
+        ("\u{0152}", "OE"),
+        ("\u{0153}", "oe"),
+        ("\u{00D0}", "D"),
+        ("\u{00F0}", "d"),
+        ("\u{0110}", "D"),
+        ("\u{0111}", "d"),
+        ("\u{00DE}", "TH"),
+        ("\u{00FE}", "th"),
+        ("\u{0141}", "L"),
+        ("\u{0142}", "l"),
+        ("\u{0131}", "i"),
+    ];
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match REPLACEMENTS.iter().find(|(from, _)| from.chars().eq(std::iter::once(ch))) {
+            Some((_, to)) => out.push_str(to),
+            None => out.push(ch),
+        }
+    }
+    // `String.prototype.normalize("NFD")` + mark stripping only matters for
+    // non-ASCII text; the replacement table above already covers slugify's own
+    // table, and every remaining non-ASCII char is dropped by the `[^a-z\d]`
+    // pass below just like the decomp-only marks would be.
+    out
+}
+
+/// Same splitting rules as @sindresorhus/slugify's decamelize (default on).
+fn decamelize(value: &str) -> String {
+    let mut out = value.to_string();
+    for (re, replacement) in [
+        (r"([A-Z]{2,})(\d+)", "$1 $2"),
+        (r"([a-z\d]+)([A-Z]{2,})", "$1 $2"),
+        (r"([a-z\d])([A-Z])", "$1 $2"),
+        (r"([A-Z]+)([A-Z][a-rt-z\d]+)", "$1 $2"),
+    ] {
+        if let Ok(re) = regex::Regex::new(re) {
+            out = re.replace_all(&out, replacement).to_string();
+        }
+    }
+    out
+}
+
+/// `slugify(path)` with @sindresorhus/slugify defaults:
+/// `/home/u/My Project` → `home-u-my-project`.
 fn slugify_path(value: &str) -> String {
-    value
-        .to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-")
-        .replace("--", "-")
-        .trim_matches('-')
-        .to_string()
+    let lowered = decamelize(&transliterate(value)).to_lowercase();
+    let mut slug = String::with_capacity(lowered.len());
+    let mut in_run = false;
+    for ch in lowered.chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            slug.push(ch);
+            in_run = false;
+        } else if !in_run {
+            slug.push('-');
+            in_run = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
 }
 
 pub struct CommandCodeExecutor {
@@ -113,4 +181,37 @@ impl Executor for CommandCodeExecutor {
 
 pub fn create(_provider: &str) -> Arc<dyn Executor> {
     Arc::new(CommandCodeExecutor::new())
+}
+
+#[cfg(test)]
+mod slugify_tests {
+    use super::*;
+
+    #[test]
+    fn slugifies_a_path_like_the_cli() {
+        assert_eq!(slugify_path("/home/u/My Project"), "home-u-my-project");
+        assert_eq!(slugify_path("/media/caliph/project/rust-9router"), "media-caliph-project-rust-9router");
+    }
+
+    #[test]
+    fn decamelizes_like_sindresorhus() {
+        // Verified against the JS: `([a-z\d])([A-Z])` splits at the case boundary
+        // only, so the digit stays glued to the lowercase run.
+        assert_eq!(slugify_path("/a/rust9Router"), "a-rust9-router");
+        assert_eq!(slugify_path("APIV2Thing"), "apiv-2-thing");
+    }
+
+    #[test]
+    fn maps_special_characters() {
+        assert_eq!(slugify_path("M&Ms"), "m-and-ms");
+        assert_eq!(slugify_path("Über_Größe"), "ueber-groesse");
+        assert_eq!(slugify_path("straße"), "strasse");
+    }
+
+    #[test]
+    fn collapses_and_trims_separators() {
+        assert_eq!(slugify_path("a---b___c"), "a-b-c");
+        assert_eq!(slugify_path("///"), "");
+        assert_eq!(slugify_path(""), "");
+    }
 }

@@ -1,8 +1,6 @@
 //! Port of open-sse/executors/opencode-zen.js.
 //!
 //! OpenCode Zen (free tier) with session management, fingerprinting, and free-tier gates.
-//! TODO(dedupe): Port fingerprinting and free-tier model detection functions from
-//! utils/opencodeFingerprint.js and providers/models/helpers.js once available.
 
 use std::sync::Arc;
 
@@ -43,7 +41,7 @@ fn translate_session_id(session_id: &str, client_tool: &str) -> String {
     let time = time_u64 & session_time_mask;
 
     // Generate session ID with descending time prefix
-    let descending_time = (~(time * 0x1000 + 1) & session_prefix_mask) as u64;
+    let descending_time = (!(time * 0x1000 + 1) & session_prefix_mask) as u64;
     let hex_time = format!("{:012x}", descending_time);
 
     let mut random_part = String::new();
@@ -100,6 +98,27 @@ fn native_session(credentials: &Credentials) -> Option<String> {
     None
 }
 
+fn generate_request_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use rand::Rng;
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let current = now_ms * 0x1000 + 1;
+    let time = format!("{:012x}", current);
+
+    let mut random_part = String::new();
+    let mut rng = rand::thread_rng();
+    for _ in 0..14 {
+        let idx = rng.gen_range(0..62);
+        random_part.push(BASE62_CHARS.chars().nth(idx).unwrap());
+    }
+    format!("msg_{}{}", time, random_part)
+}
+
 struct OpencodeZenExecutor {
     config: &'static Json,
 }
@@ -123,14 +142,21 @@ impl OpencodeZenExecutor {
 
         // Try to get native session from headers
         if let Some(native) = native_session(&creds) {
-            creds.insert(SESSION_FIELD.to_string(), Json::String(native));
+            creds.set(SESSION_FIELD, Json::String(native));
             return creds;
         }
 
-        // TODO: Implement resolveSessionId from utils/sessionManager.js
-        let resolved = "default-session".to_string();
+        // Resolve session ID using session manager
+        let raw_headers = creds.get("rawHeaders").and_then(|h| h.as_object());
+        let resolved = nr_common::session_manager::resolve_session_id(
+            raw_headers,
+            _body,
+            creds.connection_id(),
+            None,
+            "opencode-zen",
+        );
         let translated = translate_session_id(&resolved, client_tool.unwrap_or("generic"));
-        creds.insert(SESSION_FIELD.to_string(), Json::String(translated));
+        creds.set(SESSION_FIELD, Json::String(translated));
         creds
     }
 }
@@ -151,8 +177,7 @@ impl BaseHooks for OpencodeZenExecutor {
         _url_index: usize,
         _creds: &Credentials,
     ) -> Result<String> {
-        // TODO: Implement isMuseSparkModel check from providers/models/helpers.js
-        if model.contains("muse-spark") {
+        if nr_data::model_helpers::is_muse_spark_model(Some(model)) {
             Ok(RESPONSES_BASE_URL.to_string())
         } else {
             Ok(format!("{}/chat/completions", "https://opencode.ai/zen/v1"))
@@ -167,7 +192,7 @@ impl BaseHooks for OpencodeZenExecutor {
         _model: &str,
         _body: &Json,
     ) -> Result<nr_core::http::HeaderList> {
-        let mut headers = nr_exec_base::base::default_build_headers(self, credentials, stream)?;
+        let mut headers = nr_exec_base::base::default_build_headers(self, credentials, stream);
 
         // Set User-Agent from downstream or fallback to official
         if let Some(raw_headers) = credentials.get("rawHeaders").and_then(|h| h.as_object()) {
@@ -192,7 +217,11 @@ impl BaseHooks for OpencodeZenExecutor {
         }
 
         // Free-tier gate: use Bearer public for free-tier models
-        // TODO: Implement isOpencodeFreeTierModel check from providers/models/helpers.js
+        if nr_data::model_helpers::is_opencode_free_tier_model(Some(_model)) {
+            headers.insert("Authorization".into(), "Bearer public".into());
+            headers.insert("x-opencode-request".into(), generate_request_id());
+        }
+
         if url.contains("/messages") {
             headers.insert("anthropic-version".into(), "2023-06-01".into());
         }
@@ -221,8 +250,9 @@ impl Executor for OpencodeZenExecutor {
         );
 
         // Execute through base executor with prepared credentials
+        let mut req_creds = credentials;
         base_execute(self, ExecRequest {
-            credentials: &credentials,
+            credentials: &mut req_creds,
             ..req
         }).await
     }

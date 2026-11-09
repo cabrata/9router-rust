@@ -40,7 +40,7 @@ fn add_conn(db: &Db, id: &str, provider: &str, key: &str) {
             "name": id,
             "priority": 1,
             "isActive": true,
-            "providerSpecificData": { "apiKey": key }
+            "apiKey": key
         }),
     )
     .unwrap();
@@ -243,6 +243,43 @@ async fn combo_tries_members_in_order_and_returns_first_success() {
     assert_eq!(resp.status, 200, "second member should serve");
     assert_eq!(oai_calls.load(Ordering::SeqCst), 1);
     assert_eq!(ant_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn combo_member_rotates_its_own_accounts_before_advancing() {
+    let _g = lock();
+    let (_d, db) = setup_db();
+    // First member has two accounts: the first 429s, the second serves, so the
+    // combo never needs the second member.
+    add_conn(&db, "o1", "openai", "sk-o1");
+    add_conn(&db, "o2", "openai", "sk-o2");
+    add_conn(&db, "a1", "anthropic", "sk-a");
+    create_combo(&db, &json!({"name": "acct-combo", "models": ["openai/gpt-4o", "anthropic/claude-sonnet-4"]})).unwrap();
+
+    let oai_calls = Arc::new(AtomicUsize::new(0));
+    let ant_calls = Arc::new(AtomicUsize::new(0));
+    let oai = Arc::new(ScriptedExecutor {
+        provider: "openai".into(),
+        script: Mutex::new(vec![status(429, "rate limit"), ok()].into_iter()),
+        calls: oai_calls.clone(),
+        bodies: Arc::new(Mutex::new(Vec::new())),
+    });
+    let ant = Arc::new(ScriptedExecutor {
+        provider: "anthropic".into(),
+        script: Mutex::new(vec![ok()].into_iter()),
+        calls: ant_calls.clone(),
+        bodies: Arc::new(Mutex::new(Vec::new())),
+    });
+    let (o, a) = (oai.clone(), ant.clone());
+    nr_engine::chat::set_executor_resolver(Arc::new(move |p| {
+        if p == "anthropic" { a.clone() as Arc<dyn Executor> } else { o.clone() as Arc<dyn Executor> }
+    }));
+
+    let engine = RealChatEngine::new(db);
+    let resp = engine.handle_chat(chat_req("acct-combo", false)).await.unwrap();
+    assert_eq!(resp.status, 200, "second account of the first member serves");
+    assert_eq!(oai_calls.load(Ordering::SeqCst), 2, "both openai accounts tried");
+    assert_eq!(ant_calls.load(Ordering::SeqCst), 0, "combo member 2 never used");
 }
 
 #[tokio::test]

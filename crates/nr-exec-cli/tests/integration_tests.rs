@@ -101,8 +101,8 @@ mod mock_upstream_tests {
     use nr_core::Json;
     use serde_json::json;
 
-    #[test]
-    #[ignore] // Re-enable once compilation issues resolve
+    #[tokio::test]
+    #[ignore = "needs a mock devin binary"]
     async fn test_devin_cli_with_mock_binary() {
         // Would spawn a fake devin binary that speaks ACP over stdio
         // Mock binary:
@@ -112,8 +112,8 @@ mod mock_upstream_tests {
         // Verify executor emits OpenAI SSE chunks correctly
     }
 
-    #[test]
-    #[ignore]
+    #[tokio::test]
+    #[ignore = "needs a local axum mock server"]
     async fn test_grok_cli_with_mock_endpoint() {
         // POST to /cli-chat-proxy.grok.com/chat/completions
         // Request: {"input": [...], "model": "grok-3", ...}
@@ -121,8 +121,8 @@ mod mock_upstream_tests {
         // Verify: request has x-grok-* headers, input is properly formatted, response chunks are correct
     }
 
-    #[test]
-    #[ignore]
+    #[tokio::test]
+    #[ignore = "needs a local axum mock server"]
     async fn test_perchai_with_mock_endpoint() {
         // Test plan gate: POST to /api/perch-terminal/cli-plan
         // Response: {"planRequired": true, "starter": {...}}

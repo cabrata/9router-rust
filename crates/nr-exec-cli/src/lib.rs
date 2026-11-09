@@ -5,6 +5,7 @@
 pub mod devin_cli;
 pub mod perchai;
 pub mod grok_cli;
+pub mod grok_cli_models;
 
 #[cfg(test)]
 mod tests {
@@ -39,7 +40,7 @@ mod tests {
             {"type": "message", "role": "assistant", "content": "Hi"},
             {"type": "message", "role": "user", "content": "How are you?"},
         ]);
-        let count = crate::grok_cli::count_user_turns(input.get(""));
-        // Would test the function if it were public
+        let count = crate::grok_cli::count_user_turns(Some(&input));
+        assert_eq!(count, 2);
     }
 }

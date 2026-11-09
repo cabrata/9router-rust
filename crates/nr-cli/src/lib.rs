@@ -17,26 +17,30 @@
 //!
 //! ## Implemented modules
 //!
+//! - [`connect_tools`]: per-tool config writers for `connect` / `show` / `--reset`
+//!   (port of cli/src/cli/commands/connectTools.js)
 //! - [`launcher_process`]: PID file management for fast instance detection
 //! - [`port_management`]: TCP port availability polling
 //! - [`process_management`]: Platform-specific process control (kill, signal, check alive)
 //! - [`ui`]: Terminal UI helpers (spinners, colors, clear screen)
 //!
+//! `connect`, `show`, `update` and `xai video` live in the binary's `cli_commands`
+//! module; menus use `inquire` (Select / Password / Confirm).
+//!
 //! ## Not yet ported (future work)
 //!
-//! - Interactive menus (from cli/src/cli/terminalUI.js) — use `inquire` crate for dialogs
-//! - System tray icon (from cli/src/cli/tray/) — use `tray-icon` crate with optional GTK feature
-//! - Update checking and installation
-//! - Terminal UI mode vs Web UI mode selector
+//! - Terminal UI mode menus (from cli/src/cli/terminalUI.js: providers/api-keys/combos/cli-tools/settings)
 //! - API client commands (from cli/src/cli/api/)
-//! - CLI tool configuration commands (connect, show, xai video)
+//! - `xai video` generation (argument parsing is ported; the request/poll/download is stubbed)
 //! - Autostart/launch-on-boot configuration
 //!
 //! ## TODOs and shortcuts
 //!
-//! - `shortcut: tray icon requires GTK dev libs on Linux; feature-gated with fallback message`
-//! - `TODO(dedupe): interactive menus once inquire integration is complete`
+//! - `shortcut: tray icon menu callbacks need a graphical session; `tray-icon` + `gtk`
+//!   are optional deps behind `[features] tray`, so headless Linux CI needs no GTK`
+//! - `shortcut: update installs via `cargo install --path crates/nr-cli``
 
+pub mod connect_tools;
 pub mod launcher_process;
 pub mod port_management;
 pub mod process_management;

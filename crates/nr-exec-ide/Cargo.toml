@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 nr-core.workspace = true
 nr-data.workspace = true
+urlencoding.workspace = true
 nr-common.workspace = true
 nr-oauth.workspace = true
 nr-translator.workspace = true
@@ -36,3 +37,7 @@ url.workspace = true
 uuid.workspace = true
 rsa = "0.9"
 pkcs8 = "0.10"
+httpdate = "1"
+aes = "0.8"
+md-5 = "0.10"
+cbc = "0.1"

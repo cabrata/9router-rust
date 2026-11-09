@@ -580,13 +580,13 @@ pub fn routes() -> Router {
         )
         .route("/api/usage/request-logs", get(request_logs_get))
         .route("/api/usage/stream", get(stream_get))
-        .route("/api/usage/:connectionId", get(connection_usage_get))
+        .route("/api/usage/{connectionId}", get(connection_usage_get))
         .route(
-            "/api/usage/:connectionId/claude-reset",
+            "/api/usage/{connectionId}/claude-reset",
             post(claude_reset_post),
         )
         .route(
-            "/api/usage/:connectionId/codex-reset-credits",
+            "/api/usage/{connectionId}/codex-reset-credits",
             get(codex_reset_credits_get).post(codex_reset_credits_post),
         )
 }

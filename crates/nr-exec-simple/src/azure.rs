@@ -106,3 +106,72 @@ impl Executor for AzureExecutor {
 pub fn create(provider: &str) -> Arc<dyn Executor> {
     Arc::new(AzureExecutor::new())
 }
+
+#[cfg(test)]
+mod shaping_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn creds(v: serde_json::Value) -> Credentials {
+        Credentials::from_value(v)
+    }
+
+    /// Serializing an env var test keeps the process-wide env clean across
+    /// parallel tests, and we only set vars that no other test reads.
+    #[test]
+    fn deployment_path_uses_model_and_default_api_version() {
+        let ex = AzureExecutor::new();
+        let c = creds(json!({"apiKey": "k", "providerSpecificData": {"azureEndpoint": "https://res.openai.azure.com/"}}));
+        assert_eq!(
+            ex.build_url("gpt-4o", false, 0, &c).unwrap(),
+            "https://res.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-01-preview"
+        );
+    }
+
+    #[test]
+    fn per_connection_api_version_and_deployment_win() {
+        let ex = AzureExecutor::new();
+        let c = creds(json!({
+            "apiKey": "k",
+            "providerSpecificData": {
+                "azureEndpoint": "https://res.openai.azure.com",
+                "apiVersion": "2025-01-01-preview",
+                "deployment": "my-deploy",
+            },
+        }));
+        assert_eq!(
+            ex.build_url("ignored-model", false, 0, &c).unwrap(),
+            "https://res.openai.azure.com/openai/deployments/my-deploy/chat/completions?api-version=2025-01-01-preview"
+        );
+    }
+
+    #[test]
+    fn api_version_falls_back_to_env_then_default() {
+        let ex = AzureExecutor::new();
+        let c = creds(json!({"apiKey": "k", "providerSpecificData": {"azureEndpoint": "https://e"}}));
+        assert!(ex.build_url("m", false, 0, &c).unwrap().contains("api-version=2024-10-01-preview"));
+    }
+
+    #[test]
+    fn headers_use_api_key_not_bearer() {
+        let ex = AzureExecutor::new();
+        let c = creds(json!({
+            "apiKey": "secret",
+            "providerSpecificData": {"organization": "org-1"},
+        }));
+        let headers = ex.build_headers(&c, true, "https://e", "gpt-4o", &json!({})).unwrap();
+        assert_eq!(headers["api-key"], "secret");
+        assert_eq!(headers["OpenAI-Organization"], "org-1");
+        assert_eq!(headers["Accept"], "text/event-stream");
+        assert!(!headers.contains_key("Authorization"), "Azure uses api-key");
+    }
+
+    #[test]
+    fn access_token_is_used_when_no_api_key() {
+        let ex = AzureExecutor::new();
+        let c = creds(json!({"accessToken": "tok"}));
+        let headers = ex.build_headers(&c, false, "https://e", "gpt-4o", &json!({})).unwrap();
+        assert_eq!(headers["api-key"], "tok");
+        assert!(!headers.contains_key("Accept"), "non-stream has no Accept");
+    }
+}

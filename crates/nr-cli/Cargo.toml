@@ -10,6 +10,12 @@ license.workspace = true
 name = "9router"
 path = "src/main.rs"
 
+[features]
+default = []
+# Opt-in tray icon. Needs GTK dev libs on Linux, so it is never a default dep:
+# `cargo build -p nr-cli --features tray`.
+tray = ["tray-icon", "gtk"]
+
 [dependencies]
 nr-core.workspace = true
 nr-server.workspace = true
@@ -27,6 +33,10 @@ regex.workspace = true
 chrono.workspace = true
 reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
 toml_edit = "0.22"
+serde_yaml = "0.9"
+# Optional, only pulled in with `--features tray`.
+tray-icon = { version = "0.19", optional = true }
+gtk = { version = "0.18", optional = true }
 dirs = "5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -40,3 +50,5 @@ nix = { version = "0.29", features = ["process"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+toml_edit = "0.22"
+serde_yaml = "0.9"

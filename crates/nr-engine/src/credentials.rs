@@ -269,17 +269,23 @@ mod tests {
         (dir, db)
     }
 
-    fn add_conn(db: &Db, id: &str, provider: &str, priority: i32, api_key: &str) {
+    /// Create a connection and return its real id. `createProviderConnection`
+    /// assigns `uuidv4()` server-side (JS `connectionsRepo.js`), so the id in
+    /// the request body is ignored.
+    fn add_conn(db: &Db, name: &str, provider: &str, priority: i32, api_key: &str) -> String {
         let conn = json!({
-            "id": id,
             "provider": provider,
             "authType": "apikey",
-            "name": id,
+            // `name` is the dedup key for apikey connections: one row per name.
+            "name": name,
             "priority": priority,
             "isActive": true,
-            "providerSpecificData": { "apiKey": api_key }
+            // `apiKey` is a top-level connection field (JS `OPTIONAL_FIELDS`),
+            // not part of providerSpecificData.
+            "apiKey": api_key
         });
-        nr_db::repos::create_provider_connection(db, &conn).unwrap();
+        let created = nr_db::repos::create_provider_connection(db, &conn).unwrap();
+        created.get("id").and_then(Json::as_str).expect("created row has an id").to_string()
     }
 
     #[test]
@@ -295,12 +301,12 @@ mod tests {
     #[test]
     fn fill_first_picks_highest_priority() {
         let (_dir, db) = setup_db();
-        add_conn(&db, "c2", "openai", 2, "key2");
-        add_conn(&db, "c1", "openai", 1, "key1");
+        let _c2 = add_conn(&db, "c2", "openai", 2, "key2");
+        let c1 = add_conn(&db, "c1", "openai", 1, "key1");
         let exclude = HashSet::new();
         match get_provider_credentials(&db, "openai", &exclude, None, Strategy::FillFirst) {
             CredentialLookup::Selected(s) => {
-                assert_eq!(s.connection_id, "c1");
+                assert_eq!(s.connection_id, c1);
                 assert_eq!(s.credentials.api_key(), Some("key1"));
             }
             _ => panic!("expected Selected"),
@@ -310,12 +316,12 @@ mod tests {
     #[test]
     fn excluded_connection_is_skipped() {
         let (_dir, db) = setup_db();
-        add_conn(&db, "c1", "openai", 1, "key1");
-        add_conn(&db, "c2", "openai", 2, "key2");
+        let c1 = add_conn(&db, "c1", "openai", 1, "key1");
+        let c2 = add_conn(&db, "c2", "openai", 2, "key2");
         let mut exclude = HashSet::new();
-        exclude.insert("c1".to_string());
+        exclude.insert(c1);
         match get_provider_credentials(&db, "openai", &exclude, None, Strategy::FillFirst) {
-            CredentialLookup::Selected(s) => assert_eq!(s.connection_id, "c2"),
+            CredentialLookup::Selected(s) => assert_eq!(s.connection_id, c2),
             _ => panic!("expected Selected"),
         }
     }
@@ -323,8 +329,8 @@ mod tests {
     #[test]
     fn all_rate_limited_when_only_connection_is_locked() {
         let (_dir, db) = setup_db();
-        add_conn(&db, "c1", "openai", 1, "key1");
-        mark_account_unavailable(&db, "c1", 429, "rate limit", Some("openai"), Some("gpt-4"), 0);
+        let c1 = add_conn(&db, "c1", "openai", 1, "key1");
+        mark_account_unavailable(&db, &c1, 429, "rate limit", Some("openai"), Some("gpt-4"), 0);
         let exclude = HashSet::new();
         match get_provider_credentials(&db, "openai", &exclude, Some("gpt-4"), Strategy::FillFirst) {
             CredentialLookup::AllRateLimited { retry_after_human, .. } => {
@@ -337,12 +343,12 @@ mod tests {
     #[test]
     fn clear_account_error_releases_lock() {
         let (_dir, db) = setup_db();
-        add_conn(&db, "c1", "openai", 1, "key1");
-        mark_account_unavailable(&db, "c1", 429, "rate limit", Some("openai"), Some("gpt-4"), 0);
-        clear_account_error(&db, "c1", Some("gpt-4"));
+        let c1 = add_conn(&db, "c1", "openai", 1, "key1");
+        mark_account_unavailable(&db, &c1, 429, "rate limit", Some("openai"), Some("gpt-4"), 0);
+        clear_account_error(&db, &c1, Some("gpt-4"));
         let exclude = HashSet::new();
         match get_provider_credentials(&db, "openai", &exclude, Some("gpt-4"), Strategy::FillFirst) {
-            CredentialLookup::Selected(s) => assert_eq!(s.connection_id, "c1"),
+            CredentialLookup::Selected(s) => assert_eq!(s.connection_id, c1),
             _ => panic!("expected Selected after clear"),
         }
     }

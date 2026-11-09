@@ -3,7 +3,6 @@
 //! Stateful decoder for ChatGPT's compact `delta_encoding: v1` document stream.
 
 use serde_json::{json, Value};
-use std::collections::HashSet;
 
 const UNSAFE_POINTER_SEGMENTS: &[&str] = &["__proto__", "constructor", "prototype"];
 const DELTA_OPERATIONS: &[&str] = &["add", "append", "patch", "replace"];
@@ -124,13 +123,14 @@ impl ChatGptWebDeltaV1Decoder {
             return Ok(());
         }
 
-        let parent = self.navigate_to_parent(&segments)?;
+        let doc = self.document.as_mut().ok_or("Document not initialized")?;
+        let parent = Self::navigate_to_parent(doc, &segments)?;
         let key = &segments[segments.len() - 1];
 
         if let Some(arr) = parent.as_array_mut() {
-            self.apply_to_array(arr, key, operation, value)?;
+            Self::apply_to_array(arr, key, operation, value)?;
         } else if let Some(obj) = parent.as_object_mut() {
-            self.apply_to_object(obj, key, operation, value)?;
+            Self::apply_to_object(obj, key, operation, value)?;
         } else {
             return Err(format!("ChatGPT Web delta path is not mutable: {}", path));
         }
@@ -138,22 +138,24 @@ impl ChatGptWebDeltaV1Decoder {
         Ok(())
     }
 
-    fn navigate_to_parent(&mut self, segments: &[String]) -> Result<&mut Value, String> {
+    fn navigate_to_parent<'a>(doc: &'a mut Value, segments: &[String]) -> Result<&'a mut Value, String> {
         if segments.is_empty() {
             return Err("Cannot navigate to parent with empty segments".to_string());
         }
 
-        let mut current = self.document.as_mut().ok_or("Document not initialized")?;
+        let mut current = doc;
         for segment in &segments[..segments.len() - 1] {
-            if let Some(arr) = current.as_array_mut() {
+            if current.is_array() {
+                let arr = current.as_array_mut().expect("checked is_array");
                 let index = parse_array_index(segment, arr.len(), false)?;
-                current = &mut arr[index];
-            } else if let Some(obj) = current.as_object_mut() {
-                if obj.contains_key(segment) {
-                    current = &mut obj[segment];
-                } else {
-                    return Err(format!("ChatGPT Web delta path does not exist: {}", segment));
-                }
+                current = arr.get_mut(index).ok_or_else(|| {
+                    format!("ChatGPT Web delta path does not exist: {}", segment)
+                })?;
+            } else if current.is_object() {
+                let obj = current.as_object_mut().expect("checked is_object");
+                current = obj.get_mut(segment).ok_or_else(|| {
+                    format!("ChatGPT Web delta path does not exist: {}", segment)
+                })?;
             } else {
                 return Err("Delta path leads through non-container".to_string());
             }
@@ -199,7 +201,6 @@ impl ChatGptWebDeltaV1Decoder {
     }
 
     fn apply_to_array(
-        &self,
         target: &mut Vec<Value>,
         key: &str,
         operation: &str,
@@ -227,7 +228,6 @@ impl ChatGptWebDeltaV1Decoder {
     }
 
     fn apply_to_object(
-        &self,
         target: &mut serde_json::Map<String, Value>,
         key: &str,
         operation: &str,
@@ -247,10 +247,6 @@ impl ChatGptWebDeltaV1Decoder {
             _ => Err(format!("Unsupported operation: {}", operation)),
         }
     }
-}
-
-fn is_record(value: &Value) -> bool {
-    value.is_object()
 }
 
 fn assert_safe_value(value: &Value) -> Result<(), String> {
@@ -349,12 +345,10 @@ fn parse_array_index(segment: &str, length: usize, allow_end: bool) -> Result<us
 
 fn parse_chatgpt_web_encoded_item(encoded_item: &str) -> Result<Vec<SseEvent>, String> {
     let mut events = vec![];
-    let lines: Vec<&str> = encoded_item.replace("\r\n", "\n").lines().collect();
     let mut event_name = "message".to_string();
     let mut data_lines = vec![];
-    let mut has_data = false;
 
-    let dispatch = |events: &mut Vec<SseEvent>, event_name: &str, data_lines: &[String]| {
+    let mut dispatch = |events: &mut Vec<SseEvent>, event_name: &str, data_lines: &[String]| {
         if data_lines.is_empty() {
             return;
         }
@@ -374,12 +368,11 @@ fn parse_chatgpt_web_encoded_item(encoded_item: &str) -> Result<Vec<SseEvent>, S
         });
     };
 
-    for line in lines {
+    for line in encoded_item.lines() {
         if line.is_empty() {
             dispatch(&mut events, &event_name, &data_lines);
             event_name = "message".to_string();
             data_lines.clear();
-            has_data = false;
             continue;
         }
         if line.starts_with(':') {
@@ -403,7 +396,6 @@ fn parse_chatgpt_web_encoded_item(encoded_item: &str) -> Result<Vec<SseEvent>, S
             };
         } else if field == "data" {
             data_lines.push(value.to_string());
-            has_data = true;
         }
     }
     dispatch(&mut events, &event_name, &data_lines);

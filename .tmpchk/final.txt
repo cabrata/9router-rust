@@ -1,0 +1,199 @@
+    Blocking waiting for file lock on build directory
+crates/nr-data/src/schema.rs:1:21: warning: unused import: `JsonMap`
+crates/nr-data/src/pricing.rs:3:5: warning: unused import: `std::collections::HashMap`
+crates/nr-data/src/models.rs:19:9: warning: variable does not need to be mutable
+crates/nr-data/src/lib.rs:524:11: warning: constant `UNSPECIFIED` is never used
+crates/nr-data/src/lib.rs:525:11: warning: constant `DARWIN_AMD64` is never used
+crates/nr-data/src/lib.rs:526:11: warning: constant `DARWIN_ARM64` is never used
+crates/nr-data/src/lib.rs:528:11: warning: constant `LINUX_ARM64` is never used
+crates/nr-data/src/lib.rs:529:11: warning: constant `WINDOWS_AMD64` is never used
+crates/nr-data/src/vision_patterns.rs:4:7: warning: constant `SEP` is never used
+warning: `nr-data` (lib) generated 9 warnings (run `cargo fix --lib -p nr-data` to apply 3 suggestions)
+warning: unused import: `parse_json`
+ --> crates/nr-db/src/repos/request_logs.rs:8:35
+  |
+8 | use crate::helpers::{clean_param, parse_json};
+  |                                   ^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: ambiguous glob re-exports
+  --> crates/nr-db/src/repos/mod.rs:23:9
+   |
+23 | pub use request_logs::*;
+   |         ^^^^^^^^^^^^^^^ the name `get_recent_logs` in the value namespace is first re-exported here
+24 | pub use settings::*;
+25 | pub use usage::*;
+   |         -------- but the name `get_recent_logs` in the value namespace is also re-exported here
+   |
+   = note: `#[warn(ambiguous_glob_reexports)]` on by default
+
+warning: variable does not need to be mutable
+  --> crates/nr-db/src/repos/connections.rs:84:9
+   |
+84 |     let mut conns = tx.query_all(
+   |         ----^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/nr-db/src/repos/connections.rs:377:21
+    |
+377 |         if let Some(mut existing) = existing_option {
+    |                     ----^^^^^^^^
+    |                     |
+    |                     help: remove this `mut`
+
+warning: constant `RING_CAP` is never used
+  --> crates/nr-db/src/repos/usage.rs:36:7
+   |
+36 | const RING_CAP: usize = 50;
+   |       ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `PERIOD_MS` is never used
+  --> crates/nr-db/src/repos/usage.rs:37:7
+   |
+37 | const PERIOD_MS: &[(&str, u64)] = &[
+   |       ^^^^^^^^^
+
+warning: `nr-db` (lib) generated 6 warnings (run `cargo fix --lib -p nr-db` to apply 3 suggestions)
+warning: `nr-db` (lib test) generated 6 warnings (6 duplicates)
+   Compiling nr-data v0.1.0 (/media/caliph/project/rust-9router/crates/nr-data)
+warning: `nr-data` (lib test) generated 9 warnings (9 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.44s
+     Running unittests src/lib.rs (/mnt/immich-media/rust-target/debug/deps/nr_data-57373461aef8539d)
+
+running 45 tests
+test capabilities::parity_tests::commandcode_defaults_override_family_patterns ... ok
+test capabilities::parity_tests::custom_registry_roundtrip ... ok
+test capabilities::parity_tests::catalog_source_overlays_additively ... ok
+test capabilities::parity_tests::matches_js_capability_ladder ... ok
+test capabilities::parity_tests::none_model_returns_defaults ... ok
+test capabilities::parity_tests::parse_openai_model_capabilities_reads_models_dev_shape ... ok
+test capabilities::parity_tests::parse_openai_model_capabilities_returns_none_without_fields ... ok
+test capabilities::parity_tests::vendor_prefix_is_stripped_for_canonical_lookup ... ok
+test capabilities::tests::test_capabilities_from_service_kind ... ok
+test capabilities::tests::test_default_capabilities ... ok
+test capabilities::tests::test_is_gemini4_model ... ok
+test kiro_constants::tests::test_build_thinking_system_prefix ... ok
+test capabilities::parity_tests::pattern_match_applies_for_unlisted_models ... ok
+test kiro_constants::tests::test_is_agentic_model ... ok
+test kiro_constants::tests::test_is_thinking_model ... ok
+test kiro_constants::tests::test_normalize_kiro_upstream_model_id ... ok
+test kiro_constants::tests::test_resolve_default_profile_arn ... ok
+test kiro_constants::tests::test_resolve_kiro_effort_path ... ok
+test kiro_constants::tests::test_resolve_kiro_model ... ok
+test kiro_constants::tests::test_strip_agentic_suffix ... ok
+test models::tests::test_get_model_info_defaults ... ok
+test pricing::tests::test_format_cost ... ok
+test pricing::tests::test_is_free_model ... ok
+test pricing::tests::test_match_pattern ... ok
+test schema::tests::test_resolve_provider_defaults ... ok
+test schema::tests::test_resolve_provider_merges_transport ... ok
+test tests::data_is_embedded ... ok
+test tests::test_get_provider_models ... ok
+test tests::test_merge_anthropic_beta ... ok
+test tests::test_select_anthropic_beta ... ok
+test tests::test_normalize_model_id ... ok
+test thinking_levels::tests::test_can_disable_false_strips_none ... ok
+test capabilities::parity_tests::vision_name_heuristic_fills_floor_result ... ok
+test thinking_levels::tests::test_claude_adaptive_set ... ok
+test thinking_levels::tests::test_claude_no_xhigh_for_4_6 ... ok
+test thinking_levels::tests::test_kiro_unsupported_model_returns_none ... ok
+test thinking_levels::tests::test_codex_gpt_5_6_sol_includes_ultra ... ok
+test thinking_levels::tests::test_minimax_code_m3_none_high ... ok
+test thinking_levels::tests::test_strip_level_suffix ... ok
+test vision_patterns::tests::test_non_vision_excluded ... ok
+test vision_patterns::tests::test_none_returns_false ... ok
+test vision_patterns::tests::test_vision_models_recognized ... ok
+test capabilities::parity_tests::unknown_model_falls_back_to_defaults ... ok
+test thinking_levels::tests::test_reasoning_model_returns_levels ... ok
+test thinking_levels::tests::test_non_reasoning_model_returns_none ... ok
+
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+
+     Running unittests src/lib.rs (/mnt/immich-media/rust-target/debug/deps/nr_db-b393ff8d294a7cbb)
+
+running 63 tests
+test connection::tests::test_execute ... ok
+test helpers::tests::test_mask_api_key ... ok
+test helpers::tests::test_normalize_allow_list ... ok
+test helpers::tests::test_parse_json ... ok
+test helpers::tests::test_parse_json_fallback ... ok
+test helpers::tests::test_strip_null_bytes ... ok
+test connection::tests::test_transaction_commit ... ok
+test connection::tests::test_transaction_rollback ... ok
+test connection::tests::test_open_and_close ... ok
+test migrate::tests::test_migration_runs_once ... ok
+test migrate::tests::test_schema_version_tracking ... ok
+test repos::aliases::tests::test_model_aliases ... ok
+test repos::aliases::tests::test_custom_models ... ok
+test repos::api_keys::tests::test_get_api_key_by_key ... ok
+test repos::api_keys::tests::test_create_api_key ... ok
+test repos::combos::tests::test_create_and_get_combo ... ok
+test repos::combos::tests::test_delete_combo ... ok
+test repos::combos::tests::test_get_combo_by_name ... ok
+test repos::disabled_models::tests::test_disable_and_get_models ... ok
+test repos::disabled_models::tests::test_disable_merges_and_dedupes_preserving_order ... ok
+test repos::disabled_models::tests::test_enable_all_drops_entry_and_get_all_reflects_it ... ok
+test repos::disabled_models::tests::test_enable_models ... ok
+test repos::nodes::tests::create_get_update_delete_roundtrip ... ok
+test repos::request_details::tests::date_normalization_accepts_bare_dates ... ok
+test repos::nodes::tests::delete_removes_attached_custom_models ... ok
+test repos::request_details::tests::distinct_providers_sorted_and_null_skipped ... ok
+test repos::request_details::tests::filters_cover_every_supported_key ... ok
+test repos::request_details::tests::pagination_envelope_and_ordering ... ok
+test repos::request_details::tests::save_and_read_roundtrip ... ok
+test repos::request_details::tests::upsert_refreshes_every_column ... ok
+test repos::pricing::tests::pricing_roundtrip ... ok
+test repos::request_logs::tests::acquire_slot_enforces_concurrency_and_release ... ok
+test repos::pricing::tests::unknown_model_returns_none ... ok
+test repos::request_logs::tests::acquire_slot_enforces_rpm ... ok
+test repos::request_logs::tests::api_key_monitoring_counts_24h_window ... ok
+test repos::request_logs::tests::clear_removes_all_rows ... ok
+test repos::request_logs::tests::filter_from_json_ignores_empty_strings ... ok
+test repos::request_logs::tests::compat_provider_falls_back_to_short_id ... ok
+test repos::request_logs::tests::compat_provider_is_labelled_with_node_name ... ok
+test repos::request_logs::tests::insert_binds_null_for_missing_fields ... ok
+test repos::request_logs::tests::filters_by_status_kind_search_and_key ... ok
+test repos::request_logs::tests::provider_label_rules ... ok
+test repos::request_logs::tests::insert_then_query_roundtrip ... ok
+test repos::request_logs::tests::null_bytes_are_stripped_before_insert ... ok
+test repos::request_logs::tests::record_usage_dedupes_and_sums ... ok
+test repos::request_logs::tests::pagination_clamps_page_size ... ok
+test repos::request_logs::tests::prune_keeps_newest_rows_after_interval ... ok
+test repos::request_logs::tests::recent_logs_projection ... ok
+test repos::request_logs::tests::unlimited_key_always_grants ... ok
+test repos::settings::tests::test_get_settings_returns_defaults ... ok
+test repos::settings::tests::test_update_settings ... ok
+test repos::usage::tests::pending_track_schedules_emit_without_panicking_outside_runtime ... ok
+test repos::usage::tests::stats_emitter_broadcasts_update_and_live ... ok
+test repos::usage::tests::calculate_cost_resolves_pricing ... ok
+test repos::usage::tests::track_pending_records_error_provider_for_10s ... ok
+test schema::tests::test_build_create_table_sql ... ok
+test schema::tests::test_schema_version ... ok
+test schema::tests::test_tables_defined ... ok
+test repos::usage::tests::track_pending_roundtrip_with_connection_names ... ok
+test repos::usage::tests::realtime_summary_loads_saved_rows ... ok
+test tests::test_db_cloneable ... ok
+test tests::test_db_initialization ... ok
+test repos::usage::tests::save_request_usage_roundtrip ... ok
+
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+
+   Doc-tests nr_data
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests nr_db
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

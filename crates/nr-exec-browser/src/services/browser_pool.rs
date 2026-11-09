@@ -58,6 +58,16 @@ struct PoolState {
 }
 
 #[derive(Debug, Clone)]
+pub struct BrowserPoolStatus {
+    pub enabled: bool,
+    pub contexts: usize,
+    pub browser_running: bool,
+    pub engine: Option<String>,
+    pub stealth_available: bool,
+    pub last_activity_ago_ms: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct PoolMetrics {
     pub browser_launches: u64,
     pub browser_launch_failures: u64,
@@ -115,20 +125,22 @@ pub async fn acquire_browser_context(
 
     let pool_key = format!("{}:{}", if options.headless.unwrap_or(true) { "headless" } else { "headed" }, key);
 
-    let mut state = POOL_STATE.write();
+    let browser = {
+        let mut state = POOL_STATE.write();
 
-    // Check for existing context
-    if let Some(pooled) = state.contexts.get_mut(&pool_key) {
-        pooled.last_used = now_ms();
-        state.metrics.contexts_reused += 1;
-        return Ok(pooled.context.clone());
-    }
+        // Check for existing context
+        if state.contexts.contains_key(&pool_key) {
+            state.metrics.contexts_reused += 1;
+            if let Some(pooled) = state.contexts.get_mut(&pool_key) {
+                pooled.last_used = now_ms();
+                return Ok(pooled.context.clone());
+            }
+        }
 
-    // Create new context
-    let browser = state.browser.clone()
-        .ok_or(BrowserPoolError::BrowserNotAvailable)?;
-
-    drop(state); // Release lock before async operation
+        // Create new context
+        state.browser.clone()
+            .ok_or(BrowserPoolError::BrowserNotAvailable)?
+    };
 
     match create_context(&browser, options).await {
         Ok(context) => {
@@ -158,11 +170,17 @@ pub async fn release_browser_context(context: Arc<dyn BrowserContext>) {
 }
 
 /// Get browser pool status
-pub fn get_browser_pool_status() -> (bool, usize) {
+pub fn get_browser_pool_status() -> BrowserPoolStatus {
     let state = POOL_STATE.read();
     let connected = state.browser.as_ref().map(|b| b.is_connected()).unwrap_or(false);
-    let num_contexts = state.contexts.len();
-    (connected, num_contexts)
+    BrowserPoolStatus {
+        enabled: is_pool_enabled(),
+        contexts: state.contexts.len(),
+        browser_running: connected,
+        engine: None,
+        stealth_available: false,
+        last_activity_ago_ms: 0,
+    }
 }
 
 /// Get browser pool metrics

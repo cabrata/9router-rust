@@ -96,13 +96,16 @@ async fn empty_combo_is_400() {
 async fn transport_error_advances() {
     let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = calls.clone();
-    let mut first = true;
+    // Atomic, not a captured `bool`: `async move` copies a `bool` into each
+    // future, so the flag would reset on every call and never advance.
+    let first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let try_fn: TryMemberFn<'static> = Box::new(move |m: &str| {
         let seen = seen.clone();
+        let first = first.clone();
         let m = m.to_string();
         Box::pin(async move {
             seen.lock().unwrap().push(m);
-            if std::mem::replace(&mut first, false) {
+            if first.swap(false, std::sync::atomic::Ordering::SeqCst) {
                 Err(nr_core::Error::Network("conn refused".into()))
             } else {
                 Ok(ok_response())

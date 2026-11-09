@@ -1,6 +1,5 @@
 //! Port of open-sse/executors/github.js + services/copilotModels.js.
 //! GitHub Copilot executor with model routing (claude → /v1/messages, others → /chat/completions or /responses).
-//! shortcut: Copilot model catalog caching skipped (complex state management), queries live catalog each time
 
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -178,12 +177,13 @@ impl BaseHooks for GithubExecutor {
             }
         }
 
-        // Strip reasoning_effort: "none" (models without it will reject it)
+        // "none" means no thinking — strip it so models that don't support "none" don't 400
         if result.get("reasoning_effort").and_then(Json::as_str) == Some("none") {
             result.as_object_mut().map(|o| o.remove("reasoning_effort"));
         }
 
-        // TODO(dedupe): stripUnsupportedParams from translator/concerns/paramSupport.js when ported
+        // Config-driven strip of params unsupported by this provider/model
+        nr_translator::concerns::paramSupport::strip_unsupported_params("github", model, &mut result);
 
         Ok(result)
     }
@@ -206,4 +206,218 @@ impl Executor for GithubExecutor {
 
 pub fn create(_provider: &str) -> Arc<dyn Executor> {
     Arc::new(GithubExecutor::new())
+}
+
+// ==================== LIVE MODEL CATALOG (port of services/copilotModels.js) ====================
+
+const MODELS_URL: &str = "https://api.githubcopilot.com/models";
+const MODELS_FETCH_TIMEOUT_MS: u64 = 10_000;
+const MODELS_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+
+struct CatalogEntry {
+    expires_at: u64,
+    models: Vec<Json>,
+}
+
+static CATALOG_CACHE: LazyLock<std::sync::Mutex<std::collections::HashMap<String, CatalogEntry>>> =
+    LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// `cacheKey`: the Copilot token, else the GitHub access token.
+fn catalog_cache_key(creds: &Credentials) -> String {
+    creds
+        .psd_str("copilotToken")
+        .or_else(|| creds.access_token())
+        .unwrap_or("copilot-anonymous")
+        .to_string()
+}
+
+fn copilot_models_headers(token: &str) -> nr_core::http::HeaderList {
+    let copilot = github_copilot();
+    let mut headers = nr_core::http::HeaderList::new();
+    headers.insert("Authorization".into(), format!("Bearer {token}"));
+    headers.insert("Content-Type".into(), "application/json".into());
+    headers.insert("Copilot-Integration-Id".into(), "vscode-chat".into());
+    if let Some(v) = copilot.get("VSCODE_VERSION").and_then(Json::as_str) {
+        headers.insert("editor-version".into(), format!("vscode/{v}"));
+    }
+    if let Some(v) = copilot.get("COPILOT_CHAT_VERSION").and_then(Json::as_str) {
+        headers.insert("editor-plugin-version".into(), format!("copilot-chat/{v}"));
+    }
+    if let Some(ua) = copilot.get("USER_AGENT").and_then(Json::as_str) {
+        headers.insert("user-agent".into(), ua.to_string());
+    }
+    if let Some(av) = copilot.get("API_VERSION").and_then(Json::as_str) {
+        headers.insert("x-github-api-version".into(), av.to_string());
+    }
+    headers
+}
+
+/// `expandCatalog`: keep only chat models the account's policy enables.
+fn expand_catalog(raw: &[Json]) -> Vec<Json> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut models = Vec::new();
+    for m in raw {
+        if !m.is_object() {
+            continue;
+        }
+        if m.get("capabilities").and_then(|c| c.get("type")).and_then(Json::as_str) != Some("chat") {
+            continue;
+        }
+        if let Some(policy) = m.get("policy") {
+            if policy.get("state").and_then(Json::as_str) != Some("enabled") {
+                continue;
+            }
+        }
+        let id = m.get("id").and_then(Json::as_str).unwrap_or("").to_string();
+        if id.is_empty() || seen.contains(&id) {
+            continue;
+        }
+        seen.push(id.clone());
+        models.push(serde_json::json!({
+            "id": id,
+            "name": m.get("name").and_then(Json::as_str).unwrap_or(&id),
+        }));
+    }
+    models
+}
+
+/// `fetchCatalogRaw`: one `/models` call, `Err(status)` on a non-2xx answer.
+async fn fetch_catalog_raw(
+    token: &str,
+    proxy: Option<&nr_core::http::ProxyOptions>,
+) -> std::result::Result<Vec<Json>, u16> {
+    let mut fetch = nr_core::http::FetchRequest::get(MODELS_URL);
+    fetch.headers = copilot_models_headers(token);
+    fetch.header_timeout = Some(std::time::Duration::from_millis(MODELS_FETCH_TIMEOUT_MS));
+    let response = nr_core::http::proxy_fetch(fetch, proxy).await.map_err(|_| 0u16)?;
+    if !(200..300).contains(&response.status) {
+        return Err(response.status);
+    }
+    let body = response.bytes().await.map_err(|_| 0u16)?;
+    let data: Json = serde_json::from_slice(&body).map_err(|_| 0u16)?;
+    Ok(data.get("data").and_then(Json::as_array).cloned().unwrap_or_default())
+}
+
+/// `resolveCopilotModels`: the account's live catalog, or `None` on failure.
+pub async fn resolve_copilot_models(
+    creds: &Credentials,
+    force_refresh: bool,
+    proxy: Option<&nr_core::http::ProxyOptions>,
+) -> Option<Vec<Json>> {
+    let token = creds
+        .psd_str("copilotToken")
+        .or_else(|| creds.access_token())?
+        .to_string();
+
+    let key = catalog_cache_key(creds);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    if !force_refresh {
+        let cached = {
+            let cache = CATALOG_CACHE.lock().ok()?;
+            cache
+                .get(&key)
+                .filter(|entry| entry.expires_at > now)
+                .map(|entry| entry.models.clone())
+        };
+        if let Some(models) = cached {
+            return Some(models);
+        }
+    }
+
+    let raw = match fetch_catalog_raw(&token, proxy).await {
+        Ok(raw) => raw,
+        // A stale Copilot token answers 401/403; refresh from the GitHub access
+        // token and retry once.
+        Err(status) if (status == 401 || status == 403) && creds.access_token().is_some() => {
+            let access = creds.access_token().unwrap_or("").to_string();
+            let refreshed = nr_oauth::token_refresh::refresh_copilot_token(&access, &nr_core::Logger::new())
+                .await?;
+            let next = refreshed.get("token").and_then(Json::as_str)?.to_string();
+            match fetch_catalog_raw(&next, proxy).await {
+                Ok(raw) => raw,
+                Err(_) => return None,
+            }
+        }
+        Err(_) => return None,
+    };
+
+    let models = expand_catalog(&raw);
+    if models.is_empty() {
+        return None;
+    }
+
+    if let Ok(mut cache) = CATALOG_CACHE.lock() {
+        cache.insert(
+            key,
+            CatalogEntry { expires_at: now + MODELS_CACHE_TTL_MS, models: models.clone() },
+        );
+    }
+    Some(models)
+}
+
+/// `clearCopilotModelCache`.
+pub fn clear_copilot_model_cache() {
+    if let Ok(mut cache) = CATALOG_CACHE.lock() {
+        cache.clear();
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn keeps_only_enabled_chat_models() {
+        let raw = vec![
+            json!({"id": "gpt-5.5", "name": "GPT-5.5", "capabilities": {"type": "chat"}}),
+            json!({"id": "embed", "capabilities": {"type": "embeddings"}}),
+            json!({"id": "off", "capabilities": {"type": "chat"}, "policy": {"state": "disabled"}}),
+            json!({"id": "on", "capabilities": {"type": "chat"}, "policy": {"state": "enabled"}}),
+        ];
+        let models = expand_catalog(&raw);
+        let ids: Vec<&str> = models.iter().filter_map(|m| m["id"].as_str()).collect();
+        assert_eq!(ids, vec!["gpt-5.5", "on"]);
+    }
+
+    #[test]
+    fn name_falls_back_to_id() {
+        let raw = vec![json!({"id": "claude-opus-4.8", "capabilities": {"type": "chat"}})];
+        assert_eq!(expand_catalog(&raw)[0]["name"], "claude-opus-4.8");
+    }
+
+    #[test]
+    fn dedupes_repeated_ids() {
+        let raw = vec![
+            json!({"id": "a", "capabilities": {"type": "chat"}}),
+            json!({"id": "a", "capabilities": {"type": "chat"}}),
+        ];
+        assert_eq!(expand_catalog(&raw).len(), 1);
+    }
+
+    #[test]
+    fn cache_key_prefers_copilot_token() {
+        let c = Credentials::from_value(json!({
+            "accessToken": "gho_user",
+            "providerSpecificData": {"copilotToken": "copilot-tok"},
+        }));
+        assert_eq!(catalog_cache_key(&c), "copilot-tok");
+        let plain = Credentials::from_value(json!({"accessToken": "gho_user"}));
+        assert_eq!(catalog_cache_key(&plain), "gho_user");
+        let anon = Credentials::from_value(json!({}));
+        assert_eq!(catalog_cache_key(&anon), "copilot-anonymous");
+    }
+
+    #[test]
+    fn headers_carry_the_copilot_identity() {
+        let h = copilot_models_headers("tok");
+        assert_eq!(h["Authorization"], "Bearer tok");
+        assert_eq!(h["Copilot-Integration-Id"], "vscode-chat");
+        assert!(h.contains_key("editor-version"));
+        assert!(h.contains_key("x-github-api-version"));
+    }
 }

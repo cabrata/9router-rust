@@ -214,8 +214,8 @@ impl Executor for MimoFreeExecutor {
         headers.insert("X-Mimo-Source".into(), "mimocode-cli-free".into());
 
         use rand::Rng;
-        let mut rng = rand::thread_rng();
-        headers.insert("User-Agent".into(), USER_AGENTS[rng.gen_range(0..USER_AGENTS.len())].to_string());
+        let ua = USER_AGENTS[rand::thread_rng().gen_range(0..USER_AGENTS.len())].to_string();
+        headers.insert("User-Agent".into(), ua);
         headers.insert("x-session-affinity".into(), generate_session_id());
         headers.insert("Authorization".into(), format!("Bearer {}", jwt));
         headers.insert("Accept".into(), if req.stream { "text/event-stream".into() } else { "application/json".into() });
@@ -230,9 +230,10 @@ impl Executor for MimoFreeExecutor {
             req.log.debug("AUTH", "MiMo auth failed, re-bootstrapping...");
 
             let fresh_jwt = bootstrap_jwt(Some(&req.proxy)).await?;
-            let mut cache = JWT_CACHE.lock().unwrap();
-            cache.remove("mimo-free-jwt");
-            drop(cache);
+            {
+                let mut cache = JWT_CACHE.lock().unwrap();
+                cache.remove("mimo-free-jwt");
+            }
 
             headers.insert("Authorization".into(), format!("Bearer {}", fresh_jwt));
             let fetch_retry = FetchRequest::post_json(url.clone(), headers.clone(), &transformed_body);

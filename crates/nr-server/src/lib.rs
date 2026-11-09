@@ -7,6 +7,7 @@
 pub mod console_log_buffer;
 pub mod dashboard;
 pub mod mitm;
+pub mod request_log;
 pub mod routes;
 pub mod support;
 pub mod v1;

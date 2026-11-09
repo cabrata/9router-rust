@@ -11,9 +11,13 @@ pub mod default_executor;
 pub mod cline_auth;
 pub mod cline_envelope;
 pub mod machine_id;
+pub mod clinepass_models;
 
 pub use base::{base_execute, BaseHooks, RetryDelay};
 pub use default_executor::DefaultExecutor;
 pub use cline_auth::{build_cline_headers, get_cline_access_token};
+pub use clinepass_models::{
+    resolve_cline_models, resolve_clinepass_models, ClineCredentials,
+};
 pub use cline_envelope::unwrap_cline_envelope;
 pub use machine_id::get_consistent_machine_id;

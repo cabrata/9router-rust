@@ -70,7 +70,7 @@ impl CodeBuddyIntlExecutor {
     fn sanitize_system_prompts(&self, messages: &mut Vec<Json>) {
         let agent_pattern = regex::Regex::new(
             r"(?i)you are claude code|claude.?code.+official.+cli|anthropic.+official.+cli|anxthxropic.+official.+cli|you are (?:cursor|windsurf|cline|aider|continue|copilot|cody)|you are an? (?:ai )?(?:coding |code )?agent|cc_entrypoint\s*=\s*(?:cli|vscode|jetbrains|gui)|claude.?code.+issues|give feedback.+claude.?code|you are .{0,30}(?:powerful )?ai agent|orchestration capabilities|OhMyOpenCode|<agent-identity>|<Role>|<Behavior_Instructions>"
-        ).unwrap_or_default();
+        ).expect("static regex");
 
         let neutral = "You are a helpful AI assistant that helps with software engineering tasks.";
 
@@ -228,3 +228,4 @@ impl Executor for CodeBuddyIntlExecutor {
 pub fn create(_provider: &str) -> Arc<dyn Executor> {
     Arc::new(CodeBuddyIntlExecutor::new())
 }
+

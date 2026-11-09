@@ -17,13 +17,55 @@ use tokio::time::sleep;
 
 mod cli_commands;
 
+#[cfg(feature = "tray")]
+fn start_tray(port: u16) {
+    // shortcut: real tray-icon menu needs a graphical session; feature-gated so
+    // headless Linux CI builds without GTK. Upgrade: wire tray-icon menu callbacks.
+    println!("🔔 Tray mode is not wired in this build (feature `tray` enabled but no menu callbacks). Server keeps running on port {port}.");
+}
+
+#[cfg(not(feature = "tray"))]
+fn start_tray(port: u16) {
+    println!("🔔 Tray icon is disabled in this build (build with --features tray). Server keeps running on port {port}.");
+}
+
+fn try_update(latest: &str) -> bool {
+    match inquire::Confirm::new(&format!("Update now to v{latest}?"))
+        .with_default(true)
+        .prompt()
+    {
+        Ok(true) => {
+            println!("   Updating via cargo…");
+            let ok = std::process::Command::new("cargo")
+                .args(["install", "--path", "crates/nr-cli"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                println!("✅ Updated to v{latest}. Restart 9router to apply.");
+            } else {
+                println!("❌ cargo install failed.");
+            }
+            true // exit menu loop either way
+        }
+        _ => false,
+    }
+}
+
 const DEFAULT_PORT: u16 = 20128;
 const DEFAULT_HOST: &str = "0.0.0.0";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROCESS_EXIT_WAIT_MS: u64 = 1000;
 
 #[derive(Parser, Debug)]
-#[command(name = "9router", version = VERSION, about = "Local AI routing gateway")]
+// clap's auto -h/--help and -V/--version would collide with (and disagree with)
+// the JS flags: cli.js handles `-h|--help` itself and prints `-v|--version`.
+#[command(
+    name = "9router",
+    about = "Local AI routing gateway",
+    disable_help_flag = true,
+    disable_version_flag = true
+)]
 struct Args {
     /// Port to listen on
     #[arg(short = 'p', long, env = "PORT", default_value_t = DEFAULT_PORT)]
@@ -50,8 +92,12 @@ struct Args {
     tray: bool,
 
     /// Show help
-    #[arg(short = 'h', long)]
+    #[arg(short = 'h', long = "help")]
     help_flag: bool,
+
+    /// Show version
+    #[arg(short = 'v', long = "version")]
+    version_flag: bool,
 
     /// Subcommand: connect <url>, show [tool...], xai video ...
     #[command(subcommand)]
@@ -71,8 +117,14 @@ enum CliCommand {
     /// Show current CLI tool configuration
     Show {
         /// Specific tool names to show (optional)
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         tools: Vec<String>,
+    },
+    /// Check GitHub releases for a newer version and offer to self-update
+    Update {
+        /// Additional update arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        extra: Vec<String>,
     },
     /// Generate Grok Imagine videos via xAI
     #[command(name = "xai")]
@@ -98,6 +150,11 @@ async fn main() -> anyhow::Result<()> {
 
     if args.help_flag {
         print_help();
+        return Ok(());
+    }
+
+    if args.version_flag {
+        println!("{VERSION}");
         return Ok(());
     }
 
@@ -137,6 +194,7 @@ Options:
 Commands:
   connect <server-url> Configure Claude Code for a remote 9router server
   show [tool…]         Show each CLI tool's current 9router config
+  update               Check GitHub releases and offer to self-update
   xai video …          Generate a Grok Imagine video via the running gateway
 
 Examples:
@@ -224,8 +282,15 @@ async fn run_launcher(args: Args) -> anyhow::Result<()> {
         // Wait for version check result
         let latest_version = version_check.await.ok().flatten();
 
-        // Show menu loop
-        show_menu_loop(port, latest_version).await?;
+        // --tray runs the background/tray mode: no interactive menu, block until
+        // the server is stopped so the dashboard keeps serving.
+        if args.tray {
+            start_tray(port);
+            println!("   Dashboard: http://localhost:{port}/dashboard");
+            println!("   Press Ctrl-C to stop the server.");
+        } else {
+            show_menu_loop(port, latest_version).await?;
+        }
     } else {
         warn("Failed to start server");
     }
@@ -243,110 +308,82 @@ async fn run_launcher(args: Args) -> anyhow::Result<()> {
 async fn show_menu_loop(port: u16, latest_version: Option<String>) -> anyhow::Result<()> {
     loop {
         clear_screen()?;
+        println!("\n📡 9Router v{VERSION}\n");
+        println!("   Server: http://localhost:{port}");
+        println!("Choose interface:\n");
 
-        let mut menu_items = vec![];
-
+        let mut items: Vec<String> = Vec::new();
         if let Some(ref version) = latest_version {
-            menu_items.push(format!("⬆  Update to v{} (current: v{})", version, VERSION));
+            items.push(format!("⬆  Update to v{version} (current: v{VERSION})"));
         }
+        let idx_browser = items.len();
+        items.push("🌐 Web UI (Open in Browser)".into());
+        let idx_tui = items.len();
+        items.push("💻 Terminal UI (Interactive CLI)".into());
+        let idx_tray = items.len();
+        items.push("🔔 Hide to Tray (Background)".into());
+        let idx_exit = items.len();
+        items.push("🚪 Exit".into());
 
-        menu_items.push("🌐 Web UI (Open in Browser)".to_string());
-        menu_items.push("💻 Terminal UI (Interactive CLI)".to_string());
-        menu_items.push("🔔 Hide to Tray (Background)".to_string());
-        menu_items.push("🚪 Exit".to_string());
+        let choice = if stdin_is_tty() {
+            match inquire::Select::new("Select option", items.clone()).prompt() {
+                Ok(sel) => items.iter().position(|i| *i == sel).unwrap_or(idx_exit),
+                Err(_) => idx_exit, // Ctrl+C / Esc → exit
+            }
+        } else {
+            // Non-interactive: print the menu and exit cleanly so piped runs terminate.
+            for (i, item) in items.iter().enumerate() {
+                println!("  {}. {item}", i + 1);
+            }
+            idx_exit
+        };
 
-        println!("\n📡 9Router v{}\n", VERSION);
-        println!("Choose interface:");
-        for (i, item) in menu_items.iter().enumerate() {
-            println!("  {}. {}", i + 1, item);
-        }
-
-        // Simple menu selection (would be replaced with inquire for better UX)
-        print!("\nSelect option (1-{}): ", menu_items.len());
-        use std::io::{self, Write};
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        let choice = input.trim().parse::<usize>().unwrap_or(0);
-
-        let offset = if latest_version.is_some() { 1 } else { 0 };
-
-        if latest_version.is_some() && choice == 1 {
-            println!("\n⬆  Update command:");
-            println!("   npm install -g 9router@latest");
-            println!("\nExiting to allow update...");
-            break;
-        } else if choice == offset + 1 {
-            let url = format!("http://localhost:{}/dashboard", port);
+        if choice == idx_browser {
+            let url = format!("http://localhost:{port}/dashboard");
             let _ = open::that(&url);
             println!("\nOpening browser... Press Enter to return to menu.");
-            let mut pause_input = String::new();
-            let _ = std::io::stdin().read_line(&mut pause_input);
-        } else if choice == offset + 2 {
-            // Terminal UI stub (would use inquire for real TUI)
+            pause();
+        } else if choice == idx_tui {
             println!("\n💻 Terminal UI\n");
-            println!("Terminal UI (interactive menu navigation) coming soon.");
-            println!("For now, use the Web UI at http://localhost:{}/dashboard", port);
+            println!("Interactive menu navigation is not wired in this build.");
+            println!("Use the Web UI at http://localhost:{port}/dashboard");
             println!("\nPress Enter to return...");
-            let mut pause_input = String::new();
-            let _ = std::io::stdin().read_line(&mut pause_input);
-        } else if choice == offset + 3 {
-            // TODO: Hide to tray (requires tray feature)
-            println!("\n🔔 Hide to tray (feature coming soon)\n");
-            println!("Server continues running in the background.");
-            println!("Dashboard: http://localhost:{}/dashboard", port);
+            pause();
+        } else if choice == idx_tray {
+            start_tray(port);
             break;
-        } else if choice == offset + 4 {
+        } else if latest_version.is_some() && choice == 0 {
+            let version = latest_version.as_deref().unwrap_or("");
+            if try_update(version) {
+                break;
+            }
+        } else {
             println!("\n👋 Exiting...");
             break;
-        } else {
-            println!("\nInvalid selection. Try again.");
-            sleep(Duration::from_secs(1)).await;
         }
     }
-
     Ok(())
 }
 
-/// Check GitHub releases for a newer version.
-async fn check_for_update() -> Option<String> {
-    // shortcut: GitHub API call; can be swapped for semver crate comparison once integrated
-
-    if let Ok(response) = reqwest::Client::new()
-        .get("https://api.github.com/repos/cabrata/9router-rust/releases/latest")
-        .header("Accept", "application/vnd.github.v3+json")
-        .timeout(Duration::from_secs(8))
-        .send()
-        .await
+fn stdin_is_tty() -> bool {
+    #[cfg(unix)]
     {
-        if let Ok(text) = response.text().await {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(tag) = json.get("tag_name").and_then(|v| v.as_str()) {
-                    let latest = tag.trim_start_matches('v');
-                    if compare_versions(latest, VERSION) > 0 {
-                        return Some(latest.to_string());
-                    }
-                }
-            }
-        }
+        unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
     }
-    None
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
-/// Compare two semantic versions. Returns 1 if a > b, -1 if a < b, 0 if equal.
-fn compare_versions(a: &str, b: &str) -> i32 {
-    let parts_a: Vec<u32> = a.split('.').filter_map(|p| p.parse().ok()).collect();
-    let parts_b: Vec<u32> = b.split('.').filter_map(|p| p.parse().ok()).collect();
+fn pause() {
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
+}
 
-    for i in 0..3 {
-        let a_part = parts_a.get(i).copied().unwrap_or(0);
-        let b_part = parts_b.get(i).copied().unwrap_or(0);
-
-        if a_part > b_part { return 1; }
-        if a_part < b_part { return -1; }
-    }
-    0
+/// Check GitHub releases for a newer version (shared with the `update` command).
+async fn check_for_update() -> Option<String> {
+    cli_commands::check_for_update(VERSION).await
 }
 
 /// Get the first non-internal IPv4 address.

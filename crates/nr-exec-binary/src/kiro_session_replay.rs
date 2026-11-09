@@ -132,15 +132,13 @@ impl KiroSessionReplayStore {
         current_message: &JsonValue,
     ) -> (Vec<JsonValue>, JsonValue, bool) {
         let key = Self::session_key(connection_id, conversation_id);
-        let sessions = self.sessions.lock().unwrap();
-        let existing = sessions.get(&key);
+        let existing = self.sessions.lock().unwrap().get(&key).cloned();
 
         let mut base_history = history.to_vec();
         let base_current = current_message.clone();
 
         if let Some(entry) = existing {
             if entry.model_id == model_id && entry.system_prompt == system_prompt {
-                drop(sessions);
                 // Update last used time
                 self.remember_session_start(
                     key,
@@ -174,8 +172,6 @@ impl KiroSessionReplayStore {
                 return (base_history, next_current, true);
             }
         }
-
-        drop(sessions);
 
         let first_user_index = Self::find_first_user_index(&base_history);
         let session_start: JsonValue;

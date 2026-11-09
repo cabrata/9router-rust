@@ -258,9 +258,9 @@ pub async fn run_chat_gpt_web_http_turn(
     has_tools: bool,
     requested_tools: Vec<String>,
     signal: Option<&tokio::sync::Notify>,
-) -> Result<ChatHttpTurnResult> {
+) -> Result<ChatHttpTurnResult, String> {
     if access_token.is_empty() {
-        return Err("ChatGPT session has no access token".into());
+        return Err("ChatGPT session has no access token".to_string());
     }
 
     let messages = body
@@ -268,14 +268,14 @@ pub async fn run_chat_gpt_web_http_turn(
         .and_then(|m| m.as_array())
         .ok_or("ChatGPT Web requires messages")?;
     if messages.is_empty() {
-        return Err("ChatGPT Web requires messages".into());
+        return Err("ChatGPT Web requires messages".to_string());
     }
 
-    let prompt = flatten_messages(messages)?;
+    let prompt = flatten_messages(messages).map_err(|e| e.to_string())?;
     let prompt = with_tool_order(&prompt, has_tools, messages);
 
     if prompt.trim().is_empty() {
-        return Err("ChatGPT Web requires non-empty text".into());
+        return Err("ChatGPT Web requires non-empty text".to_string());
     }
 
     let sentinel = fetch_sentinel_headers(&base_url, &access_token, &user_agent)
@@ -321,7 +321,7 @@ pub async fn run_chat_gpt_web_http_turn(
 
     if !prepare_resp.status().is_success() {
         let status = prepare_resp.status().as_u16();
-        return Err(format!("ChatGPT prepare failed (HTTP {})", status).into());
+        return Err(format!("ChatGPT prepare failed (HTTP {})", status));
     }
 
     let prepare_json = prepare_resp
@@ -378,7 +378,7 @@ pub async fn run_chat_gpt_web_http_turn(
         .map_err(|e| format!("ChatGPT conversation failed: {}", e))?;
 
     if !conversation_resp.status().is_success() {
-        return Err(format!("ChatGPT conversation failed (HTTP {})", conversation_resp.status().as_u16()).into());
+        return Err(format!("ChatGPT conversation failed (HTTP {})", conversation_resp.status().as_u16()));
     }
 
     // Read SSE stream with deadline
@@ -409,14 +409,14 @@ pub async fn run_chat_gpt_web_http_turn(
         .unwrap_or("");
 
     if conversation_id.is_empty() {
-        return Err("ChatGPT conversation produced no conversation id".into());
+        return Err("ChatGPT conversation produced no conversation id".to_string());
     }
 
     // Poll /backend-api/conversation/{id} until is_complete
     let started = Instant::now();
     loop {
         if started.elapsed() > Duration::from_millis(POLL_TIMEOUT_MS) {
-            return Err("ChatGPT chat turn timed out".into());
+            return Err("ChatGPT chat turn timed out".to_string());
         }
 
         sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;

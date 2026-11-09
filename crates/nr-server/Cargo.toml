@@ -12,29 +12,78 @@ nr-data.workspace = true
 nr-common.workspace = true
 nr-db.workspace = true
 nr-engine.workspace = true
+nr-exec-base.workspace = true
+nr-executors.workspace = true
+nr-translator.workspace = true
 nr-oauth.workspace = true
 anyhow.workspace = true
+async-stream.workspace = true
 axum.workspace = true
+maud = { workspace = true }
+rust-embed = "8"
 base64.workspace = true
 bcrypt.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 futures.workspace = true
+hex.workspace = true
 http.workspace = true
 http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 jsonwebtoken.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
+rcgen.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded.workspace = true
+sha2.workspace = true
+time.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tokio-util.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+
+[[test]]
+name = "api_routes"
+path = "tests/api_routes.rs"
+
+[[test]]
+name = "v1_gateway"
+path = "tests/v1_gateway.rs"
+
+[[test]]
+name = "auth_units"
+path = "tests/auth_units.rs"
+
+[[test]]
+name = "management_crud"
+path = "tests/management_crud.rs"
+
+[[test]]
+name = "route_tests"
+path = "tests/route_tests.rs"
+
+[[test]]
+name = "dashboard_pages"
+path = "tests/dashboard_pages.rs"
+
+[[test]]
+name = "route_groups"
+path = "tests/route_groups.rs"

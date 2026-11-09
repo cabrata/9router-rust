@@ -33,7 +33,10 @@ impl PendingState {
 }
 
 const PENDING_TIMEOUT_MS: u64 = 60 * 1000;
+// Used by the `recentRing` helpers that the usage SSE path reads.
+#[allow(dead_code)]
 const RING_CAP: usize = 50;
+#[allow(dead_code)]
 const PERIOD_MS: &[(&str, u64)] = &[
     ("24h", 86400000),
     ("7d", 604800000),

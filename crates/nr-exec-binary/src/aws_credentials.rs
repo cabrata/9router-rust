@@ -70,7 +70,8 @@ pub fn resolve_region(
     credentials: &Credentials,
     env_vars: Option<&HashMap<String, String>>,
 ) -> Result<String> {
-    let env = env_vars.unwrap_or(&Default::default());
+    let default_env = HashMap::new();
+    let env = env_vars.unwrap_or(&default_env);
 
     // Try connection setting first
     if let Some(region) = credentials.psd_str("region") {
@@ -115,7 +116,7 @@ fn read_static_credentials(credentials: &Credentials) -> Result<ResolvedAwsCrede
         })?
         .to_string();
 
-    let secret_access_key = credentials.api_key.as_deref().ok_or_else(|| {
+    let secret_access_key = credentials.api_key().ok_or_else(|| {
         nr_core::Error::BadRequest(
             "Bedrock static credentials are incomplete. Set the AWS secret access key as the \
             provider API key and providerSpecificData.accessKeyId to the AWS access key id, \
