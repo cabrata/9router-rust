@@ -1,7 +1,12 @@
-// Theme toggle + <dialog> modal wiring. Port of ThemeToggle.js / themeStore.js
-// (localStorage key "theme": light | dark | system).
+// Theme toggle, mobile sidebar drawer, and <dialog> modal wiring.
+// Port of ThemeToggle.js / themeStore.js (localStorage key "theme":
+// light | dark | system) and Sidebar.js's onClose drawer behaviour.
 (function () {
   function dark() { return document.documentElement.classList.contains('dark'); }
+  function closeNav() {
+    var s = document.getElementById('sidebar');
+    if (s) { s.classList.remove('open'); }
+  }
   document.addEventListener('click', function (e) {
     var t = e.target.closest && e.target.closest('[data-theme-toggle]');
     if (t) {
@@ -10,6 +15,14 @@
       document.documentElement.classList.toggle('dark', next === 'dark');
       return;
     }
+    var n = e.target.closest && e.target.closest('[data-nav-toggle]');
+    if (n) {
+      var side = document.getElementById('sidebar');
+      if (side) { side.classList.toggle('open'); }
+      return;
+    }
+    // Sidebar.js closes the drawer when a link is followed.
+    if (e.target.closest && e.target.closest('#sidebar a')) { closeNav(); }
     var o = e.target.closest && e.target.closest('[data-modal-open]');
     if (o) { var d = document.getElementById(o.getAttribute('data-modal-open')); if (d && d.showModal) d.showModal(); return; }
     var c = e.target.closest && e.target.closest('[data-modal-close]');

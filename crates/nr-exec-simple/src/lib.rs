@@ -13,6 +13,7 @@ pub mod xiaomi_tokenplan;
 pub mod xiaomi_mimo;
 pub mod mimo_free;
 pub mod minimax_code;
+pub mod minimax_code_usage;
 pub mod codebuddy_cn;
 pub mod codebuddy_intl;
 pub mod github;

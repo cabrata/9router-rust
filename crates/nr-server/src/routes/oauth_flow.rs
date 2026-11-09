@@ -1,19 +1,22 @@
 //! OAuth flow HTTP routes: dynamic `/api/oauth/[provider]/[action]` endpoints plus
 //! provider-specific import routes.
-//! Faithful port of `src/app/api/oauth/**`.
+//! Faithful port of `src/app/api/oauth/**` and `src/lib/oauth/utils/server.js`.
 //!
-//! Backed by `nr_oauth` (`OAuthProvider` trait + flows helpers). If a provider's
-//! flow function is not ported yet, we return a clear `501` naming the provider
-//! rather than panicking or returning a bare 400.
+//! Backed by `nr_oauth` (`OAuthProvider` trait + flows helpers). Provider-flow
+//! gaps inside `nr_oauth` surface as its own errors; this module never fabricates
+//! a success.
 
-use axum::extract::{Path, Query};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 use nr_oauth::flows::providers::{
     exchange_code, generate_auth_data, get_provider, poll_device_token, request_device_code,
@@ -40,8 +43,8 @@ const NO_PKCE_DEVICE_PROVIDERS: &[&str] = &[
     "kimi",
     "kimi-coding",
     "kilocode",
-    "Claude Opus 5.5-cn",
-    "Claude Opus 5.5-intl",
+    "codebuddy-cn",
+    "codebuddy-intl",
     "qoder",
     "qoder-cn",
     "grok-cli",
@@ -49,13 +52,6 @@ const NO_PKCE_DEVICE_PROVIDERS: &[&str] = &[
     "glm",
     "nous",
 ];
-
-fn not_implemented(provider: &str, action: &str) -> Response {
-    error_response(
-        StatusCode::NOT_IMPLEMENTED,
-        format!("Provider `{provider}` does not yet support action `{action}` in this build"),
-    )
-}
 
 /// Whether the provider exposes a `device_code` flow (per its OAuthProvider trait).
 fn supports_device_code(provider: &str) -> bool {
@@ -90,16 +86,69 @@ async fn handle_get(
     match action {
         "authorize" => handle_authorize(provider, params).await,
         "device-code" => handle_device_code(provider, params).await,
-        _ => {
-            // All remaining actions in JS are provider-specific (start-proxy,
-            // poll-status, stop-proxy, ide-status, lease-status) and rely on
-            // local callback proxies / OS detection that is not ported here.
-            Ok(not_implemented(provider, action))
-        }
+        "start-proxy" => Ok(handle_start_proxy(provider, &params).await),
+        "poll-status" => Ok(handle_poll_status(provider, &params).await),
+        "stop-proxy" => Ok(handle_stop_proxy(provider).await),
+        "ide-status" => Ok(handle_ide_status(provider).await),
+        "lease-status" => Ok(handle_lease_status(provider, &params).await),
+        _ => Ok(error_response(StatusCode::BAD_REQUEST, "Unknown action")),
     }
 }
 
 async fn handle_authorize(provider: &str, params: HashMap<String, String>) -> nr_core::Result<Response> {
+    // Xiaomi Desktop: custom ECDH flow — generate keypair, start proxy, return
+    // the authorize URL (JS: `if (provider === "xiaomi-mimo")` branch).
+    if provider == "xiaomi-mimo" {
+        let (public_key, private_key) = generate_xiaomi_keypair();
+        let runtime = proxy_runtime(provider);
+        let Some(port) = start_proxy(&runtime, provider, None).await else {
+            return Ok(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to start callback server",
+            ));
+        };
+        let state = params
+            .get("state")
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let redirect_uri = format!("http://127.0.0.1:{port}/");
+        {
+            let mut rt = runtime.lock().unwrap();
+            rt.session = Some(ProxySession {
+                status: "pending",
+                error: None,
+                exchange: ExchangeSpec {
+                    code_verifier: String::new(),
+                    redirect_uri: redirect_uri.clone(),
+                    state: state.clone(),
+                },
+                private_key: Some(private_key),
+                xiaomi_result: None,
+                system_id: None,
+                connection_id: None,
+                email: None,
+            });
+        }
+        let key_name = xiaomi_key_name();
+        let authorize_url = format!(
+            "https://platform.xiaomimimo.com/authorize?pk={}&redirect_uri={}&kn=mimocode&key_name={}",
+            urlencoding::encode(&public_key),
+            urlencoding::encode(&redirect_uri),
+            urlencoding::encode(&key_name),
+        );
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "state": state,
+                "authorizeUrl": authorize_url,
+                "redirectUri": redirect_uri,
+                "port": port,
+            })),
+        )
+            .into_response());
+    }
+
     let redirect_uri = params
         .get("redirect_uri")
         .cloned()
@@ -110,6 +159,13 @@ async fn handle_authorize(provider: &str, params: HashMap<String, String>) -> nr
     for (k, v) in &params {
         if k != "redirect_uri" && !v.is_empty() {
             meta_map.insert(k.clone(), Value::String(v.clone()));
+        }
+    }
+    // Zed: derive native_app_port from the local callback URL so the RSA keypair
+    // is bound to the port the proxy is actually listening on.
+    if provider == "zed" {
+        if let Some(port) = url::Url::parse(&redirect_uri).ok().and_then(|u| u.port()) {
+            meta_map.insert("nativeAppPort".into(), json!(port));
         }
     }
     let meta = if meta_map.is_empty() { None } else { Some(Value::Object(meta_map)) };
@@ -209,6 +265,621 @@ fn device_data_to_json(d: &DeviceCodeResponse) -> Value {
     Value::Object(m)
 }
 
+// ─── Local callback proxies ─────────────────────────────────────────────────
+//
+// Port of `src/lib/oauth/utils/server.js`: in-process loopback HTTP servers that
+// receive the provider's OAuth callback, auto-exchange the code, store the
+// connection and record the outcome on the session the modal polls.
+//
+// One `ProxyRuntime` per provider; the modal drives it via /start-proxy,
+// /register-session, /poll-status and /stop-proxy exactly as in JS.
+
+struct ProxyRuntime {
+    // Fixed callbacks (codex: 1455, zed preferred: 58443) fall back to a
+    // random port when busy, like the JS `server.on("error", …)` handlers.
+    preferred_port: Option<u16>,
+    port: Option<u16>,
+    task: Option<tokio::task::AbortHandle>,
+    callback_path: &'static str,
+    session: Option<ProxySession>,
+}
+
+/// One registered server-side exchange session.
+struct ProxySession {
+    status: &'static str,
+    error: Option<String>,
+    exchange: ExchangeSpec,
+    /// xiaomi-mimo: raw X25519 private key (32 bytes) used to decrypt `u`.
+    #[allow(dead_code)]
+    private_key: Option<Vec<u8>>,
+    /// xiaomi-mimo: decrypted callback payload, surfaced by poll-status.
+    xiaomi_result: Option<Value>,
+    /// zed: login attempt's own id, merged into the exchange meta.
+    system_id: Option<String>,
+    connection_id: Option<String>,
+    email: Option<String>,
+}
+
+#[derive(Clone)]
+struct ExchangeSpec {
+    code_verifier: String,
+    redirect_uri: String,
+    state: String,
+}
+
+static PROXY_STATE: LazyLock<Mutex<HashMap<String, Arc<Mutex<ProxyRuntime>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn proxy_runtime(provider: &str) -> Arc<Mutex<ProxyRuntime>> {
+    let mut states = PROXY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    states
+        .entry(provider.to_string())
+        .or_insert_with(|| {
+            let (preferred_port, callback_path) = match provider {
+                "codex" => (Some(1455), "/auth/callback"),
+                "zed" => (Some(58443), "/"),
+                "windsurf" => (None, "/windsurf-auth-callback"),
+                _ => (None, "/callback"),
+            };
+            Arc::new(Mutex::new(ProxyRuntime {
+                preferred_port,
+                port: None,
+                task: None,
+                callback_path,
+                session: None,
+            }))
+        })
+        .clone()
+}
+
+/// `isLoopbackOrigin(origin)`: navigation redirects have no Origin; anything
+/// else must be a loopback HTTP origin.
+fn is_loopback_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get("origin") else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    if scheme != "http" {
+        return false;
+    }
+    let host = rest.split(['/', ':']).next().unwrap_or("");
+    host == "127.0.0.1" || host == "localhost"
+}
+
+fn html_result_page(success: bool, message: &str) -> String {
+    let (color, icon, title) = if success {
+        ("#22c55e", "&#10003;", "Authentication Successful")
+    } else {
+        ("#ef4444", "&#10007;", "Authentication Failed")
+    };
+    let message = message
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;");
+    format!(
+        r##"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{title}</title>
+<style>body{{font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#f5f5f5}}.c{{text-align:center;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.1)}}.i{{color:{color};font-size:3rem}}h1{{margin:1rem 0}}p{{color:#666}}</style>
+</head><body><div class="c"><div class="i">{icon}</div><h1>{title}</h1><p>{message}</p><p>Closing in <span id="cd">3</span>s...</p>
+<script>let n=3;const c=document.getElementById("cd");const t=setInterval(()=>{{n--;c.textContent=n;if(n<=0){{clearInterval(t);window.close();}}}},1000);</script>
+</div></body></html>"##
+    )
+}
+
+async fn bind_loopback(preferred: u16) -> std::io::Result<(tokio::net::TcpListener, u16)> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", preferred)).await?;
+    let port = listener.local_addr()?.port();
+    Ok((listener, port))
+}
+
+/// `GET /api/oauth/[provider]/start-proxy`.
+async fn handle_start_proxy(provider: &str, params: &HashMap<String, String>) -> Response {
+    let runtime = proxy_runtime(provider);
+    let preferred = params
+        .get("native_app_port")
+        .and_then(|p| p.parse::<u16>().ok());
+    match start_proxy(&runtime, provider, preferred).await {
+        Some(port) => {
+            let path = runtime.lock().unwrap().callback_path;
+            Json(json!({
+                "success": true,
+                "port": port,
+                "callbackUrl": format!("http://127.0.0.1:{port}{path}"),
+            }))
+            .into_response()
+        }
+        None => error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to start callback server"),
+    }
+}
+
+async fn start_proxy(
+    runtime: &Arc<Mutex<ProxyRuntime>>,
+    provider: &str,
+    preferred: Option<u16>,
+) -> Option<u16> {
+    {
+        let mut rt = runtime.lock().unwrap();
+        if let Some(port) = rt.port {
+            // Reuse the live listener and renew its idle timeout (JS does the
+            // same so a previous flow's deadline can't kill the new one).
+            if let Some(task) = rt.task.take() {
+                task.abort();
+            }
+            rt.task = Some(tokio::spawn(proxy_idle_kill(runtime.clone())).abort_handle());
+            return Some(port);
+        }
+    }
+    let preferred = preferred.or_else(|| runtime.lock().unwrap().preferred_port).unwrap_or(0);
+    let (listener, port) = match bind_loopback(preferred).await {
+        Ok(ok) => ok,
+        Err(_) => {
+            if preferred != 0 {
+                bind_loopback(0).await.ok()?
+            } else {
+                return None;
+            }
+        }
+    };
+    {
+        let mut rt = runtime.lock().unwrap();
+        rt.port = Some(port);
+        rt.task = Some(tokio::spawn(proxy_idle_kill(runtime.clone())).abort_handle());
+    }
+    let app = Router::new()
+        .route("/callback", any(callback_handler))
+        .route("/auth/callback", any(callback_handler))
+        .route("/windsurf-auth-callback", any(callback_handler))
+        .route("/", any(callback_handler))
+        .with_state((provider.to_string(), runtime.clone()));
+    runtime.lock().unwrap().task = Some(tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    }).abort_handle());
+    Some(port)
+}
+
+async fn proxy_idle_kill(runtime: Arc<Mutex<ProxyRuntime>>) {
+    // JS timeouts: codex/xai 300s, trae/windsurf/zed/perchai 600s.
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    let mut rt = runtime.lock().unwrap();
+    if let Some(task) = rt.task.take() {
+        task.abort();
+    }
+    rt.port = None;
+    rt.session = None;
+}
+
+/// Extract a parsed callback as JSON from the query string, or None when the
+/// request is not the actual provider callback (probe/prefetch/stray hit).
+fn select_callback(provider: &str, query: &HashMap<String, String>) -> Option<Value> {
+    match provider {
+        "codex" | "xai" => {
+            let code = query.get("code")?;
+            Some(json!({ "code": code }))
+        }
+        "trae" => {
+            if !query.contains_key("refreshToken") {
+                return None;
+            }
+            let raw = format!("/callback?{}", serde_urlencoded::to_string(query).unwrap_or_default());
+            Some(json!({ "code": raw }))
+        }
+        "windsurf" => {
+            if !query.contains_key("access_token") {
+                return None;
+            }
+            let raw = format!(
+                "/windsurf-auth-callback?{}",
+                serde_urlencoded::to_string(query).unwrap_or_default()
+            );
+            Some(json!({ "code": raw }))
+        }
+        "zed" => {
+            if !(query.contains_key("user_id")
+                || query.contains_key("userId")
+                || query.contains_key("access_token")
+                || query.contains_key("accessToken")
+                || query.contains_key("token"))
+            {
+                return None;
+            }
+            let raw = format!("/?{}", serde_urlencoded::to_string(query).unwrap_or_default());
+            Some(json!({ "code": raw }))
+        }
+        "xiaomi-mimo" => query.get("u").map(|u| json!({ "u": u })),
+        "perchai" => query
+            .get("code")
+            .or_else(|| query.get("access_token"))
+            .map(|c| json!({ "code": c })),
+        _ => None,
+    }
+}
+
+async fn callback_handler(
+    State((provider, runtime)): State<(String, Arc<Mutex<ProxyRuntime>>)>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    if !is_loopback_origin(&headers) {
+        return (StatusCode::FORBIDDEN, Html(html_result_page(false, "Cross-origin callback rejected")))
+            .into_response();
+    }
+
+    let query: HashMap<String, String> = uri
+        .query()
+        .map(|q| serde_urlencoded::from_str(q).unwrap_or_default())
+        .unwrap_or_default();
+
+    // Snapshot the session state under a short-lived lock, then release it
+    // before any `.await` (holding a MutexGuard across an await makes the
+    // handler future !Send, which fails axum's Handler bound).
+    struct SessionSnapshot {
+        exchange: ExchangeSpec,
+        private_key: Option<Vec<u8>>,
+        system_id: Option<String>,
+    }
+    let snap: Option<SessionSnapshot> = {
+        let rt = runtime.lock().unwrap();
+        rt.session.as_ref().map(|s| SessionSnapshot {
+            exchange: s.exchange.clone(),
+            private_key: s.private_key.clone(),
+            system_id: s.system_id.clone(),
+        })
+    };
+
+    let Some(snap) = snap else {
+        // Mode B (codex/xai): no registered session → legacy redirect to the app
+        // port, exactly like startCodexProxy/startXaiProxy.
+        if provider == "codex" || provider == "xai" {
+            if let Some(app_port) = query.get("app_port") {
+                let location = format!("http://localhost:{app_port}/callback?{}", uri.query().unwrap_or(""));
+                let rt2 = runtime.clone();
+                tokio::spawn(async move {
+                    stop_proxy(&rt2).await;
+                });
+                return (StatusCode::FOUND, [("Location", location)]).into_response();
+            }
+        }
+        return (StatusCode::OK, Html(html_result_page(false, "No active login session"))).into_response();
+    };
+
+    // Anti-CSRF: a state-bearing callback must match the registered session.
+    if let Some(cb_state) = query.get("state") {
+        if cb_state != &snap.exchange.state {
+            {
+                let mut rt = runtime.lock().unwrap();
+                if let Some(session) = rt.session.as_mut() {
+                    session.status = "error";
+                    session.error = Some("Callback state mismatch".to_string());
+                }
+            }
+            let html = Html(html_result_page(false, "Callback state mismatch"));
+            let rt2 = runtime.clone();
+            tokio::spawn(async move {
+                stop_proxy(&rt2).await;
+            });
+            return (StatusCode::OK, html).into_response();
+        }
+    }
+
+    let Some(selected) = select_callback(&provider, &query) else {
+        // Probe/prefetch: keep session and server alive for the real redirect.
+        return (StatusCode::OK, Html(html_result_page(
+            false,
+            "Waiting for sign-in — this request carried no login data.",
+        )))
+        .into_response();
+    };
+
+    if provider == "xiaomi-mimo" {
+        let Some(private_key) = snap.private_key.as_ref() else {
+            {
+                let mut rt = runtime.lock().unwrap();
+                if let Some(session) = rt.session.as_mut() {
+                    session.status = "error";
+                    session.error = Some("No decryption key for this session".to_string());
+                }
+            }
+            return (StatusCode::OK, Html(html_result_page(false, "No decryption key for this session")))
+                .into_response();
+        };
+        let u = selected.get("u").and_then(Value::as_str).unwrap_or("");
+        match decrypt_xiaomi_callback(private_key, u) {
+            Ok(result) => {
+                {
+                    let mut rt = runtime.lock().unwrap();
+                    if let Some(session) = rt.session.as_mut() {
+                        session.status = "done";
+                        session.xiaomi_result = Some(result);
+                    }
+                }
+                (StatusCode::OK, Html(html_result_page(true, "You can close this window.")))
+                    .into_response()
+            }
+            Err(err) => {
+                {
+                    let mut rt = runtime.lock().unwrap();
+                    if let Some(session) = rt.session.as_mut() {
+                        session.status = "error";
+                        session.error = Some(err.clone());
+                    }
+                }
+                let rt2 = runtime.clone();
+                tokio::spawn(async move {
+                    stop_proxy(&rt2).await;
+                });
+                (StatusCode::OK, Html(html_result_page(false, &err))).into_response()
+            }
+        }
+    } else {
+        let rt2 = runtime.clone();
+        let result =
+            run_callback_exchange(&provider, &selected, &snap.exchange, snap.system_id.as_deref())
+                .await;
+        match result {
+            Ok((html, connection_id, email)) => {
+                {
+                    let mut rt = runtime.lock().unwrap();
+                    if let Some(session) = rt.session.as_mut() {
+                        session.status = "done";
+                        session.connection_id = connection_id;
+                        session.email = email;
+                    }
+                }
+                tokio::spawn(async move {
+                    stop_proxy(&rt2).await;
+                });
+                (StatusCode::OK, Html(html)).into_response()
+            }
+            Err(err) => {
+                {
+                    let mut rt = runtime.lock().unwrap();
+                    if let Some(session) = rt.session.as_mut() {
+                        session.status = "error";
+                        session.error = Some(err.clone());
+                    }
+                }
+                (StatusCode::OK, Html(html_result_page(false, &err))).into_response()
+            }
+        }
+    }
+}
+
+async fn stop_proxy(runtime: &Arc<Mutex<ProxyRuntime>>) {
+    let mut rt = runtime.lock().unwrap();
+    if let Some(task) = rt.task.take() {
+        task.abort();
+    }
+    rt.port = None;
+    rt.session = None;
+}
+
+/// Exchange the callback code and persist the connection; returns the result
+/// page HTML on success, the error message otherwise.
+async fn run_callback_exchange(
+    provider: &str,
+    selected: &Value,
+    exchange: &ExchangeSpec,
+    system_id: Option<&str>,
+) -> Result<(String, Option<String>, Option<String>), String> {
+    let code = selected.get("code").and_then(Value::as_str).unwrap_or("");
+    let mut meta = None;
+    if provider == "zed" {
+        if let Some(system_id) = system_id {
+            meta = Some(json!({ "systemId": system_id }));
+        }
+    }
+    let mapped = exchange_code(
+        provider,
+        code,
+        &exchange.redirect_uri,
+        Some(&exchange.code_verifier),
+        Some(&exchange.state),
+        meta.as_ref(),
+        &nr_core::Logger::new(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut conn = mapped.to_map();
+    conn.insert("provider".into(), Value::String(provider.to_string()));
+    conn.insert("authType".into(), Value::String("oauth".into()));
+    if let Some(expires_in) = mapped.expires_in {
+        let expires_at = chrono::Utc::now() + chrono::Duration::seconds(expires_in);
+        conn.insert(
+            "expiresAt".into(),
+            Value::String(expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        );
+    }
+    conn.insert("testStatus".into(), Value::String("active".into()));
+
+    let db = nr_db::db().map_err(|e| e.to_string())?;
+    let created = nr_db::create_provider_connection(&db, &Value::Object(conn))
+        .map_err(|e| e.to_string())?;
+
+    let connection_id = created.get("id").and_then(Value::as_str).map(str::to_string);
+    let email = created.get("email").and_then(Value::as_str).map(str::to_string);
+    Ok((html_result_page(true, "You can close this window."), connection_id, email))
+}
+
+/// `POST /api/oauth/[provider]/register-session`.
+async fn handle_register_session(provider: &str, body: Option<&Value>) -> Response {
+    let Some(body) = body else {
+        return error_response(StatusCode::BAD_REQUEST, "Missing request body");
+    };
+    let state = body.get("state").and_then(Value::as_str).unwrap_or("").trim();
+    if state.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "Missing state");
+    }
+    let code_verifier = body
+        .get("codeVerifier")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let redirect_uri = body
+        .get("redirectUri")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let system_id = body.get("systemId").and_then(Value::as_str).map(str::to_string);
+
+    let runtime = proxy_runtime(provider);
+    if runtime.lock().unwrap().port.is_none() {
+        if start_proxy(&runtime, provider, None).await.is_none() {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Failed to start callback server");
+        }
+    }
+
+    let mut rt = runtime.lock().unwrap();
+    rt.session = Some(ProxySession {
+        status: "pending",
+        error: None,
+        exchange: ExchangeSpec {
+            code_verifier,
+            redirect_uri,
+            state: state.to_string(),
+        },
+        private_key: None,
+        xiaomi_result: None,
+        system_id,
+        connection_id: None,
+        email: None,
+    });
+    Json(json!({ "success": true })).into_response()
+}
+
+fn proxy_session_status(session: &ProxySession, provider: &str) -> Value {
+    let mut out = json!({ "status": session.status });
+    if let Some(err) = &session.error {
+        out["error"] = Value::String(err.clone());
+    }
+    if let Some(id) = &session.connection_id {
+        out["connectionId"] = Value::String(id.clone());
+    }
+    if let Some(email) = &session.email {
+        out["email"] = Value::String(email.clone());
+    }
+    if provider == "xiaomi-mimo" {
+        if let Some(result) = &session.xiaomi_result {
+            out["result"] = result.clone();
+        }
+    }
+    out
+}
+
+/// `GET /api/oauth/[provider]/poll-status`.
+async fn handle_poll_status(provider: &str, params: &HashMap<String, String>) -> Response {
+    let state = params.get("state").cloned().unwrap_or_default();
+    let runtime = proxy_runtime(provider);
+    let rt = runtime.lock().unwrap();
+    let Some(session) = rt.session.as_ref() else {
+        return Json(json!({ "status": "unknown" })).into_response();
+    };
+    if !state.is_empty() && session.exchange.state != state {
+        return Json(json!({ "status": "unknown" })).into_response();
+    }
+    if session.status == "done" || session.status == "error" {
+        let payload = proxy_session_status(session, provider);
+        let rt2 = runtime.clone();
+        tokio::spawn(async move {
+            let mut rt = rt2.lock().unwrap();
+            rt.session = None;
+        });
+        return Json(payload).into_response();
+    }
+    Json(json!({ "status": session.status })).into_response()
+}
+
+/// `GET /api/oauth/[provider]/stop-proxy`.
+async fn handle_stop_proxy(provider: &str) -> Response {
+    stop_proxy(&proxy_runtime(provider)).await;
+    Json(json!({ "success": true })).into_response()
+}
+
+/// `GET /api/oauth/[provider]/ide-status`.
+async fn handle_ide_status(provider: &str) -> Response {
+    match provider {
+        "trae" | "windsurf" => {
+            Json(super::oauth_local_creds::detect_ide_installed(provider)).into_response()
+        }
+        "perchai" => Json(super::oauth_local_creds::detect_perch_cli_installed()).into_response(),
+        _ => error_response(
+            StatusCode::BAD_REQUEST,
+            "ide-status only supported for trae/windsurf/perchai",
+        ),
+    }
+}
+
+// ─── Xiaomi MiMo ECDH callback decryption ──────────────────────────────────
+//
+// Port of `src/lib/oauth/providers/xiaomi-mimo.js` `generateKeyPair` /
+// `decryptCallback`: X25519 ECDH → SHA-256 → AES-256-GCM.
+// Wire format (base64-decoded): [12-byte nonce][32-byte ephemeral pubkey]
+// [ciphertext][16-byte GCM tag].
+
+/// `generateKeyPair()` → (base64 SPKI public key, raw 32-byte private scalar).
+fn generate_xiaomi_keypair() -> (String, Vec<u8>) {
+    use base64::Engine;
+    use x25519_dalek::{PublicKey, StaticSecret};
+    let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let public = PublicKey::from(&secret);
+    // SPKI DER prefix for X25519 ("302a300506032b656e032100") + raw key.
+    let mut spki = Vec::with_capacity(44);
+    spki.extend_from_slice(&hex::decode("302a300506032b656e032100").unwrap());
+    spki.extend_from_slice(public.as_bytes());
+    (base64::engine::general_purpose::STANDARD.encode(spki), secret.to_bytes().to_vec())
+}
+
+/// `decryptCallback(privateKeyDer, encryptedB64)`.
+fn decrypt_xiaomi_callback(private_key: &[u8], encrypted_b64: &str) -> Result<Value, String> {
+    use aes_gcm::aead::{AeadInPlace, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(encrypted_b64)
+        .map_err(|_| "Encrypted payload is not valid base64".to_string())?;
+    if raw.len() < 12 + 32 + 16 + 1 {
+        return Err(format!("Encrypted payload too short: {} bytes", raw.len()));
+    }
+    let nonce = &raw[..12];
+    let mut ephemeral = [0u8; 32];
+    ephemeral.copy_from_slice(&raw[12..44]);
+    let ciphertext = &raw[44..raw.len() - 16];
+    let tag = &raw[raw.len() - 16..];
+
+    let mut key_bytes = [0u8; 32];
+    key_bytes.copy_from_slice(
+        private_key
+            .get(..32)
+            .ok_or_else(|| "Bad private key".to_string())?,
+    );
+    let private_key = StaticSecret::from(key_bytes);
+    let shared = private_key.diffie_hellman(&PublicKey::from(ephemeral));
+    let key = Sha256::digest(shared.as_bytes());
+
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?;
+    let mut plaintext = ciphertext.to_vec();
+    cipher
+        .decrypt_in_place_detached(Nonce::from_slice(nonce), b"", &mut plaintext, aes_gcm::Tag::from_slice(tag))
+        .map_err(|_| "Decryption failed".to_string())?;
+    let parsed: Value = serde_json::from_slice(&plaintext).map_err(|_| "Decrypted payload is not valid JSON".to_string())?;
+    if !parsed.is_object() {
+        return Err("Decrypted payload is not a valid object".to_string());
+    }
+    Ok(parsed)
+}
+
 // ─── POST Handlers ──────────────────────────────────────────────────────────
 
 /// POST /api/oauth/[provider]/[action]
@@ -242,6 +913,8 @@ async fn handle_post(
     let log = nr_core::Logger::new();
 
     match action {
+        "lease-connect" => handle_lease_connect(provider, body.as_ref()).await,
+        "register-session" => Ok(handle_register_session(provider, body.as_ref()).await),
         "exchange" => handle_exchange(provider, body.as_ref(), &log).await,
         "poll" => handle_poll(provider, body.as_ref(), &log).await,
         "manual-code" => {
@@ -271,16 +944,223 @@ async fn handle_post(
                 ));
             }
 
-            // xAI proxy sessions are local-only; not ported in this build.
-            Ok(not_implemented(provider, "manual-code"))
+            // `completeXaiManualCode`: the session was registered by
+            // /register-session (or by the proxy's Mode A callback), so the
+            // verifier and redirect URI live there. A missing session is an
+            // error, exactly like JS.
+            let runtime = proxy_runtime(provider);
+            let Some((code_verifier, redirect_uri)) = runtime
+                .lock()
+                .unwrap()
+                .session
+                .as_ref()
+                .filter(|s| s.exchange.state == state)
+                .map(|s| (s.exchange.code_verifier.clone(), s.exchange.redirect_uri.clone()))
+            else {
+                return Ok(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "xAI OAuth session not found; restart the login flow and paste the code again",
+                ));
+            };
+
+            let mapped = exchange_code(
+                provider,
+                code,
+                &redirect_uri,
+                Some(&code_verifier),
+                Some(state),
+                None,
+                &log,
+            )
+            .await?;
+
+            let mut conn = mapped.to_map();
+            conn.insert("provider".into(), Value::String("xai".into()));
+            conn.insert("authType".into(), Value::String("oauth".into()));
+            if let Some(expires_in) = mapped.expires_in {
+                let expires_at = chrono::Utc::now() + chrono::Duration::seconds(expires_in);
+                conn.insert(
+                    "expiresAt".into(),
+                    Value::String(expires_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+                );
+            }
+            conn.insert("testStatus".into(), Value::String("active".into()));
+            let db = nr_db::db()?;
+            let created = nr_db::create_provider_connection(&db, &Value::Object(conn))?;
+
+            // Done: clear the session and stop the proxy, like completeXaiManualCode.
+            {
+                let mut rt = runtime.lock().unwrap();
+                rt.session = None;
+            }
+            let runtime2 = runtime.clone();
+            tokio::spawn(async move {
+                stop_proxy(&runtime2).await;
+            });
+
+            Ok((
+                StatusCode::OK,
+                Json(json!({
+                    "success": true,
+                    "connection": {
+                        "id": created.get("id").cloned().unwrap_or(Value::Null),
+                        "provider": created.get("provider").cloned().unwrap_or(Value::Null),
+                        "email": created.get("email").cloned().unwrap_or(Value::Null),
+                        "displayName": created.get("displayName").cloned().unwrap_or(Value::Null),
+                    }
+                })),
+            )
+                .into_response())
         }
-        _ => {
-            // All remaining actions (lease-connect, register-session, ...) rely
-            // on local proxy servers / OS state that is not ported here.
-            let _ = query;
-            Ok(not_implemented(provider, action))
+        _ => Ok(error_response(StatusCode::BAD_REQUEST, "Unknown action")),
+    }
+}
+
+/// `POST /api/oauth/[provider]/lease-connect`: MiniMax code desktop lease.
+async fn handle_lease_connect(provider: &str, body: Option<&Value>) -> nr_core::Result<Response> {
+    if provider != "minimax-code" && provider != "minimax-code-global" {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "lease-connect only supported for minimax-code/minimax-code-global",
+        ));
+    }
+    let data_dir = body
+        .and_then(|b| b.get("dataDir"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| nr_core::paths::home_dir().join(".minimax"));
+
+    // Validate availability up front so the user gets the broker's exact
+    // failure reason instead of a dead connection. The capability read is the
+    // same check the executor performs for every request.
+    let cap = data_dir.join("run").join("mcode-auth-lease-v1.cap");
+    if !cap.is_file() {
+        return Ok(error_response(
+            StatusCode::CONFLICT,
+            format!(
+                "Cannot read capability file {}. Is the MiniMax Code desktop app installed and logged in on this machine?",
+                cap.display()
+            ),
+        ));
+    }
+
+    // Idempotent: one lease connection per (provider, data dir).
+    let db = nr_db::db()?;
+    let existing = nr_db::get_provider_connections(&db, Some(&json!({ "provider": provider })))?
+        .into_iter()
+        .find(|c| {
+            c.get("authType").and_then(Value::as_str) == Some("mcode-lease")
+                && c.get("providerSpecificData")
+                    .and_then(|p| p.get("mcodeDataDir"))
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    == Some(data_dir.clone())
+        });
+    if let Some(existing) = existing {
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "connection": {
+                    "id": existing.get("id").cloned().unwrap_or(Value::Null),
+                    "provider": existing.get("provider").cloned().unwrap_or(Value::Null),
+                },
+                "reused": true,
+            })),
+        )
+            .into_response());
+    }
+
+    let name = if provider == "minimax-code-global" {
+        "MiniMax Desktop (Lease, Global)"
+    } else {
+        "MiniMax Desktop (Lease)"
+    };
+    let created = nr_db::create_provider_connection(
+        &db,
+        &json!({
+            "provider": provider,
+            "authType": "mcode-lease",
+            "name": name,
+            "providerSpecificData": { "mcodeDataDir": data_dir.to_string_lossy() },
+            "testStatus": "active",
+        }),
+    )?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "connection": {
+                "id": created.get("id").cloned().unwrap_or(Value::Null),
+                "provider": created.get("provider").cloned().unwrap_or(Value::Null),
+            },
+        })),
+    )
+        .into_response())
+}
+
+/// `GET /api/oauth/[provider]/lease-status`: MiniMax Code desktop broker probe.
+/// Read-only — leases nothing. Matches the JS `lease-status` action.
+async fn handle_lease_status(provider: &str, params: &HashMap<String, String>) -> Response {
+    if provider != "minimax-code" && provider != "minimax-code-global" {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "lease-status only supported for minimax-code/minimax-code-global",
+        );
+    }
+    let data_dir = params
+        .get("data_dir")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| nr_core::paths::home_dir().join(".minimax"));
+    match nr_exec_simple::minimax_code::request_status(&data_dir).await {
+        Ok(status) => {
+            let mut out = serde_json::Map::new();
+            out.insert("found".into(), json!(true));
+            out.insert("dataDir".into(), json!(data_dir.display().to_string()));
+            if let Some(obj) = status.as_object() {
+                out.extend(obj.clone());
+            }
+            Json(Value::Object(out)).into_response()
+        }
+        Err(e) => {
+            let message = e.to_string();
+            let code = if message.contains("Capability file") {
+                "BROKER_UNAVAILABLE"
+            } else if message.contains("sign-in was refused") {
+                "BROKER_REJECTED"
+            } else {
+                "INTERNAL_ERROR"
+            };
+            Json(json!({
+                "found": false,
+                "dataDir": data_dir.display().to_string(),
+                "error": code,
+                "message": message,
+            }))
+            .into_response()
         }
     }
+}
+
+/// `getKeyName()` from `src/lib/oauth/providers/xiaomi-mimo.js`: stable
+/// per-machine key label, no filesystem writes.
+fn xiaomi_key_name() -> String {
+    let machine_id = {
+        use sha2::{Digest, Sha256};
+        let host = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "unknown".into());
+        let input = format!("{}-{}", std::env::consts::OS, host);
+        let mut hasher = Sha256::new();
+        hasher.update(input.as_bytes());
+        let digest = hasher.finalize();
+        hex::encode(&digest[..4])
+    };
+    format!("9router-xmd-{machine_id}")
 }
 
 async fn handle_exchange(
@@ -293,6 +1173,101 @@ async fn handle_exchange(
             StatusCode::NOT_IMPLEMENTED,
             format!("Provider `{provider}` is not registered in this build"),
         ));
+    }
+
+    // ── xiaomi-mimo ───────────────────────────────────────────────────────
+    // No token exchange: the callback already decrypted `sk`. Just read the
+    // proxy session result and create the connection (JS first branch).
+    if provider == "xiaomi-mimo" {
+        let Some(state) = body.and_then(|b| b.get("state")).and_then(Value::as_str) else {
+            return Ok(error_response(StatusCode::BAD_REQUEST, "Missing state"));
+        };
+        let runtime = proxy_runtime(provider);
+        let session_payload = {
+            let rt = runtime.lock().unwrap();
+            let Some(session) = rt.session.as_ref() else {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "OAuth session not completed. Please restart the login flow.",
+                ));
+            };
+            if session.exchange.state != state || session.status != "done" {
+                let err = session.error.clone().unwrap_or_else(|| {
+                    "OAuth session not completed. Please restart the login flow.".to_string()
+                });
+                return Ok(error_response(StatusCode::BAD_REQUEST, err));
+            }
+            session.xiaomi_result.clone()
+        };
+        let Some(result) = session_payload else {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "OAuth session not completed. Please restart the login flow.",
+            ));
+        };
+        let uid = result.get("uid").and_then(Value::as_str);
+        let access_token = result
+            .get("sk")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if access_token.is_empty() {
+            return Ok(error_response(StatusCode::BAD_REQUEST, "Xiaomi session result has no sk"));
+        }
+        let base_url = result
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("https://api.xiaomimimo.com/v1");
+
+        // Desktop-exclusive Preview models authenticate with the account-session
+        // passToken. shortcut: reading it needs the Desktop cookie store (locked
+        // SQLite / OS keyring); left null so those models fall back to the API
+        // key. Upgrade when Desktop exposes it without the lock.
+        let db = nr_db::db()?;
+        let created = nr_db::create_provider_connection(
+            &db,
+            &json!({
+                "provider": "xiaomi-mimo",
+                "authType": "oauth",
+                "accessToken": access_token,
+                "refreshToken": Value::Null,
+                "expiresAt": iso_in_seconds(365 * 24 * 60 * 60),
+                "email": uid.map(|u| format!("{u}@xiaomi")),
+                "displayName": uid.map(|u| format!("Xiaomi {u}")).or_else(|| Some("Xiaomi MiMo".to_string())),
+                "providerSpecificData": {
+                    "uid": uid,
+                    "baseUrl": base_url,
+                    "authMethod": "oauth",
+                    "mimoPassToken": Value::Null,
+                    "mimoUserId": Value::Null,
+                    "mimoCUserId": Value::Null,
+                },
+                "testStatus": "active",
+            }),
+        )?;
+        // The modal consumed the session; clear it and stop the proxy.
+        {
+            let mut rt = runtime.lock().unwrap();
+            rt.session = None;
+        }
+        let runtime2 = runtime.clone();
+        tokio::spawn(async move {
+            stop_proxy(&runtime2).await;
+        });
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "connection": {
+                    "id": created.get("id").cloned().unwrap_or(Value::Null),
+                    "provider": created.get("provider").cloned().unwrap_or(Value::Null),
+                    "email": created.get("email").cloned().unwrap_or(Value::Null),
+                    "displayName": created.get("displayName").cloned().unwrap_or(Value::Null),
+                }
+            })),
+        )
+            .into_response());
     }
 
     let code = body
@@ -314,11 +1289,177 @@ async fn handle_exchange(
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string());
 
-    if code.is_empty() {
-        return Ok(error_response(StatusCode::BAD_REQUEST, "Missing code"));
+    // ── perchai ───────────────────────────────────────────────────────────
+    // Handles PKCE code, full callback URL, raw JWT, or JSON from
+    // cli-auth-session.json — the provider accepts whatever is pasted.
+    if provider == "perchai" {
+        if code.is_empty() {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "Missing token or authorization code",
+            ));
+        }
+        let mapped = exchange_code(
+            provider,
+            &code,
+            "http://localhost:8080/callback",
+            code_verifier.as_deref(),
+            state.as_deref(),
+            None,
+            log,
+        )
+        .await?;
+        let mut conn = mapped.to_map();
+        conn.insert("provider".into(), Value::String("perchai".into()));
+        conn.insert("authType".into(), Value::String("oauth".into()));
+        if let Some(expires_in) = mapped.expires_in {
+            conn.insert(
+                "expiresAt".into(),
+                Value::String(iso_in_seconds(expires_in)),
+            );
+        }
+        conn.insert("testStatus".into(), Value::String("active".into()));
+        let db = nr_db::db()?;
+        let created = nr_db::create_provider_connection(&db, &Value::Object(conn))?;
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "connection": {
+                    "id": created.get("id").cloned().unwrap_or(Value::Null),
+                    "provider": created.get("provider").cloned().unwrap_or(Value::Null),
+                    "email": created.get("email").cloned().unwrap_or(Value::Null),
+                    "displayName": created.get("displayName").cloned().unwrap_or(Value::Null),
+                }
+            })),
+        )
+            .into_response());
+    }
+
+    // ── trae / windsurf ───────────────────────────────────────────────────
+    // Code is either a raw callback URL or a pasted token; no PKCE.
+    if provider == "trae" || provider == "windsurf" {
+        if code.is_empty() {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "Missing token or callback URL",
+            ));
+        }
+        let mapped = exchange_code(
+            provider,
+            &code,
+            "http://localhost:8080/callback",
+            None,
+            state.as_deref(),
+            None,
+            log,
+        )
+        .await?;
+        let mut conn = mapped.to_map();
+        conn.insert("provider".into(), Value::String(provider.to_string()));
+        conn.insert(
+            "authType".into(),
+            Value::String(if provider == "windsurf" { "api_key" } else { "oauth" }.into()),
+        );
+        if let Some(expires_in) = mapped.expires_in {
+            conn.insert(
+                "expiresAt".into(),
+                Value::String(iso_in_seconds(expires_in)),
+            );
+        }
+        conn.insert("testStatus".into(), Value::String("active".into()));
+        let db = nr_db::db()?;
+        let created = nr_db::create_provider_connection(&db, &Value::Object(conn))?;
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "connection": {
+                    "id": created.get("id").cloned().unwrap_or(Value::Null),
+                    "provider": created.get("provider").cloned().unwrap_or(Value::Null),
+                    "email": created.get("email").cloned().unwrap_or(Value::Null),
+                    "displayName": created.get("displayName").cloned().unwrap_or(Value::Null),
+                }
+            })),
+        )
+            .into_response());
+    }
+
+    // ── raw JWT access token ──────────────────────────────────────────────
+    // Detect `eyJ…` tokens (ChatGPT website / Codex-style) and store them as
+    // access_token connections without an OAuth exchange.
+    if code.starts_with("eyJ") && code.contains('.') {
+        let info = super::oauth_jwt::extract_codex_account_info(&code);
+        let direct = super::oauth_jwt::decode_jwt_payload(&code).unwrap_or_else(|| json!({}));
+        let account_id = info
+            .get("chatgptAccountId")
+            .or_else(|| direct.get("account_id"));
+        let plan_type = info
+            .get("chatgptPlanType")
+            .or_else(|| direct.get("plan_type"));
+        let email = info.get("email").or_else(|| direct.get("email"));
+        let mut provider_specific_data = serde_json::Map::new();
+        provider_specific_data.insert("authMethod".into(), json!("access_token"));
+        if let Some(id) = account_id.filter(|v| !v.is_null()) {
+            provider_specific_data.insert("chatgptAccountId".into(), id.clone());
+        }
+        if let Some(plan) = plan_type.filter(|v| !v.is_null()) {
+            provider_specific_data.insert("chatgptPlanType".into(), plan.clone());
+        }
+        let db = nr_db::db()?;
+        let created = nr_db::create_provider_connection(
+            &db,
+            &json!({
+                "provider": provider,
+                "authType": "access_token",
+                "accessToken": code,
+                "email": email.and_then(Value::as_str),
+                "providerSpecificData": Value::Object(provider_specific_data),
+                "testStatus": "active",
+            }),
+        )?;
+        return Ok((
+            StatusCode::OK,
+            Json(json!({
+                "success": true,
+                "connection": {
+                    "id": created.get("id").cloned().unwrap_or(Value::Null),
+                    "provider": created.get("provider").cloned().unwrap_or(Value::Null),
+                    "email": created.get("email").cloned().unwrap_or(Value::Null),
+                    "displayName": created.get("displayName").cloned().unwrap_or(Value::Null),
+                }
+            })),
+        )
+            .into_response());
+    }
+
+    // ── generic PKCE exchange ─────────────────────────────────────────────
+    let no_pkce_exchange_providers = ["cline", "clinepass", "kimchi"];
+    let redirect_uri = body
+        .and_then(|b| b.get("redirectUri"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string());
+    let code_verifier = body
+        .and_then(|b| b.get("codeVerifier"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string());
+    if code.is_empty()
+        || (redirect_uri.is_none() && !no_pkce_exchange_providers.contains(&provider))
+    {
+        return Ok(error_response(StatusCode::BAD_REQUEST, "Missing required fields"));
+    }
+    if !no_pkce_exchange_providers.contains(&provider) && code_verifier.is_none() {
+        return Ok(error_response(StatusCode::BAD_REQUEST, "Missing required fields"));
     }
 
     let redirect = redirect_uri.unwrap_or_else(|| "http://localhost:8080/callback".to_string());
+    let mut meta = body.and_then(|b| b.get("meta")).cloned();
+    if let Some(system_id) = body.and_then(|b| b.get("systemId")).and_then(Value::as_str) {
+        let merged = meta.get_or_insert_with(|| json!({}));
+        if merged.is_object() {
+            merged["systemId"] = json!(system_id);
+        }
+    }
 
     let mapped = exchange_code(
         provider,
@@ -326,7 +1467,7 @@ async fn handle_exchange(
         &redirect,
         code_verifier.as_deref(),
         state.as_deref(),
-        None,
+        meta.as_ref(),
         log,
     )
     .await?;

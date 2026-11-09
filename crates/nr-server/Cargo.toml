@@ -15,10 +15,13 @@ nr-engine.workspace = true
 nr-exec-base.workspace = true
 nr-exec-cli.workspace = true
 nr-exec-ide.workspace = true
+nr-exec-simple.workspace = true
 nr-executors.workspace = true
 nr-translator.workspace = true
 nr-oauth.workspace = true
 anyhow.workspace = true
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
 async-stream.workspace = true
 axum.workspace = true
 maud = { workspace = true }

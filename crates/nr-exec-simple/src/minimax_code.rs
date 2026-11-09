@@ -168,6 +168,27 @@ fn assert_ok(response: &Json) -> Result<&Json> {
     Err(Error::Provider(format!("MiniMax Code broker auth error: {code}")))
 }
 
+/// `requestStatus(dataDir)`: read-only desktop broker probe — is the app
+/// installed, running and signed in? Matches `open-sse/services/minimaxCodeLease.js`.
+pub async fn request_status(data_dir: &std::path::Path) -> Result<Json> {
+    let capability = read_capability(data_dir)?;
+    let request_id = format!("9r-status-{}", now_ms().into_base36());
+    let request = serde_json::json!({
+        "version": AUTH_LEASE_PROTOCOL_VERSION,
+        "requestId": request_id,
+        "capability": capability,
+        "method": "status",
+    });
+    let socket = data_dir.join("run").join(SOCKET_FILE);
+    let response = send_lease_request(&socket.to_string_lossy(), &request).await?;
+    let result = assert_ok(&response)?;
+    Ok(serde_json::json!({
+        "status": result.get("status").cloned().unwrap_or(Json::Null),
+        "generation": result.get("generation").cloned().unwrap_or(Json::Null),
+        "expiresAtMs": result.get("expiresAtMs").cloned().unwrap_or(Json::Null),
+    }))
+}
+
 /// Borrow a cached-or-fresh access token from the desktop broker.
 async fn get_lease_token(credentials: &Credentials) -> Result<LeasedToken> {
     let data_dir = resolve_mcode_data_dir(credentials);

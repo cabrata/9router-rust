@@ -14,9 +14,9 @@ pub mod dash_providers;
 pub mod dash_ops;
 pub mod dash_tools;
 
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use maud::{html, Markup, PreEscaped};
 use serde_json::Value;
@@ -113,19 +113,24 @@ pub const EXTRA_NAV_ITEMS: &[(&str, &str)] = &[
     ("/dashboard/settings", "Settings"),
 ];
 
-/// Pages rendered at the root (`/providers`) that `/dashboard/<page>` falls back to.
+/// Legacy root pages. Each one is (or will be) mirrored under `/dashboard/<page>`;
+/// [`fallback`] only redirects these when no explicit route claimed the path.
 const LEGACY_PAGES: &[&str] = &["providers", "keys", "combos", "settings", "usage", "oauth", "login"];
 
-/// Accepts both legacy root paths (`/providers`, `/`) and `/dashboard/...` paths.
+/// Accepts both legacy root paths (`/providers`, `/`) and `/dashboard/...` paths,
+/// with or without a trailing slash.
 fn normalize_active(active: &str) -> String {
-    match active {
-        "" | "/" => "/dashboard".to_string(),
-        a if a == "/dashboard" || a.starts_with("/dashboard/") => a.to_string(),
-        a => format!("/dashboard{a}"),
+    let trimmed = active.trim_end_matches('/');
+    let path = if trimmed.is_empty() { "/" } else { trimmed };
+    match path {
+        "/" => "/dashboard".to_string(),
+        p if p == "/dashboard" || p.starts_with("/dashboard/") => p.to_string(),
+        p => format!("/dashboard{p}"),
     }
 }
 
-/// Active-state by prefix on a segment boundary; `/dashboard` itself matches exactly.
+/// Active-state by prefix on a segment boundary; `/dashboard` itself matches exactly
+/// (mirrors `isActive` in Sidebar.js, where `/dashboard` means the Endpoint page).
 pub fn nav_is_active(href: &str, active: &str) -> bool {
     let active = normalize_active(active);
     if href == "/dashboard" {
@@ -137,23 +142,42 @@ pub fn nav_is_active(href: &str, active: &str) -> bool {
 fn nav_links(items: &[(&str, &str)], active: &str) -> Markup {
     html! {
         @for (href, label) in items {
-            li { a href=(href) class=(if nav_is_active(href, active) { "active" } else { "" }) { (label) } }
+            li {
+                a href=(href) class=(if nav_is_active(href, active) { "active" } else { "" })
+                    aria-current=[if nav_is_active(href, active) { Some("page") } else { None }] {
+                    (label)
+                }
+            }
         }
     }
 }
 
+/// Sidebar port of `src/shared/components/Sidebar.js`: traffic lights, gradient
+/// logo, main nav, Manage section. Collapses to a drawer on narrow screens
+/// (`data-nav-toggle` in the topbar, wired in `static/dashboard.js`).
 fn nav(active: &str) -> Markup {
     html! {
-        aside class="sidebar" {
+        aside class="sidebar" id="sidebar" {
+            div class="traffic" aria-hidden="true" {
+                span class="dot red" {} span class="dot amber" {} span class="dot green" {}
+            }
             div class="brand" {
                 a href="/dashboard" class="brand-link" {
                     span class="logo" { "9" }
-                    span { h1 { "9router" } div class="ver" { (PreEscaped(concat!("rust · v", env!("CARGO_PKG_VERSION")))) } }
+                    span class="brand-text" {
+                        h1 { "9router" }
+                        div class="ver" { (PreEscaped(concat!("v", env!("CARGO_PKG_VERSION"), " · rust"))) }
+                    }
                 }
             }
-            ul class="nav" { (nav_links(NAV_ITEMS, active)) }
-            div class="nav-section" { "Manage" }
-            ul class="nav" { (nav_links(EXTRA_NAV_ITEMS, active)) }
+            nav class="side-nav" aria-label="Dashboard" {
+                ul class="nav" { (nav_links(NAV_ITEMS, active)) }
+                div class="nav-section" { "Manage" }
+                ul class="nav" { (nav_links(EXTRA_NAV_ITEMS, active)) }
+            }
+            div class="sidebar-foot" {
+                a href="/api/version" class="muted" { "version" }
+            }
         }
     }
 }
@@ -197,12 +221,16 @@ pub fn layout(title: &str, active: &str, user: &str, body: Markup) -> Markup {
                     (nav(active))
                     main class="main" {
                         header class="topbar" {
-                            h2 { (title) }
+                            div class="topbar-left" {
+                                button type="button" class="nav-toggle" data-nav-toggle
+                                    aria-label="Toggle navigation" aria-controls="sidebar" { "☰" }
+                                h2 { (title) }
+                            }
                             div class="user-box" {
                                 (theme_toggle())
-                                "Signed in as " (user)
+                                span class="user-name" { (user) }
                                 form method="post" action="/logout" {
-                                    button class="btn btn-sm" type="submit" { "Sign out" }
+                                    button class="btn btn-sm btn-ghost" type="submit" { "Sign out" }
                                 }
                             }
                         }
@@ -227,16 +255,31 @@ pub fn bare_layout(title: &str, body: Markup) -> Markup {
 
 // ─── Router ─────────────────────────────────────────────────────────────────
 
-/// Pages served at both the legacy root path and `/dashboard/<page>`.
-/// `providers` and `usage` are deliberately NOT mirrored: `dash_providers` / `dash_ops`
-/// own `/dashboard/providers…` and `/dashboard/usage`; until they land, `fallback`
-/// redirects those to the root page.
+/// Dashboard routes.
+///
+/// The legacy pages are served at both their root path and `/dashboard/<page>`:
+///
+/// | root          | mirrored                    | owner            |
+/// |---------------|-----------------------------|------------------|
+/// | `/keys`       | `/dashboard/keys`           | this module      |
+/// | `/combos`     | `/dashboard/combos`         | this module      |
+/// | `/settings`   | `/dashboard/settings`       | this module      |
+/// | `/oauth`      | `/dashboard/oauth`          | this module      |
+/// | `/login`      | `/dashboard/login`          | fallback redirect |
+/// | `/providers`  | `/dashboard/providers`      | `dash_providers` |
+/// | `/usage`      | `/dashboard/usage`          | `dash_ops`       |
+///
+/// `/providers` and `/usage` are *not* re-registered here: `dash_providers` and
+/// `dash_ops` already own the `/dashboard/...` path (axum panics on overlapping
+/// method routes), and their pages render the same data. The root handlers stay in
+/// `pages` for clients and tests that still use them.
 pub fn router() -> Router {
     let keys = get(pages::keys_page).post(forms::create_key);
     let key = get(pages::key_edit_page).put(forms::update_key).delete(forms::delete_key);
     let combos = get(pages::combos_page).post(forms::create_combo);
     let combo = get(pages::combo_edit_page).put(forms::update_combo).delete(forms::delete_combo);
     let settings = get(pages::settings_page).post(forms::update_settings);
+    let login = get(pages::login_page).post(forms::login_submit);
     Router::new()
         .merge(dash_providers::router())
         .merge(dash_ops::router())
@@ -246,7 +289,7 @@ pub fn router() -> Router {
             ([(header::CONTENT_TYPE, "image/svg+xml")], assets::FAVICON)
         }))
         .route("/", get(pages::root_page))
-        .route("/login", get(pages::login_page).post(forms::login_submit))
+        .route("/login", login)
         .route("/logout", post_redirect("/login"))
         .route("/providers", get(pages::providers_page).post(forms::create_provider))
         .route("/providers/{id}", get(pages::provider_edit_page).put(forms::update_provider).delete(forms::delete_provider))
@@ -261,22 +304,30 @@ pub fn router() -> Router {
         .route("/settings", settings.clone())
         .route("/dashboard/settings", settings)
         .route("/settings/password", post(forms::change_password))
+        .route("/dashboard/settings/password", post(forms::change_password))
         .route("/usage", get(pages::usage_page))
         .route("/oauth", get(pages::oauth_page))
         .route("/dashboard/oauth", get(pages::oauth_page))
         .fallback(fallback)
 }
 
-/// Runs only when no route matched. `/dashboard/<legacy page>[/…]` redirects (GET/HEAD)
-/// to the root page that already serves it; everything else is a plain 404.
-/// `/dashboard` itself is served here (not routed) so a sibling lane may claim it
-/// (JS shows the Endpoint page there) without a merge conflict.
-async fn fallback(method: axum::http::Method, uri: axum::http::Uri, headers: HeaderMap) -> Response {
-    if uri.path().trim_end_matches('/') == "/dashboard" && method == axum::http::Method::GET {
+/// Runs only when no route matched. `/dashboard[/]` is served here (not routed) so a
+/// sibling lane may claim it (JS shows the Endpoint page there) without a merge
+/// conflict. `/dashboard/<legacy page>[/…]` redirects (GET/HEAD) to the root page
+/// that already serves it; anything else is a plain 404.
+async fn fallback(method: Method, uri: Uri, headers: HeaderMap) -> Response {
+    let readable = method == Method::GET || method == Method::HEAD;
+    if readable && uri.path().trim_end_matches('/') == "/dashboard" {
         return pages::root_page(headers).await;
     }
     match dashboard_redirect_target(uri.path()) {
-        Some(mut target) if method == axum::http::Method::GET || method == axum::http::Method::HEAD => {
+        Some(_) if !readable => (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, "GET, HEAD".to_string())],
+            "method not allowed",
+        )
+            .into_response(),
+        Some(mut target) => {
             if let Some(q) = uri.query() {
                 target.push('?');
                 target.push_str(q);
@@ -284,7 +335,7 @@ async fn fallback(method: axum::http::Method, uri: axum::http::Uri, headers: Hea
             (StatusCode::SEE_OTHER, [(header::LOCATION, target), (header::CACHE_CONTROL, "no-store".to_string())])
                 .into_response()
         }
-        _ => (StatusCode::NOT_FOUND, "not found").into_response(),
+        None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
 }
 
@@ -293,8 +344,6 @@ fn dashboard_redirect_target(path: &str) -> Option<String> {
     let first = rest.split('/').next().unwrap_or("");
     LEGACY_PAGES.contains(&first).then(|| format!("/{rest}"))
 }
-
-use axum::routing::post;
 
 fn post_redirect(to: &str) -> axum::routing::MethodRouter {
     let to = to.to_string();
@@ -318,19 +367,42 @@ mod tests {
     #[test]
     fn active_by_prefix() {
         assert!(nav_is_active("/dashboard", "/"));
+        assert!(nav_is_active("/dashboard", "/dashboard/"));
         assert!(!nav_is_active("/dashboard", "/providers"));
         assert!(nav_is_active("/dashboard/providers", "/providers"));
         assert!(nav_is_active("/dashboard/providers", "/dashboard/providers/abc"));
         assert!(!nav_is_active("/dashboard/providers", "/dashboard/providers-x"));
         assert!(nav_is_active("/dashboard/media-providers", "/dashboard/media-providers/web"));
         assert!(!nav_is_active("/dashboard/media-providers", "/dashboard/providers"));
+        assert!(nav_is_active("/dashboard/keys", "/keys"));
+        assert!(nav_is_active("/dashboard/keys", "/dashboard/keys/abc/"));
     }
 
     #[test]
     fn nav_mirrors_js_sidebar() {
         let labels: Vec<_> = NAV_ITEMS.iter().map(|(_, l)| *l).collect();
-        assert_eq!(labels.len(), 18);
+        assert_eq!(
+            labels,
+            vec![
+                "Dashboard", "Endpoint", "Providers", "Media Providers", "Combos", "Usage", "Quota",
+                "Request Logs", "Console Log", "CLI Tools", "MITM", "Translator", "Token Saver",
+                "Pxpipe", "Skills", "Proxy Pools", "Profile", "Basic Chat",
+            ]
+        );
         assert!(NAV_ITEMS.iter().all(|(h, _)| h.starts_with("/dashboard")));
+    }
+
+    #[test]
+    fn every_nav_item_activates_for_its_own_child() {
+        for (href, _) in NAV_ITEMS.iter().chain(EXTRA_NAV_ITEMS) {
+            assert!(nav_is_active(href, href), "{href}");
+            // The Dashboard item is special: it matches only itself (JS maps it to
+            // the Endpoint page); every other item activates for its subtree.
+            if *href != "/dashboard" {
+                assert!(nav_is_active(href, &format!("{href}/child")), "{href}/child");
+            }
+            assert!(!nav_is_active(href, &format!("{href}-other")), "{href}-other");
+        }
     }
 
     #[test]

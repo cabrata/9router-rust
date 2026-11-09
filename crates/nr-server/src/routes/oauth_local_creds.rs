@@ -551,6 +551,53 @@ pub fn read_perch_cli_credentials() -> Value {
     })
 }
 
+/// `detectPerchCliInstalled()`: is `perch` on PATH and is there a session?
+/// Matches `src/lib/oauth/utils/perchCliCredentials.js`.
+pub fn detect_perch_cli_installed() -> Value {
+    let session = read_perch_cli_credentials();
+    let found = session.get("found").and_then(Value::as_bool) == Some(true);
+    let installed = run("which", &["perch"], std::time::Duration::from_secs(5)).is_some()
+        || run("where", &["perch"], std::time::Duration::from_secs(5)).is_some();
+    json!({
+        "installed": installed || found,
+        "hasSession": found,
+        "session": if found { session } else { Value::Null },
+        "authFilePath": home().join(".perch").join("cli-auth-session.json").display().to_string(),
+    })
+}
+
+/// `detectIdeInstalled(providerId)`: binary/path probe for Trae/Windsurf.
+/// Matches `src/lib/oauth/utils/ideDetect.js`.
+pub fn detect_ide_installed(provider: &str) -> Value {
+    let path_sets: &[&str] = match provider {
+        "trae" => &[
+            "/usr/bin/trae",
+            "/usr/local/bin/trae",
+            "/opt/trae",
+            "/opt/Trae",
+        ],
+        "windsurf" => &[
+            "/usr/bin/windsurf",
+            "/usr/local/bin/windsurf",
+            "/opt/windsurf",
+            "/opt/Windsurf",
+        ],
+        _ => return json!({ "installed": false, "path": Value::Null }),
+    };
+    for p in path_sets {
+        if std::path::Path::new(p).exists() {
+            return json!({ "installed": true, "path": p });
+        }
+    }
+    let bin = if provider == "trae" { "trae" } else { "windsurf" };
+    if run("which", &[bin], std::time::Duration::from_secs(5)).is_some()
+        || run("where", &[bin], std::time::Duration::from_secs(5)).is_some()
+    {
+        return json!({ "installed": true, "path": bin });
+    }
+    json!({ "installed": false, "path": Value::Null })
+}
+
 // ─── Zed ────────────────────────────────────────────────────────────────────
 
 pub const ZED_DEFAULT_CREDENTIALS_URL: &str = "https://zed.dev";
