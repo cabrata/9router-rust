@@ -380,5 +380,8 @@ still shows those 5 as racing.
 - Raw transcript: `/home/caliph/.jcode/scratch/e2e-report/` (`index.md`,
   `summary.txt`, `server.log`, per-request `.body` files).
 
-All probe servers and the mock upstream were stopped; ports 21991-22003 are free.
-No state was written to `~/.9router`.
+All probe servers and the mock upstream were stopped; ports 21991-22007 are free.
+No state was written to `~/.9router`: verified by stat-ing its database before and
+after a full probe run (WAL and data file mtimes unchanged). Note that other
+agents' `cargo test` jobs in this workspace do open the real `~/.9router`; that is
+not this probe.
