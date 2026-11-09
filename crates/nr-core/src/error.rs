@@ -18,6 +18,15 @@ pub enum Error {
     BadRequest(String),
     #[error("{0}")]
     NotFound(String),
+    /// Misconfiguration (missing URL, clientId, secret) maps to 500.
+    #[error("config: {0}")]
+    Config(String),
+    /// Provider/upstream OAuth failure maps to 502.
+    #[error("provider: {0}")]
+    Provider(String),
+    /// Operation not supported by this provider/flow maps to 400.
+    #[error("not supported: {0}")]
+    NotSupported(String),
     #[error("{0}")]
     Other(String),
 }
@@ -26,6 +35,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 impl Error {
     pub fn other(msg: impl std::fmt::Display) -> Self {
+        Error::Other(msg.to_string())
+    }
+
+    /// Convenience constructor. Maps to `Other`.
+    pub fn new(msg: impl std::fmt::Display) -> Self {
         Error::Other(msg.to_string())
     }
 
@@ -38,6 +52,9 @@ impl Error {
             Error::Upstream { status, .. } => *status,
             Error::BadRequest(_) => 400,
             Error::NotFound(_) => 404,
+            Error::Config(_) => 500,
+            Error::Provider(_) => 502,
+            Error::NotSupported(_) => 400,
             Error::Other(_) => 500,
         }
     }
