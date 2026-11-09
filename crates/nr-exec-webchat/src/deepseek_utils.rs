@@ -354,6 +354,13 @@ impl Default for FinishOnceGuard {
 
 pub const DEEPSEEK_FINISHED_DRAIN_MS: u64 = 750;
 
+/// How long to wait after DeepSeek `response/status=FINISHED` for trailing
+/// `search_results` before closing the OpenAI-compatible SSE. Upstreams that
+/// leave the HTTP body open hang OpenAI SDK clients waiting for
+/// `data: [DONE]` after `finish_reason: stop`, so the drain always closes.
+///
+/// JS drives this off a `setTimeout`; the Rust stream transform instead polls
+/// [`FinishedDrainScheduler::tick`] per upstream chunk.
 pub struct FinishedDrainScheduler {
     drain_timer: Mutex<Option<Instant>>,
     drain_ms: u64,
@@ -367,6 +374,8 @@ impl FinishedDrainScheduler {
         }
     }
 
+    /// (Re)arm the drain window. Any post-FINISHED payload extends it so late
+    /// `search_results` are still captured.
     pub fn schedule_finish_after_drain(&self) {
         if let Ok(mut timer) = self.drain_timer.lock() {
             *timer = Some(Instant::now());
@@ -379,16 +388,28 @@ impl FinishedDrainScheduler {
         }
     }
 
+    /// JS `isDrainPending` asks only whether the timer is armed.
     pub fn is_drain_pending(&self) -> bool {
-        if let Ok(timer) = self.drain_timer.lock() {
-            if let Some(start) = *timer {
-                start.elapsed().as_millis() < self.drain_ms as u128
-            } else {
-                false
-            }
-        } else {
-            false
+        self.drain_timer
+            .lock()
+            .map(|t| t.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Drain elapsed → invoke `finish` once and clear the timer.
+    /// Returns `true` when it fired (so the caller can close the stream).
+    pub fn tick<F: FnMut()>(&self, mut finish: F) -> bool {
+        let due = self
+            .drain_timer
+            .lock()
+            .ok()
+            .and_then(|t| t.map(|start| start.elapsed().as_millis() >= self.drain_ms as u128))
+            .unwrap_or(false);
+        if due {
+            self.clear_finished_drain();
+            finish();
         }
+        due
     }
 }
 
@@ -447,6 +468,33 @@ mod tests {
         let content = "[citation:1] hello [citation:2] world";
         let formatted = format_stream_content(content, "deepseek-search");
         assert_eq!(formatted, "[1] hello [2] world");
+    }
+
+    #[test]
+    fn test_finished_drain_scheduler_states() {
+        let sched = FinishedDrainScheduler::new(DEEPSEEK_FINISHED_DRAIN_MS);
+        assert!(!sched.is_drain_pending(), "nothing armed yet");
+        assert!(!sched.tick(|| {}), "tick without an armed window never fires");
+
+        sched.schedule_finish_after_drain();
+        assert!(sched.is_drain_pending(), "armed");
+        assert!(!sched.tick(|| {}), "not yet elapsed");
+
+        std::thread::sleep(std::time::Duration::from_millis(
+            DEEPSEEK_FINISHED_DRAIN_MS + 20,
+        ));
+        assert!(sched.is_drain_pending(), "still armed until tick fires");
+        let mut fired = 0;
+        assert!(sched.tick(|| fired += 1), "fires after the window");
+        assert_eq!(fired, 1);
+        assert!(!sched.is_drain_pending(), "disarmed after firing");
+        assert!(!sched.tick(|| fired += 1), "one-shot");
+        assert_eq!(fired, 1);
+
+        // Re-arming extends the window (late search_results keep it alive).
+        sched.schedule_finish_after_drain();
+        sched.clear_finished_drain();
+        assert!(!sched.is_drain_pending());
     }
 
     #[test]

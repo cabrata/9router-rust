@@ -54,7 +54,7 @@ fn json_response(status: u16, body: String) -> UpstreamResponse {
     UpstreamResponse::from_bytes(status, headers, body)
 }
 
-fn sse_headers() -> HeaderMap {
+pub(crate) fn sse_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
