@@ -108,7 +108,45 @@ pub async fn handle_combo_chat(
         };
 
         if response.ok() {
-            return ComboOutcome::Response(response);
+            // Success (2xx). A 2xx is necessary but NOT sufficient: Gemini aborts (e.g.
+            // MALFORMED_FUNCTION_CALL) still return 200 and stream empty content, which would
+            // otherwise be delivered as a successful empty answer with no failover.
+            // Peek the stream for real content before committing to this candidate.
+            if response.content_type().contains("text/event-stream") {
+                let peeked = crate::empty_failover::peek_combo_response(response, None).await;
+                if peeked.outcome == crate::empty_failover::PeekOutcome::Content {
+                    return ComboOutcome::Response(peeked.response);
+                }
+
+                // Empty generation. Fall through to the next candidate unless this is a legitimately
+                // empty class (content filter) or the last candidate - in which case return the
+                // (empty) response as-is, preserving prior behaviour rather than manufacturing a 5xx.
+                let reason_label = peeked.finish_reason.as_deref().unwrap_or("no-content");
+                if crate::empty_failover::is_no_retry_finish(peeked.finish_reason.as_deref()) || is_last(i) {
+                    return ComboOutcome::Response(peeked.response);
+                }
+
+                last_error = format!("empty generation ({reason_label})");
+                last_status = 502;
+                continue;
+            } else {
+                // Non-streaming (or non-SSE) response.
+                if !is_last(i) && response.content_type().contains("application/json") {
+                    let status = response.status;
+                    let headers = response.headers.clone();
+                    let chunks: Vec<_> = response.body.collect().await;
+                    let bytes: Bytes = chunks.into_iter().filter_map(|c| c.ok()).flatten().collect();
+                    if let Ok(peek_body) = serde_json::from_slice::<Json>(&bytes) {
+                        if crate::empty_failover::is_zero_content_json(&peek_body) {
+                            last_error = "Zero usable content".to_string();
+                            last_status = 200;
+                            continue;
+                        }
+                    }
+                    return ComboOutcome::Response(UpstreamResponse::from_bytes(status, headers, bytes));
+                }
+                return ComboOutcome::Response(response);
+            }
         }
 
         // Non-ok: buffer the error body so the rule engine can classify it,

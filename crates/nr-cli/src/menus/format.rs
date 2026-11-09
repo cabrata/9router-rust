@@ -204,15 +204,15 @@ mod tests {
         assert_eq!(truncate("exactly10!", 10), "exactly10!");
         assert_eq!(truncate("abcdefghijkl", 10), "abcdefg...");
         // Multibyte input must not split a char boundary.
-        assert_eq!(truncate("ключключключ", 5), "клю...");
+        assert_eq!(truncate("ключключключ", 5), "кл...");
     }
 
     #[test]
     fn mask_key_keeps_first_and_last_four() {
         assert_eq!(mask_key(""), "***");
         assert_eq!(mask_key("short"), "***");
-        assert_eq!(mask_key("12345678"), "1234****5678");
-        assert_eq!(mask_key("sk-abcdef1234567890"), "sk-a************7890");
+        assert_eq!(mask_key("1234abcd5678"), "1234****5678");
+        assert_eq!(mask_key("sk-abcdef1234567890"), "sk-a***********7890");
     }
 
     #[test]
@@ -286,7 +286,7 @@ mod tests {
     fn api_key_label_masks_the_secret() {
         assert_eq!(
             api_key_label(&json!({"name": "laptop", "key": "sk-1234567890abcd"})),
-            "laptop (sk-1**********abcd)"
+            "laptop (sk-1*********abcd)"
         );
     }
 }

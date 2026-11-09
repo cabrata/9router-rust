@@ -37,6 +37,13 @@ pub fn db() -> nr_core::Result<Db> {
     }
 }
 
+/// Override or reset the process-wide default database handle (used for tests and custom data dirs).
+pub fn set_default_db(db: Option<Db>) {
+    let handle = DEFAULT_DB.get_or_init(|| Arc::new(Mutex::new(None)));
+    let mut guard = handle.lock();
+    *guard = db;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

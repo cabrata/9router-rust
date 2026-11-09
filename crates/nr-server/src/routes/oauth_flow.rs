@@ -929,10 +929,9 @@ const KIRO_SOCIAL_REDIRECT: &str = "kiro://kiro.kiroAgent/authenticate-success";
 
 /// POST /api/oauth/kiro/import — import an IDE refresh token.
 pub async fn kiro_import(Json(body): Json<Value>) -> Response {
-    let Some(refresh_token) = string_field(&body, "refreshToken").filter(|s| !s.is_empty()) else {
+    let Some(refresh_token) = trimmed_field(&body, "refreshToken").filter(|s| !s.is_empty()) else {
         return import_error(StatusCode::BAD_REQUEST, "Refresh token is required");
     };
-    let refresh_token = refresh_token.trim().to_string();
 
     let client_id = trimmed_field(&body, "clientId");
     let client_secret = trimmed_field(&body, "clientSecret");
@@ -1564,7 +1563,13 @@ pub async fn xiaomi_mimo_api_key(Json(body): Json<Value>) -> Response {
     let mut model_count = 0i64;
     if !key.is_empty() {
         let url = match env_endpoint("xiaomi-mimo-models") {
-            Some(full) => full,
+            Some(full) => {
+                if !full.ends_with("/models") {
+                    format!("{}/models", full.trim_end_matches('/'))
+                } else {
+                    full
+                }
+            }
             None => format!("{effective_base_url}/models"),
         };
         let mut req = nr_core::http::FetchRequest::get(url);
@@ -2504,10 +2509,17 @@ mod import_tests {
         }
     }
 
-    fn test_db() -> (tempfile::TempDir, nr_db::Db) {
+    /// The default DB is process-global, so tests that install one must not
+    /// interleave. Returns the guard alongside the handle; hold it for the whole
+    /// test (any test that reads back through the global handle depends on it).
+    static DB_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_db() -> (tempfile::TempDir, nr_db::Db, MutexGuard<'static, ()>) {
+        let lock = DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::TempDir::new().unwrap();
         let db = nr_db::Db::open_in(dir.path()).unwrap();
-        (dir, db)
+        nr_db::set_default_db(Some(db.clone()));
+        (dir, db, lock)
     }
 
     async fn body_json(response: Response) -> Value {
@@ -2517,6 +2529,7 @@ mod import_tests {
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     }
 
+    #[derive(Clone)]
     struct MockRequest {
         method: String,
         path: String,
@@ -2636,7 +2649,7 @@ mod import_tests {
     fn fake_jwt(claims: Value) -> String {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
-        format!("h.{payload}.s")
+        format!("eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.{payload}.signature_padding_for_length_over_fifty_characters")
     }
 
     // ─── cursor ─────────────────────────────────────────────────────────────
@@ -2692,7 +2705,7 @@ mod import_tests {
 
     #[tokio::test]
     async fn cursor_import_stores_a_connection() {
-        let (_dir, db) = test_db();
+        let (_dir, db, _db_lock) = test_db();
         let token = fake_jwt(json!({ "email": "cursor@example.com", "sub": "user-1" }));
         let machine_id = "0123456789abcdef0123456789abcdef";
 
@@ -2729,7 +2742,7 @@ mod import_tests {
 
     #[tokio::test]
     async fn kiro_import_cli_proxy_accepts_a_string_payload() {
-        let (_dir, db) = test_db();
+        let (_dir, db, _db_lock) = test_db();
         let auth = json!({
             "auth_method": "external_idp",
             "access_token": fake_jwt(json!({ "upn": "dev@corp.example" })),
@@ -2879,7 +2892,7 @@ mod import_tests {
 
     #[tokio::test]
     async fn iflow_cookie_exchanges_bxauth_for_an_api_key() {
-        let (_dir, db) = test_db();
+        let (_dir, db, _db_lock) = test_db();
         let server = start_mock(|request| {
             if request.method == "GET" {
                 (
@@ -2956,7 +2969,7 @@ mod import_tests {
 
     #[tokio::test]
     async fn zed_import_validates_against_the_cloud_api() {
-        let (_dir, db) = test_db();
+        let (_dir, db, _db_lock) = test_db();
         let server = start_mock(|request| {
             assert_eq!(request.path, "/client/users/me");
             assert_eq!(request.header("authorization"), Some("user-1 zed-token"));
@@ -3047,7 +3060,7 @@ mod import_tests {
 
     #[tokio::test]
     async fn xiaomi_api_key_stores_a_validated_key() {
-        let (_dir, db) = test_db();
+        let (_dir, db, _db_lock) = test_db();
         let server = start_mock(|request| {
             assert_eq!(request.path, "/models");
             assert_eq!(request.header("authorization"), Some("Bearer sk-test"));
@@ -3086,7 +3099,7 @@ mod import_tests {
 
     #[tokio::test]
     async fn xiaomi_api_key_accepts_a_session_only_body_and_updates_in_place() {
-        let (_dir, db) = test_db();
+        let (_dir, db, _db_lock) = test_db();
 
         let first = xiaomi_mimo_api_key(Json(json!({
             "mimoPassToken": "pass-1",
@@ -3230,7 +3243,7 @@ mod import_tests {
 
     #[tokio::test]
     async fn perch_plan_status_reports_the_upstream_gate() {
-        let (_dir, db) = test_db();
+        let (_dir, db, _db_lock) = test_db();
         nr_db::create_provider_connection(
             &db,
             &json!({
@@ -3293,7 +3306,7 @@ mod import_tests {
 
     #[tokio::test]
     async fn perch_plan_status_404s_without_a_connection() {
-        let (_dir, db) = test_db();
+        let (_dir, db, _db_lock) = test_db();
         let _ = db;
         let response = perchai_plan_status(Query(HashMap::new())).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -3314,7 +3327,7 @@ mod import_tests {
 
     #[tokio::test]
     async fn perch_plan_claim_sends_pro_to_the_web_app() {
-        let (_dir, db) = test_db();
+        let (_dir, db, _db_lock) = test_db();
         nr_db::create_provider_connection(
             &db,
             &json!({
@@ -3336,7 +3349,7 @@ mod import_tests {
 
     #[tokio::test]
     async fn perch_plan_claim_accepts_starter_and_saves_it() {
-        let (_dir, db) = test_db();
+        let (_dir, db, _db_lock) = test_db();
         let server = start_mock(|request| {
             if request.method == "POST" {
                 assert_eq!(request.json()["plan"], json!("starter"));

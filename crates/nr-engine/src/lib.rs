@@ -27,8 +27,10 @@ pub use chat::{
 };
 pub use combo::{get_combo_models_from_data, handle_combo_chat, ComboOutcome};
 pub use empty_failover::{
-    classify_body, delta_has_client_content, inspect_sse_line, is_no_retry_finish, scan_sse_buffer,
-    should_fail_over, PeekOutcome, ScanState,
+    classify_body, delta_has_client_content, inspect_sse_line, is_no_retry_finish,
+    is_terminal_empty_stream, is_zero_content_json, peek_combo_response, peek_stream_for_content,
+    reconstruct_stream, scan_sse_buffer, scan_summary, should_fail_over, PeekOutcome,
+    PeekedComboResponse, PeekedStream, ScanState,
 };
 
 // ─── Media Requests & Handlers ──────────────────────────────────────────────

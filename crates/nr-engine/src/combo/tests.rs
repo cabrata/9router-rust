@@ -168,3 +168,113 @@ fn combo_models_lookup_ignores_provider_model_strings() {
     let combos = serde_json::json!([{ "name": "plexus/fast", "models": ["a/m1"] }]);
     assert_eq!(get_combo_models_from_data("plexus/fast", &combos), None);
 }
+
+fn sse_response(frames: &[&str]) -> UpstreamResponse {
+    let chunks: Vec<Bytes> = frames.iter().map(|f| Bytes::from(f.to_string())).collect();
+    let body = Box::pin(futures::stream::iter(chunks.into_iter().map(Ok)));
+    UpstreamResponse::sse(body)
+}
+
+#[tokio::test]
+async fn combo_empty_stream_first_member_falls_through_to_second() {
+    let role = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n";
+    let stop = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+    let done = "data: [DONE]\n\n";
+    let content = "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n";
+
+    let (try_fn, calls) = make_try(vec![
+        Ok(sse_response(&[role, stop, done])),
+        Ok(sse_response(&[role, content, done])),
+    ]);
+    let models = vec!["m1".to_string(), "m2".to_string()];
+    match handle_combo_chat(&models, "combo-empty", "fallback", try_fn).await {
+        ComboOutcome::Response(mut r) => {
+            assert!(r.ok());
+            let mut text = String::new();
+            while let Some(chunk) = r.body.next().await {
+                text.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            }
+            assert!(text.contains("OK"), "{text}");
+        }
+        _ => panic!("expected Response"),
+    }
+    assert_eq!(*calls.lock().unwrap(), vec!["m1".to_string(), "m2".to_string()]);
+}
+
+#[tokio::test]
+async fn combo_gemini_malformed_function_call_falls_through() {
+    let malformed = "data: {\"candidates\":[{\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}]}\n\n";
+    let content = "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n";
+
+    let (try_fn, calls) = make_try(vec![
+        Ok(sse_response(&[malformed])),
+        Ok(sse_response(&[content])),
+    ]);
+    let models = vec!["gemini/m1".to_string(), "openai/m2".to_string()];
+    match handle_combo_chat(&models, "combo-gemini", "fallback", try_fn).await {
+        ComboOutcome::Response(mut r) => {
+            assert!(r.ok());
+            let mut text = String::new();
+            while let Some(chunk) = r.body.next().await {
+                text.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            }
+            assert!(text.contains("recovered"), "{text}");
+        }
+        _ => panic!("expected Response"),
+    }
+    assert_eq!(*calls.lock().unwrap(), vec!["gemini/m1".to_string(), "openai/m2".to_string()]);
+}
+
+#[tokio::test]
+async fn combo_all_members_empty_returns_last_response() {
+    let role = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n";
+    let stop = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+
+    let (try_fn, calls) = make_try(vec![
+        Ok(sse_response(&[role, stop])),
+        Ok(sse_response(&[role, stop])),
+    ]);
+    let models = vec!["m1".to_string(), "m2".to_string()];
+    match handle_combo_chat(&models, "combo-all-empty", "fallback", try_fn).await {
+        ComboOutcome::Response(r) => assert!(r.ok()),
+        _ => panic!("expected Response"),
+    }
+    assert_eq!(*calls.lock().unwrap(), vec!["m1".to_string(), "m2".to_string()]);
+}
+
+#[tokio::test]
+async fn combo_content_filter_is_not_retried() {
+    let filter = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n";
+    let content = "data: {\"choices\":[{\"delta\":{\"content\":\"never reached\"}}]}\n\n";
+
+    let (try_fn, calls) = make_try(vec![
+        Ok(sse_response(&[filter])),
+        Ok(sse_response(&[content])),
+    ]);
+    let models = vec!["m1".to_string(), "m2".to_string()];
+    match handle_combo_chat(&models, "combo-filter", "fallback", try_fn).await {
+        ComboOutcome::Response(r) => assert!(r.ok()),
+        _ => panic!("expected Response"),
+    }
+    // Only the first model was called because content_filter is not retryable
+    assert_eq!(*calls.lock().unwrap(), vec!["m1".to_string()]);
+}
+
+#[tokio::test]
+async fn combo_zero_content_json_falls_through() {
+    let empty_json = UpstreamResponse::json(200, &serde_json::json!({
+        "choices": [{"message": {"content": ""}, "finish_reason": null}]
+    }));
+    let content_json = UpstreamResponse::json(200, &serde_json::json!({
+        "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]
+    }));
+
+    let (try_fn, calls) = make_try(vec![Ok(empty_json), Ok(content_json)]);
+    let models = vec!["m1".to_string(), "m2".to_string()];
+    match handle_combo_chat(&models, "combo-json", "fallback", try_fn).await {
+        ComboOutcome::Response(r) => assert!(r.ok()),
+        _ => panic!("expected Response"),
+    }
+    assert_eq!(*calls.lock().unwrap(), vec!["m1".to_string(), "m2".to_string()]);
+}
+

@@ -164,16 +164,22 @@ pub fn logs_payload() -> Value {
     json!({ "success": true, "logs": get_logs() })
 }
 
+/// Process-wide lock for tests that mutate the global buffer.
+///
+/// The buffer is process-global, so tests in any module that clear it or rely on
+/// a subscriber seeing only their own lines must hold this.
+#[cfg(test)]
+pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The buffer is process-global, so tests that touch it must not overlap.
-    /// `cargo test` runs them on parallel threads by default.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
     fn serial() -> std::sync::MutexGuard<'static, ()> {
-        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+        test_serial()
     }
 
     #[test]

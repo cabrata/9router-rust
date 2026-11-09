@@ -1,9 +1,9 @@
 //! `9router xai video` — generate a Grok Imagine video through the local
-//! 9router gateway and save the result as an MP4 file.
+//! 9router gateway or direct xAI endpoint and save the result as an MP4 file.
 //!
 //! Port of `cli/src/cli/commands/xaiVideo.js`. Flow: POST
-//! `/v1/videos/generations` → poll `GET /v1/videos/{request_id}` until
-//! done/failed/timeout → download `video.url` → atomic rename.
+//! `/v1/videos/generations` → poll `GET /v1/videos/{request_id}` with backoff
+//! until done/failed/timeout → download `video.url` → atomic rename.
 //!
 //! No OAuth tokens or Authorization headers are ever printed.
 
@@ -23,6 +23,7 @@ pub const DEFAULT_MODEL: &str = "xai/grok-imagine-video";
 pub const DEFAULT_OUTPUT: &str = "video.mp4";
 pub const DEFAULT_TIMEOUT_SEC: u64 = 600;
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 5_000;
+pub const MAX_BACKOFF_MS: u64 = 60_000;
 
 /// Statuses that end a job (the JS `TERMINAL_STATUSES` set).
 pub const TERMINAL_STATUSES: &[&str] = &["done", "completed", "failed", "error", "expired", "cancelled"];
@@ -134,7 +135,6 @@ pub fn parse_args(argv: &[String]) -> Result<VideoOptions, String> {
 
 /// Strip secrets out of anything headed for the terminal.
 pub fn sanitize_text(text: &str) -> String {
-    // `Bearer\s+[A-Za-z0-9._~+/=-]{8,}` case-insensitive.
     static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"(?i)Bearer\s+[A-Za-z0-9._~+/=-]{8,}").expect("static regex")
     });
@@ -177,9 +177,16 @@ pub fn build_create_body(opts: &VideoOptions) -> Result<Value, String> {
     Ok(body)
 }
 
-/// `http://host:port/path`, the origin the CLI talks to.
+/// Base URL the CLI talks to. Supports explicit `http://` / `https://` schemas or `host:port`.
 pub fn gateway_url(host: &str, port: u16) -> String {
-    format!("http://{host}:{port}")
+    if host.starts_with("http://") || host.starts_with("https://") {
+        return host.trim_end_matches('/').to_string();
+    }
+    if port == 443 {
+        format!("https://{host}")
+    } else {
+        format!("http://{host}:{port}")
+    }
 }
 
 /// What the next poll should do, given the gateway's HTTP status and body.
@@ -191,7 +198,7 @@ pub enum Classification {
     Done,
     /// Job finished in a failed state, with a sanitized message.
     Failed(String),
-    /// Transient failure (429/503 or an unexpected status) — keep polling.
+    /// Transient failure (429/503 or an unexpected status) — keep polling with backoff.
     Retry,
     /// Fatal response; carries the sanitized raw body.
     HardError(String),
@@ -234,14 +241,31 @@ pub fn classify_poll(status: u16, body: Option<&Value>, raw: &str) -> Classifica
     Classification::Retry
 }
 
-/// `result.video.url || result.video.file_output.public_url`
+/// Extract video URL from candidate response paths.
+/// Supports `video.url`, `video.file_output.public_url`, `url`, `data[0].url`, `file_output.public_url`.
 pub fn video_url(body: &Value) -> Option<String> {
-    let video = body.get("video")?;
-    if let Some(url) = video.get("url").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+    if let Some(video) = body.get("video") {
+        if let Some(url) = video.get("url").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            return Some(url.to_string());
+        }
+        if let Some(url) = video
+            .get("file_output")
+            .and_then(|f| f.get("public_url"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(url.to_string());
+        }
+    }
+    if let Some(url) = body.get("url").and_then(Value::as_str).filter(|s| !s.is_empty()) {
         return Some(url.to_string());
     }
-    video
-        .get("file_output")
+    if let Some(data) = body.get("data").and_then(Value::as_array) {
+        if let Some(url) = data.first().and_then(|item| item.get("url")).and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            return Some(url.to_string());
+        }
+    }
+    body.get("file_output")
         .and_then(|f| f.get("public_url"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
@@ -255,6 +279,7 @@ pub fn part_path(output: &str) -> String {
 
 // ── transport ───────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
 pub struct CreateResponse {
     pub status: u16,
     pub body: Option<Value>,
@@ -262,10 +287,22 @@ pub struct CreateResponse {
     pub connection_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
 pub struct PollResponse {
     pub status: u16,
     pub body: Option<Value>,
     pub raw: String,
+    pub retry_after_sec: Option<u64>,
+}
+
+impl PollResponse {
+    pub fn new(status: u16, body: Option<Value>, raw: String) -> Self {
+        Self { status, body, raw, retry_after_sec: None }
+    }
+
+    pub fn with_retry_after(status: u16, body: Option<Value>, raw: String, retry_after_sec: Option<u64>) -> Self {
+        Self { status, body, raw, retry_after_sec }
+    }
 }
 
 /// The three network calls the command makes. A trait so tests can drive the
@@ -276,7 +313,7 @@ pub trait VideoApi {
     fn download(&self, url: &str, dest: &Path) -> Result<(), String>;
 }
 
-/// Blocking HTTP client for the local gateway.
+/// Blocking HTTP client for the local gateway or direct xAI endpoint.
 pub struct HttpApi {
     client: reqwest::blocking::Client,
     base: String,
@@ -333,24 +370,28 @@ impl VideoApi for HttpApi {
         }
         let resp = req.send().map_err(|e| format!("Network error: {e}"))?;
         let status = resp.status().as_u16();
+        let retry_after_sec = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok());
         let raw = resp.text().map_err(|e| format!("Network error: {e}"))?;
-        Ok(PollResponse { status, body: parse_json_or_none(&raw), raw })
+        Ok(PollResponse { status, body: parse_json_or_none(&raw), raw, retry_after_sec })
     }
 
     fn download(&self, url: &str, dest: &Path) -> Result<(), String> {
-        // The JS downloader follows up to 5 redirects; reqwest's default limit
-        // is 10, so cap it to match.
         let client = reqwest::blocking::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(5))
             .timeout(Duration::from_secs(600))
             .build()
             .map_err(|e| e.to_string())?;
-        let resp = client.get(url).send().map_err(|e| format!("Download failed: {e}"))?;
+        let mut resp = client.get(url).send().map_err(|e| format!("Download failed: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("Download failed: HTTP {}", resp.status().as_u16()));
         }
-        let bytes = resp.bytes().map_err(|e| format!("Download failed: {e}"))?;
-        fs::write(dest, &bytes).map_err(|e| format!("Download failed: {e}"))
+        let mut file = fs::File::create(dest).map_err(|e| format!("Download failed: {e}"))?;
+        io::copy(&mut resp, &mut file).map_err(|e| format!("Download failed: {e}"))?;
+        Ok(())
     }
 }
 
@@ -390,7 +431,7 @@ pub fn run(argv: &[String]) -> i32 {
         print!("{HELP}");
         return 0;
     }
-    if opts.prompt.as_deref().unwrap_or("").is_empty() {
+    if opts.prompt.as_deref().unwrap_or("").trim().is_empty() {
         eprintln!("❌ --prompt is required");
         print!("{HELP}");
         return 1;
@@ -442,6 +483,9 @@ pub fn run_with<A: VideoApi>(api: &A, opts: &VideoOptions, out: &mut dyn Write) 
 
     let deadline = Instant::now() + Duration::from_secs(opts.timeout_sec);
     let mut last_line = String::new();
+    let mut backoff_ms = opts.poll_interval_ms;
+    let max_backoff = MAX_BACKOFF_MS.max(opts.poll_interval_ms * 4);
+
     loop {
         if cancelled() {
             let _ = fs::remove_file(&part);
@@ -467,15 +511,23 @@ pub fn run_with<A: VideoApi>(api: &A, opts: &VideoOptions, out: &mut dyn Write) 
             }
         };
 
-        match classify_poll(res.status, res.body.as_ref(), &res.raw) {
+        let sleep_ms = match classify_poll(res.status, res.body.as_ref(), &res.raw) {
             Classification::Failed(msg) => {
                 let _ = fs::remove_file(&part);
                 let _ = writeln!(out, "❌ Job {request_id} failed: {msg}");
+                let lower = msg.to_ascii_lowercase();
+                if lower.contains("quota") || lower.contains("rate limit") || lower.contains("credits") {
+                    let _ = writeln!(out, "   xAI quota or rate limit exceeded.");
+                }
                 return 1;
             }
             Classification::HardError(raw) => {
                 let _ = fs::remove_file(&part);
                 let _ = writeln!(out, "❌ Polling failed (HTTP {}): {raw}", res.status);
+                let lower = raw.to_ascii_lowercase();
+                if res.status == 429 || lower.contains("quota") || lower.contains("rate limit") {
+                    let _ = writeln!(out, "   xAI quota or rate limit reached. Please check your credits or tier.");
+                }
                 return 1;
             }
             Classification::Done => {
@@ -484,6 +536,8 @@ pub fn run_with<A: VideoApi>(api: &A, opts: &VideoOptions, out: &mut dyn Write) 
                 return finish_download(api, &body, &opts.output, &part, out);
             }
             Classification::Pending(status, progress) => {
+                // Successful poll resets retry backoff
+                backoff_ms = opts.poll_interval_ms;
                 let line = match progress {
                     Some(p) => format!("⏳ {} {}%", if status.is_empty() { "pending" } else { &status }, p),
                     None => format!("⏳ {}", if status.is_empty() { "pending" } else { &status }),
@@ -492,11 +546,21 @@ pub fn run_with<A: VideoApi>(api: &A, opts: &VideoOptions, out: &mut dyn Write) 
                     last_line = line.clone();
                     write_progress(out, &line);
                 }
+                opts.poll_interval_ms
             }
-            Classification::Retry => {}
-        }
+            Classification::Retry => {
+                let wait = if let Some(sec) = res.retry_after_sec {
+                    (sec * 1000).max(opts.poll_interval_ms)
+                } else {
+                    let current = backoff_ms;
+                    backoff_ms = (backoff_ms * 2).min(max_backoff);
+                    current
+                };
+                wait
+            }
+        };
 
-        sleep_interruptible(opts.poll_interval_ms);
+        sleep_interruptible(sleep_ms);
     }
 }
 
@@ -531,7 +595,6 @@ fn finish_download<A: VideoApi>(api: &A, body: &Value, output: &str, part: &str,
 }
 
 fn report_create_failure(status: u16, body: Option<&Value>, raw: &str, out: &mut dyn Write) {
-    // `body?.error?.message || body?.error || raw || HTTP status`
     let from_error = body.and_then(|b| b.get("error")).and_then(|e| match e {
         Value::String(s) if !s.is_empty() => Some(s.clone()),
         Value::Object(_) => e
@@ -551,8 +614,11 @@ fn report_create_failure(status: u16, body: Option<&Value>, raw: &str, out: &mut
     let clean = sanitize_text(&detail);
     let trimmed: String = clean.chars().take(500).collect();
     let _ = writeln!(out, "❌ Create failed: {trimmed}");
-    if status == 400 && detail.to_ascii_lowercase().contains("no credentials") {
+    let lower = detail.to_ascii_lowercase();
+    if status == 400 && lower.contains("no credentials") {
         let _ = writeln!(out, "   Connect an xAI account first: dashboard → Providers → xAI (Grok).");
+    } else if status == 429 || lower.contains("quota") || lower.contains("rate limit") || lower.contains("insufficient") {
+        let _ = writeln!(out, "   xAI quota or rate limit reached. Please check your credits or tier.");
     }
 }
 
@@ -704,11 +770,9 @@ mod tests {
 
     #[test]
     fn classify_covers_terminal_pending_and_transient_states() {
-        // done / completed end the job
         for s in ["done", "completed", "DONE"] {
             assert_eq!(classify_poll(200, Some(&json!({"status": s})), ""), Classification::Done);
         }
-        // failures surface the provider message
         match classify_poll(200, Some(&json!({"status": "failed", "error": {"message": "nope"}})), "") {
             Classification::Failed(m) => assert_eq!(m, "nope"),
             other => panic!("expected Failed, got {other:?}"),
@@ -717,7 +781,6 @@ mod tests {
             Classification::Failed(m) => assert_eq!(m, "video generation failed"),
             other => panic!("expected Failed, got {other:?}"),
         }
-        // running jobs report progress
         assert_eq!(
             classify_poll(200, Some(&json!({"status": "running", "progress": 40})), ""),
             Classification::Pending("running".into(), Some(40.0))
@@ -726,7 +789,6 @@ mod tests {
             classify_poll(200, Some(&json!({})), ""),
             Classification::Pending(String::new(), None)
         );
-        // 429/503 are retried, other 4xx are fatal
         assert_eq!(classify_poll(429, None, "slow down"), Classification::Retry);
         assert_eq!(classify_poll(503, None, "unavailable"), Classification::Retry);
         assert_eq!(
@@ -737,11 +799,16 @@ mod tests {
     }
 
     #[test]
-    fn video_url_prefers_url_then_file_output() {
+    fn video_url_prefers_url_then_file_output_and_data_array() {
         assert_eq!(video_url(&json!({"video": {"url": "https://v/1.mp4"}})).as_deref(), Some("https://v/1.mp4"));
         assert_eq!(
             video_url(&json!({"video": {"file_output": {"public_url": "https://v/2.mp4"}}})).as_deref(),
             Some("https://v/2.mp4")
+        );
+        assert_eq!(video_url(&json!({"url": "https://v/3.mp4"})).as_deref(), Some("https://v/3.mp4"));
+        assert_eq!(
+            video_url(&json!({"data": [{"url": "https://v/4.mp4"}]})).as_deref(),
+            Some("https://v/4.mp4")
         );
         assert!(video_url(&json!({"video": {"url": ""}})).is_none());
         assert!(video_url(&json!({})).is_none());
@@ -796,7 +863,11 @@ mod tests {
         }
         fn download(&self, url: &str, dest: &Path) -> Result<(), String> {
             *self.downloaded.borrow_mut() = Some((url.to_string(), dest.to_path_buf()));
-            self.download.borrow().clone().unwrap_or(Ok(()))
+            let res = self.download.borrow().clone().unwrap_or(Ok(()));
+            if res.is_ok() {
+                let _ = fs::write(dest, b"video-content");
+            }
+            res
         }
     }
 
@@ -814,13 +885,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("out.mp4");
         let api = FakeApi::new(vec![
-            PollResponse { status: 200, body: Some(json!({"status": "queued"})), raw: String::new() },
-            PollResponse { status: 200, body: Some(json!({"status": "running", "progress": 50})), raw: String::new() },
-            PollResponse {
-                status: 200,
-                body: Some(json!({"status": "done", "video": {"url": "https://cdn/v.mp4"}})),
-                raw: String::new(),
-            },
+            PollResponse::new(200, Some(json!({"status": "queued"})), String::new()),
+            PollResponse::new(200, Some(json!({"status": "running", "progress": 50})), String::new()),
+            PollResponse::new(
+                200,
+                Some(json!({"status": "done", "video": {"url": "https://cdn/v.mp4"}})),
+                String::new(),
+            ),
         ]);
         let mut buf = Vec::new();
         let code = run_with(&api, &opts(output.to_str().unwrap(), 1), &mut buf);
@@ -829,6 +900,7 @@ mod tests {
         assert!(text.contains("📋 Job accepted: req 1"), "{text}");
         assert!(text.contains("⬇️  Downloading…"));
         assert!(text.contains("✅ Saved"));
+        assert!(output.exists());
 
         let polls = api.polls.borrow();
         assert_eq!(polls.len(), 3);
@@ -841,17 +913,49 @@ mod tests {
     }
 
     #[test]
+    fn polling_with_retry_and_backoff_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("retry_out.mp4");
+        let api = FakeApi::new(vec![
+            PollResponse::with_retry_after(429, None, "Too Many Requests".into(), Some(1)),
+            PollResponse::new(503, None, "Service Unavailable".into()),
+            PollResponse::new(200, Some(json!({"status": "done", "url": "https://cdn/final.mp4"})), String::new()),
+        ]);
+        let mut buf = Vec::new();
+        let code = run_with(&api, &opts(output.to_str().unwrap(), 5), &mut buf);
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&buf));
+        assert!(output.exists());
+        assert_eq!(api.polls.borrow().len(), 3);
+    }
+
+    #[test]
     fn failed_job_reports_and_exits_nonzero() {
-        let api = FakeApi::new(vec![PollResponse {
-            status: 200,
-            body: Some(json!({"status": "failed", "error": "moderation"})),
-            raw: String::new(),
-        }]);
+        let api = FakeApi::new(vec![PollResponse::new(
+            200,
+            Some(json!({"status": "failed", "error": "moderation"})),
+            String::new(),
+        )]);
         let mut buf = Vec::new();
         assert_eq!(run_with(&api, &opts("unused.mp4", 1), &mut buf), 1);
         let text = String::from_utf8_lossy(&buf);
         assert!(text.contains("Job req 1 failed: moderation"), "{text}");
         assert!(api.downloaded.borrow().is_none());
+    }
+
+    #[test]
+    fn quota_error_during_creation_shows_quota_hint() {
+        let mut api = FakeApi::new(vec![]);
+        api.create = CreateResponse {
+            status: 429,
+            body: Some(json!({"error": {"message": "insufficient_quota: please upgrade your tier"}})),
+            raw: String::new(),
+            connection_id: None,
+        };
+        let mut buf = Vec::new();
+        assert_eq!(run_with(&api, &opts("x.mp4", 1), &mut buf), 1);
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("Create failed: insufficient_quota"), "{text}");
+        assert!(text.contains("xAI quota or rate limit reached"), "{text}");
     }
 
     #[test]
@@ -883,11 +987,11 @@ mod tests {
                 })
             }
             fn poll(&self, _: &str, _: Option<&str>) -> Result<PollResponse, String> {
-                Ok(PollResponse {
-                    status: 200,
-                    body: Some(json!({"status": "done", "video": {"url": "https://cdn/v.mp4"}})),
-                    raw: String::new(),
-                })
+                Ok(PollResponse::new(
+                    200,
+                    Some(json!({"status": "done", "video": {"url": "https://cdn/v.mp4"}})),
+                    String::new(),
+                ))
             }
             fn download(&self, _: &str, dest: &Path) -> Result<(), String> {
                 fs::write(dest, b"partial").unwrap();
@@ -906,11 +1010,11 @@ mod tests {
 
     #[test]
     fn done_without_a_video_url_is_an_error() {
-        let api = FakeApi::new(vec![PollResponse {
-            status: 200,
-            body: Some(json!({"status": "completed"})),
-            raw: String::new(),
-        }]);
+        let api = FakeApi::new(vec![PollResponse::new(
+            200,
+            Some(json!({"status": "completed"})),
+            String::new(),
+        )]);
         let mut buf = Vec::new();
         assert_eq!(run_with(&api, &opts("x.mp4", 1), &mut buf), 1);
         assert!(String::from_utf8_lossy(&buf).contains("no video URL was returned"));
@@ -920,5 +1024,194 @@ mod tests {
     fn gateway_url_matches_the_js_origin() {
         assert_eq!(gateway_url("127.0.0.1", 20128), "http://127.0.0.1:20128");
         assert_eq!(gateway_url("localhost", 3000), "http://localhost:3000");
+        assert_eq!(gateway_url("https://api.x.ai", 443), "https://api.x.ai");
+        assert_eq!(gateway_url("api.x.ai", 443), "https://api.x.ai");
+    }
+
+    // ── Mock integration tests with local socket ────────────────────────────
+
+    const FAKE_MP4: &[u8] = b"FAKE-MP4-STREAM-DATA-TEST";
+
+    fn start_test_server<F>(handler: F) -> (u16, std::sync::Arc<AtomicBool>, std::thread::JoinHandle<()>)
+    where
+        F: Fn(&str, &str, &[u8]) -> (u16, Vec<(&'static str, String)>, Vec<u8>) + Send + Sync + 'static,
+    {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("port").port();
+        let handler = std::sync::Arc::new(handler);
+        let running = std::sync::Arc::new(AtomicBool::new(true));
+        let running_clone = running.clone();
+
+        let handle = std::thread::spawn(move || {
+            listener.set_nonblocking(true).expect("set nonblocking");
+            while running_clone.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 4096];
+                        let n = match stream.read(&mut buf) {
+                            Ok(n) if n > 0 => n,
+                            _ => continue,
+                        };
+                        let req_str = String::from_utf8_lossy(&buf[..n]);
+                        let mut lines = req_str.lines();
+                        let req_line = lines.next().unwrap_or("");
+                        let parts: Vec<&str> = req_line.split_whitespace().collect();
+                        let method = parts.first().copied().unwrap_or("GET");
+                        let uri = parts.get(1).copied().unwrap_or("/");
+
+                        let body_offset = req_str
+                            .find("\r\n\r\n")
+                            .map(|idx| idx + 4)
+                            .or_else(|| req_str.find("\n\n").map(|idx| idx + 2))
+                            .unwrap_or(n);
+                        let body = &buf[body_offset.min(n)..n];
+
+                        let (status, headers, resp_body) = handler(method, uri, body);
+                        let status_text = match status {
+                            200 => "200 OK",
+                            400 => "400 Bad Request",
+                            429 => "429 Too Many Requests",
+                            404 => "404 Not Found",
+                            503 => "503 Service Unavailable",
+                            _ => "500 Internal Server Error",
+                        };
+
+                        let mut resp = format!(
+                            "HTTP/1.1 {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                            resp_body.len()
+                        );
+                        for (k, v) in headers {
+                            resp.push_str(&format!("{k}: {v}\r\n"));
+                        }
+                        resp.push_str("\r\n");
+
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.write_all(&resp_body);
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (port, running, handle)
+    }
+
+    #[test]
+    fn mock_integration_end_to_end_flow() {
+        let poll_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let poll_count_c = poll_count.clone();
+        let port_holder = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let port_holder_c = port_holder.clone();
+
+        let (port, running, handle) = start_test_server(move |method, uri, body| match (method, uri) {
+            ("POST", "/v1/videos/generations") => {
+                let parsed: Value = serde_json::from_slice(body).unwrap_or(json!({}));
+                assert_eq!(parsed["prompt"], "a neon cat");
+                (
+                    200,
+                    vec![
+                        ("Content-Type", "application/json".into()),
+                        ("x-9router-connection-id", "conn-wire-42".into()),
+                    ],
+                    serde_json::to_vec(&json!({ "request_id": "job-wire-1" })).unwrap(),
+                )
+            }
+            ("GET", "/v1/videos/job-wire-1") => {
+                let c = poll_count_c.fetch_add(1, Ordering::SeqCst);
+                if c < 2 {
+                    (
+                        200,
+                        vec![("Content-Type", "application/json".into())],
+                        serde_json::to_vec(&json!({ "status": "running", "progress": (c + 1) * 45 })).unwrap(),
+                    )
+                } else {
+                    let p = port_holder_c.load(Ordering::SeqCst);
+                    let dl = format!("http://127.0.0.1:{p}/files/video.mp4");
+                    (
+                        200,
+                        vec![("Content-Type", "application/json".into())],
+                        serde_json::to_vec(&json!({
+                            "status": "done",
+                            "video": { "url": dl }
+                        }))
+                        .unwrap(),
+                    )
+                }
+            }
+            ("GET", "/files/video.mp4") => (
+                200,
+                vec![("Content-Type", "video/mp4".into())],
+                FAKE_MP4.to_vec(),
+            ),
+            _ => (404, vec![], b"Not Found".to_vec()),
+        });
+        port_holder.store(port, Ordering::SeqCst);
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_file = dir.path().join("wire_output.mp4");
+
+        let opts = VideoOptions {
+            prompt: Some("a neon cat".into()),
+            output: out_file.to_str().unwrap().into(),
+            host: "127.0.0.1".into(),
+            port,
+            timeout_sec: 10,
+            poll_interval_ms: 10,
+            ..VideoOptions::default()
+        };
+
+        let api = HttpApi::new(&opts.host, opts.port, None).unwrap();
+        let mut log_buf = Vec::new();
+        let code = run_with(&api, &opts, &mut log_buf);
+        running.store(false, Ordering::SeqCst);
+        let _ = handle.join();
+
+        let logs = String::from_utf8_lossy(&log_buf);
+        assert_eq!(code, 0, "logs: {logs}");
+        assert!(out_file.exists());
+        assert_eq!(fs::read(&out_file).unwrap(), FAKE_MP4);
+        assert!(!Path::new(&part_path(out_file.to_str().unwrap())).exists());
+    }
+
+    #[test]
+    fn mock_integration_bad_prompt_error() {
+        let (port, running, handle) = start_test_server(|method, uri, _| match (method, uri) {
+            ("POST", "/v1/videos/generations") => (
+                400,
+                vec![("Content-Type", "application/json".into())],
+                serde_json::to_vec(&json!({
+                    "error": { "message": "invalid_argument: prompt violates policy" }
+                }))
+                .unwrap(),
+            ),
+            _ => (404, vec![], b"".to_vec()),
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let out_file = dir.path().join("bad_prompt.mp4");
+
+        let opts = VideoOptions {
+            prompt: Some("forbidden content".into()),
+            output: out_file.to_str().unwrap().into(),
+            host: "127.0.0.1".into(),
+            port,
+            ..VideoOptions::default()
+        };
+
+        let api = HttpApi::new(&opts.host, opts.port, None).unwrap();
+        let mut log_buf = Vec::new();
+        let code = run_with(&api, &opts, &mut log_buf);
+        running.store(false, Ordering::SeqCst);
+        let _ = handle.join();
+
+        let logs = String::from_utf8_lossy(&log_buf);
+        assert_eq!(code, 1);
+        assert!(logs.contains("invalid_argument: prompt violates policy"), "{logs}");
+        assert!(!out_file.exists());
     }
 }

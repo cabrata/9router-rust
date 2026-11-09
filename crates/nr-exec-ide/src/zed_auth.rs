@@ -264,10 +264,15 @@ pub async fn fetch_zed_authenticated_user(
         .await
         .map_err(|e| Error::other(format!("Failed to fetch Zed user info: {}", e)))?;
 
+    let status = response.status();
     let text = response
         .text()
         .await
         .map_err(|e| Error::other(format!("Failed to read Zed user info response: {}", e)))?;
+
+    if !status.is_success() {
+        return Err(Error::other(format!("Zed API returned {}: {}", status, text)));
+    }
 
     serde_json::from_str(&text)
         .map_err(|e| Error::other(format!("Failed to parse Zed user info: {}", e)))

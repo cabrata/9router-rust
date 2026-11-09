@@ -228,9 +228,9 @@ pub const APIKEY_PROVIDERS: &[ProviderEntry] = &[
 /// Providers using the device-code flow in the JS (`DEVICE_CODE_PROVIDERS`).
 pub const DEVICE_CODE_PROVIDERS: &[&str] = &["github", "qwen", "kiro", "glm"];
 
-/// `ALL_PROVIDERS` lookup by id (OAuth table first, then API key table).
+/// `ALL_PROVIDERS` lookup by id or alias (OAuth table first, then API key table).
 pub fn provider_by_id(id: &str) -> Option<&'static ProviderEntry> {
-    OAUTH_PROVIDERS.iter().chain(APIKEY_PROVIDERS.iter()).find(|p| p.id == id)
+    OAUTH_PROVIDERS.iter().chain(APIKEY_PROVIDERS.iter()).find(|p| p.id == id || p.alias == id)
 }
 
 /// Static per-provider model ids, ported from the JS `PROVIDER_MODELS` table.
@@ -868,7 +868,7 @@ mod tests {
         let keys = vec![json!({"id": "k1", "name": "laptop", "key": "sk-1234567890abcd"})];
         let rows = api_key_rows(&keys);
         assert_eq!(rows[0].label, "Create New API Key");
-        assert_eq!(rows[1].label, "laptop (sk-1**********abcd)");
+        assert_eq!(rows[1].label, "laptop (sk-1*********abcd)");
         assert_eq!(rows[1].step, Step::Act(Action::ViewApiKey("k1".into())));
         // The label must never leak the full key.
         assert!(!rows[1].label.contains("1234567890"));
