@@ -64,7 +64,7 @@ Support modules confirmed present with real logic (not stubs):
 | `open-sse/services/{copilotModels,cursorModels,grokCliModels,kiroModels,qoderModels,clinepassModels}.js` | `nr-exec-{simple,binary,ide,cli}` model modules |
 | `open-sse/services/{provider,model}.js` | `nr-common/src/{provider,model}.rs` |
 | `open-sse/providers/{capabilities,catalogOverride,pricing,visionPatterns,thinkingLevels}` | `nr-data/src/*` |
-| `src/lib/db/**` (repos, migrations, adapters) | `nr-db/src/**` |
+| `src/lib/db/**` (repos, migrations, backup, adapters) | `nr-db/src/**` |
 | `src/lib/oauth/providers/*.js` (30 providers) | `nr-oauth/src/flows/providers/*` |
 | `src/lib/qoder/*` | `nr-exec-ide/src/qoder/*` |
 | `src/mitm/**` | `nr-server/src/mitm/**` |
@@ -85,16 +85,16 @@ Present but with a known behavioural gap.
 | `open-sse/services/projectId.js` | *absent* | Antigravity/project-id cache (fetch/invalidate/TTL cleanup) not ported. |
 | `open-sse/services/usage.js` | *absent* | `getUsageForProvider` per-provider usage probe. |
 | `open-sse/services/compact.js` | *absent* | `getComboModelsFromData` / `handleComboChat` compaction variant. |
-| `src/lib/consoleLogBuffer.js` | *absent* | In-process log ring buffer + SSE fan-out. |
-| `src/lib/headroom/{detect,process}.js` | *absent* | Detection, managed proxy spawn/stop, extras install. |
-| `src/lib/pxpipe/{service,loader,install,events}.js` | *absent* | Library-mode token-saver, install log, event stats. |
-| `src/lib/tunnel/**` (16 files, 1836 lines) | *absent* | Cloudflare quick tunnel + Tailscale funnel managers, health/dns probes, state. |
-| `src/lib/mcp/stdioSseBridge.js` | *absent* | stdio↔SSE MCP bridge, smart text filter. |
+| `src/lib/consoleLogBuffer.js` | `nr-server/src/console_log_buffer.rs` | Ported: ring buffer (maxLines 200, 100 ms batch flush, ANSI strip) + broadcast fan-out, surfaced by `routes/translator.rs`. |
+| `src/lib/headroom/{detect,process}.js` | `nr-server/src/routes/headroom.rs` | Management surface ported; the managed proxy is spawned as a child process rather than an in-process module. |
+| `src/lib/pxpipe/{service,loader,install,events}.js` | `nr-server/src/routes/pxpipe.rs` | Management surface + on-disk layout ported; the module runs via `node` (library mode), see the `shortcut:` note in that file. |
+| `src/lib/tunnel/**` (16 files, 1836 lines) | `nr-server/src/routes/tunnel.rs` | Status/enable/disable routes and both managers ported. |
+| `src/lib/mcp/stdioSseBridge.js` | `nr-server/src/routes/mcp.rs` | stdio↔SSE bridge + text filter ported. |
 | `src/lib/appUpdater.js`, `src/lib/updater/updater.js` | `nr-server/src/routes/api/version.rs` | Version route exists; updater download/verify/restart flow does not. |
-| `src/lib/auth/{dashboardSession,loginLimiter,trustedPeer}.js` | *absent* | Session cookie helper, login rate limiter, trusted-proxy peer check. |
-| `src/lib/modelCatalog/sync.js` | `nr-server/src/routes/api/models.rs` (route only) | Catalog refresh/merge engine not ported. |
-| `src/lib/network/{connectionProxy,outboundProxy,netlifyRelay,proxyTest}.js` | `nr-core/src/http.rs`, `settings.rs` (partial) | `connectionProxy`/`outboundProxy` echoed in settings, but outbound-proxy resolution and Netlify relay are not implemented. |
-| `src/lib/providerNormalization.js`, `src/lib/providerConnectionResponse.js` | `nr-server/src/routes/api/providers.rs` | `to_provider_connection_response` covers redaction; normalisation helpers not separately ported. |
+| `src/lib/auth/{dashboardSession,loginLimiter,trustedPeer}.js` | `nr-server/src/routes/auth.rs` | Ported: JWT cookie (`auth_token`, HS256, 24 h), progressive login lockout (5 fails → 30 s/2 m/10 m/30 m), `x-9r-peer-token` + `x-9r-real-ip` trust check, `TRUST_PROXY` XFF handling. |
+| `src/lib/modelCatalog/sync.js` | `nr-server/src/routes/api/models.rs` (route only) | Catalog refresh/merge engine not ported: `POST /api/models/catalog-sync` currently reports `{models: 0, providers: 0}` without fetching models.dev. |
+| `src/lib/network/{connectionProxy,outboundProxy,netlifyRelay,proxyTest}.js` | `nr-core/src/http.rs`, `settings.rs` (partial) | `connectionProxy`/`outboundProxy` echoed in settings; `proxy_fetch` reads `HTTP(S)_PROXY`/`ALL_PROXY`/`NO_PROXY`. `applyOutboundProxyEnv` (settings → env, `NINE_ROUTER_PROXY_MANAGED` bookkeeping) and the Netlify relay are not implemented. |
+| `src/lib/providerNormalization.js`, `src/lib/providerConnectionResponse.js` | `nr-server/src/routes/api/providers.rs` | Ported: `to_provider_connection_response` (secret strip + `sessionToken` drop for every `credentialForm: "aws"` provider, read from the data dump), `normalize_provider_id` + `provider_slug` matching the JS regexes, and the `ollama-local` `baseUrl`/`baseURL`/`ollamaHostUrl` fallback. |
 | `src/lib/comboPresets.js` | `nr-server/src/routes/api/combos.rs` | Presets endpoint present; preset table provenance unclear (verify against JS on changes). |
 | `src/lib/mimoLoginSession.js`, `src/lib/oauth/perchPlan.js`, `src/lib/oauth/kiroExternalIdp.js` | `nr-oauth` (partial) | Provider flows exist; the session/plan helper surfaces behind the OAuth sub-routes do not. |
 | `cli/src/cli/commands/xaiVideo.js` | `nr-cli/src/cli_commands.rs:761` | Argument parsing ported; request/poll/download marked "unchanged stub". |
@@ -172,3 +172,40 @@ another agent). Request-shape validation is ported and returns `400` first.
 `translator/translate` and `translator/send` are that same agent's, appended to
 `translator.rs`.
 
+## `src/lib` inventory (2026-11-09 pass)
+
+Every `src/lib/*.js` module, with the decision taken for the API-only Rust port.
+
+### Ported
+
+| JS | Rust |
+|---|---|
+| `db/schema.js` | `nr-db/src/schema.rs` (same `TABLES`, same PRAGMAs, `SCHEMA_VERSION = 3`) |
+| `db/migrate.js` | `nr-db/src/migrate.rs` (versioned chain, pre-schema backup, additive sync, legacy JSON import, `.migrated-from-json` marker, `MigrationAborted` rollback) |
+| `db/backup.js` | `nr-db/src/backup.rs` |
+| `db/repos/*.js` (12) | `nr-db/src/repos/*.rs` |
+| `db/helpers/{jsonCol,kvStore,metaStore,nullBytes}.js` | `nr-db/src/helpers.rs`, `repos/aliases.rs`, `migrate.rs` |
+| `db/index.js` `exportDb`/`importDb` | `nr-server/src/routes/api/settings.rs` (`/api/settings/database`) |
+| `db/paths.js`, `dataDir.js` | `nr-core/src/paths.rs` |
+| `localDb.js` / `usageDb.js` / `requestDetailsDb.js` / `disabledModelsDb.js` | re-export shims → `nr-db` |
+| `requestLog.js` | `nr-server/src/request_log.rs` |
+| `auth/dashboardSession.js` `auth/loginLimiter.js` `auth/trustedPeer.js` | `nr-server/src/routes/auth.rs` |
+| `consoleLogBuffer.js` | `nr-server/src/console_log_buffer.rs` |
+| `providerNormalization.js` `providerConnectionResponse.js` | `nr-server/src/routes/api/providers.rs` |
+| `comboPresets.js` | `nr-server/src/routes/api/combos.rs` |
+| `ttsVoices.js` | `nr-server/src/routes/api/media_providers.rs` |
+| `mitmAliasCache.js` | `nr-server/src/mitm/db_reader.rs` (reads SQLite directly: Rust runs in-process, so the JSON replica is unnecessary) |
+| `headroom/**`, `pxpipe/**`, `tunnel/**`, `mcp/stdioSseBridge.js` | `nr-server/src/routes/{headroom,pxpipe,tunnel,mcp}.rs` |
+
+### Not ported, deliberately
+
+| JS | Why |
+|---|---|
+| `src/store/{theme,notification,headerSearch,provider,settings,user}Store.js` | Pure browser state (`zustand` stores: which theme is selected, which sidebar filter is typed, toast queue). **No HTTP route reads them** — they are `"use client"` modules driving React components. The server-side equivalents that *do* matter live in `settings` (`nr-server` `/api/settings`): `requireLogin`, `requireApiKey`, `tunnelDashboardAccess`, etc. Porting them would add dead client state to a server crate. |
+| `appUpdater.js`, `updater/updater.js` | Desktop-binary self-update (download, checksum, replace, restart). The Rust binary is distributed by cargo/`9router update`; `POST /api/version/update` keeps the JS-shaped response. |
+| `mimoLoginSession.js` | Interactive browser login session for one provider's OAuth panel; the Rust OAuth flow for xiaomi-mimo covers credentials, and the login routes report `not_ported` rather than pretending to work. |
+| `modelCatalog/sync.js` | models.dev fetch/merge; the route reports empty results instead of stale data. |
+| `network/outboundProxy.js`, `network/netlifyRelay.js` | Process-wide proxy env management; `proxy_fetch` already honours proxy env per request, so settings-driven env rewriting has no consumer yet. |
+| `grokBuildConfig.js` | CLI tool config writer; `nr-server/src/routes/cli_tools.rs` owns that surface. |
+
+Scripts (`src/app/api/**/route.js`) are covered separately in the route table above.
