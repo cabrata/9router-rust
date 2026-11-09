@@ -343,12 +343,28 @@ pub fn to_arguments_string(value: Option<&Json>) -> String {
 // ── Generic webTools.js DSML Normalization & Tool Prompts ────────────────────
 
 lazy_static::lazy_static! {
+    // JS: /<(｜｜DSML｜｜|\|DSML\|)\s*invoke\s+name=["']([^"']+)["']\s*>([\s\S]*?)<\/\k<dsml>\s*invoke\s*>/g
+    // requires the SAME delimiter on both tags via a named backreference, which
+    // the `regex` crate does not support. Enumerate the two disjoint delimiter
+    // branches instead; the opening tags cannot be confused, so leftmost-match
+    // semantics are identical. Branch 1 captures name/body in groups 1/2,
+    // branch 2 in groups 3/4.
     static ref DSML_INVOKE_RE: Regex = Regex::new(
-        r#"(?i)<(｜｜DSML｜｜|\|DSML\|)\s*invoke\s+name=["']([^"']+)["']\s*>([\s\S]*?)</(?:\1)\s*invoke\s*>"#
+        concat!(
+            r#"<｜｜DSML｜｜\s*invoke\s+name=["']([^"']+)["']\s*>([\s\S]*?)</｜｜DSML｜｜\s*invoke\s*>"#,
+            "|",
+            r#"<\|DSML\|\s*invoke\s+name=["']([^"']+)["']\s*>([\s\S]*?)</\|DSML\|\s*invoke\s*>"#,
+        )
     ).unwrap();
 
     static ref DSML_PARAMETER_RE: Regex = Regex::new(
-        r#"(?i)<(?:｜｜DSML｜｜|\|DSML\|)\s*parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)(?:</?(?:｜｜DSML｜｜|\|DSML\|)\s*parameter\s*>|(?=<(?:｜｜DSML｜｜|\|DSML\|)\s*parameter\s+name=|</(?:｜｜DSML｜｜|\|DSML\|)\s*invoke\s*>))"#
+        // rust `regex` crate rejects look-ahead; absorb the boundary marker
+        // into the match and strip it from the captured body in post.
+        r#"(?i)<(?:｜｜DSML｜｜|\|DSML\|)\s*parameter\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)(?:</?(?:｜｜DSML｜｜|\|DSML\|)\s*parameter\s*>|<(?:｜｜DSML｜｜|\|DSML\|)\s*parameter\s+name=|</(?:｜｜DSML｜｜|\|DSML\|)\s*invoke\s*>)"#
+    ).unwrap();
+
+    static ref DSML_PARAMETER_CLOSE_RE: Regex = Regex::new(
+        r#"(?i)</(?:｜｜DSML｜｜|\|DSML\|)\s*parameter\s*>"#
     ).unwrap();
 
     static ref DSML_CALLS_RE: Regex = Regex::new(
@@ -358,14 +374,22 @@ lazy_static::lazy_static! {
 
 pub fn normalize_dsml_tool_calls(text: &str) -> String {
     let replaced = DSML_INVOKE_RE.replace_all(text, |caps: &regex::Captures| {
-        let name = &caps[2];
-        let body = &caps[3];
+        let (name, body) = match (caps.get(1), caps.get(3)) {
+            (Some(name), _) => (name.as_str(), caps.get(2).map(|m| m.as_str()).unwrap_or("")),
+            (None, Some(name)) => (name.as_str(), caps.get(4).map(|m| m.as_str()).unwrap_or("")),
+            _ => return String::new(),
+        };
         let mut parameters = serde_json::Map::new();
 
         for pcap in DSML_PARAMETER_RE.captures_iter(body) {
             let pname = pcap[1].to_string();
-            let raw = pcap[2].trim();
-            if let Ok(parsed) = serde_json::from_str::<Json>(raw) {
+            // Match tail may contain the closing `</｜｜DSML｜｜>` tag (when the
+            // boundary was the tag itself). Strip it before trimming.
+            let raw = DSML_PARAMETER_CLOSE_RE
+                .replace(&pcap[2], "")
+                .trim()
+                .to_string();
+            if let Ok(parsed) = serde_json::from_str::<Json>(&raw) {
                 parameters.insert(pname, parsed);
             } else {
                 parameters.insert(pname, Json::String(raw.to_string()));
@@ -818,22 +842,36 @@ fn get_xml_child(inner: &str, tag: &str) -> Option<String> {
 }
 
 fn build_args_from_parameters(inner: &str) -> Option<Json> {
-    let param_re = Regex::new(
-        r#"(?is)<parameter\b([^>]*?)/?>(?:((?:(?!<parameter\b)[\s\S])*?)</parameter>)?"#
+    // Port of JS `PARAM_TAG_RE` (deepseekWebTools.js:275). The JS body group is
+    // a tempered greedy token `(?:(?!<parameter\b)[\s\S])*?` so an attribute-only
+    // `<parameter ...>` (no closing tag) cannot let the body matcher swallow a
+    // following `<parameter>...</parameter>` and drop that parameter. Rust
+    // `regex` rejects negative-lookahead, so we drive the loop manually.
+    let open_re = Regex::new(r#"(?is)<parameter\b([^>]*?)/?>"#
+    ).unwrap();
+    let close_re = Regex::new(r#"(?is)</parameter\s*>"#
     ).unwrap();
 
     let mut out = serde_json::Map::new();
     let mut found = false;
 
-    for cap in param_re.captures_iter(inner) {
-        let attrs = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        let body = cap.get(2).map(|m| m.as_str().trim());
+    for open_cap in open_re.captures_iter(inner) {
+        let open_m = open_cap.get(0).unwrap();
+        let attrs = open_cap.get(1).map(|m| m.as_str()).unwrap_or("");
         let name = match get_attr(attrs, "name") {
             Some(n) if !n.is_empty() => n,
             _ => continue,
         };
+        // Body is everything between this open and the next `</parameter>`, but
+        // only if that close appears before any subsequent `<parameter\b` open.
+        let after = &inner[open_m.end()..];
+        let next_open_off = open_re.find(after).map(|m| m.start());
+        let close_match = close_re.find(after).filter(|m| {
+            next_open_off.map_or(true, |no| m.start() < no)
+        });
+        let body = close_match.map(|m| after[..m.start()].trim().to_string());
         let val = get_attr(attrs, "content")
-            .or_else(|| body.map(|s| s.to_string()))
+            .or(body)
             .unwrap_or_default();
         out.insert(name, Json::String(val));
         found = true;
@@ -1432,6 +1470,42 @@ Done."#,
         assert!(has_malformed_deepseek_tool_markup("<｜｜DSML｜｜ invoke name=\"bash\">"));
         assert!(has_malformed_deepseek_tool_markup("<tool name=\"x\">"));
         assert!(!has_malformed_deepseek_tool_markup("Here is the answer to your question."));
+    }
+
+    #[test]
+    fn test_normalize_dsml_requires_matching_delimiters() {
+        // Regression: DSML_INVOKE_RE used a JS backreference (\1), which the
+        // `regex` crate rejects at construction time and which panicked on
+        // first use, poisoning the lazy static for every later caller.
+        let same = "<｜｜DSML｜｜ invoke name=\"bash\"><｜｜DSML｜｜ parameter name=\"command\" string=\"true\">ls</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>";
+        let normalized = normalize_dsml_tool_calls(same);
+        assert!(normalized.contains("<tool>"), "got {normalized}");
+        assert!(normalized.contains("\"name\":\"bash\""));
+        assert!(normalized.contains("\"command\":\"ls\""));
+
+        // Pipe delimiters work too.
+        let piped = "<|DSML| invoke name=\"bash\"><|DSML| parameter name=\"command\">pwd</|DSML| parameter></|DSML| invoke>";
+        let normalized = normalize_dsml_tool_calls(piped);
+        assert!(normalized.contains("\"name\":\"bash\""), "got {normalized}");
+        assert!(normalized.contains("\"command\":\"pwd\""));
+
+        // Mismatched delimiters must NOT pair up.
+        let mixed = "<｜｜DSML｜｜ invoke name=\"bash\"><｜｜DSML｜｜ parameter name=\"command\">ls</｜｜DSML｜｜ parameter></|DSML| invoke>";
+        assert!(!normalize_dsml_tool_calls(mixed).contains("<tool>"));
+    }
+
+    #[test]
+    fn test_parse_tool_calls_from_text_strips_block() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "weather", "parameters": {"type": "object"}}
+        })];
+        let (content, calls) =
+            parse_tool_calls_from_text("before <tool>{\"name\":\"weather\",\"arguments\":{\"city\":\"Oslo\"}}</tool> after", "cgpt", &tools);
+        let calls = calls.expect("calls");
+        assert_eq!(calls[0].function.name, "weather");
+        assert_eq!(calls[0].id, "cgpt_0");
+        assert_eq!(content, "before  after");
     }
 
     #[test]

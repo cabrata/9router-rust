@@ -22,7 +22,9 @@
 //!   - TODO: Implement DSML parsing and serialization, tool call formatting
 
 pub mod attachments;
+pub mod chat_http;
 pub mod chatgpt_web;
+pub mod chatgpt_web_tools;
 pub mod deepseek_web;
 pub mod deepseek_utils;
 pub mod delta_v1;
