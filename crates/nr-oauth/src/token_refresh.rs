@@ -5,6 +5,7 @@
 //! fields (`accessToken`, `refreshToken`, `expiresIn`/`expiresAt`, …) or `null`.
 
 use chrono::Utc;
+use base64::Engine;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use parking_lot::RwLock;
 use serde::{Serialize};
@@ -540,7 +541,7 @@ pub async fn refresh_cline_token(refresh_token: &str, log: &Logger) -> Option<Js
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<JsonMap>().await {
                     Ok(body) => {
-                        let tokens = body.get("data").cloned().unwrap_or(body.clone());
+                        let tokens = body.get("data").cloned().unwrap_or(Json::Object(body.clone()));
                         let access_token = tokens.get("accessToken")?.as_str()?.to_string();
 
                         let expires_in = tokens.get("expiresAt")
@@ -690,9 +691,10 @@ pub async fn refresh_codex_token(refresh_token: &str, log: &Logger) -> Option<Js
                 }
             }
             Ok(resp) => {
+                let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 // Check for permanent errors
-                if resp.status() == 400 {
+                if status.as_u16() == 400 {
                     if text.contains("invalid_grant") || text.contains("refresh_token_expired") {
                         log.error("TOKEN_REFRESH", "Codex refresh token already used or invalid. Re-auth required.");
                         let mut result = JsonMap::new();
@@ -722,7 +724,7 @@ pub async fn refresh_iflow_token(refresh_token: &str, log: &Logger) -> Option<Js
         let client_secret = ""; // iFlow secret if needed
 
         // Build Basic Auth header
-        let basic_auth = base64::encode(format!("{}:{}", client_id, client_secret));
+        let basic_auth = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", client_id, client_secret));
 
         let client = reqwest::Client::new();
         match client
@@ -853,7 +855,7 @@ pub async fn refresh_trae_token(refresh_token: &str, _credentials: &Credentials,
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<JsonMap>().await {
                     Ok(payload) => {
-                        let result_obj = payload.get("Result").or_else(|| payload.get("result")).cloned().unwrap_or(payload.clone());
+                        let result_obj = payload.get("Result").or_else(|| payload.get("result")).cloned().unwrap_or(Json::Object(payload.clone()));
                         let access_token = result_obj.get("AccessToken")
                             .or_else(|| result_obj.get("accessToken"))
                             .and_then(|v| v.as_str())?
@@ -1425,7 +1427,7 @@ pub fn format_provider_credentials(provider: &str, creds: &Credentials, _log: &L
     // Provider-specific fields
     match provider {
         "gemini" => {
-            if let Some(pid) = creds.project_id() {
+            if let Some(pid) = creds.str("projectId") {
                 result.insert("projectId".to_string(), json!(pid));
             }
         }
@@ -1433,7 +1435,7 @@ pub fn format_provider_credentials(provider: &str, creds: &Credentials, _log: &L
             // apiKey and accessToken only
         }
         "vertex" | "vertex-partner" => {
-            if let Some(pid) = creds.project_id() {
+            if let Some(pid) = creds.str("projectId") {
                 result.insert("projectId".to_string(), json!(pid));
             }
         }

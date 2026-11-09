@@ -1,11 +1,13 @@
 //! iFlow OAuth provider - authorization_code flow
 
+use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json, json::str_of};
 use serde_json::json;
 
 pub struct IFlowProvider;
 
+#[async_trait]
 impl OAuthProvider for IFlowProvider {
     fn config_id(&self) -> &'static str { "iflow" }
     fn flow_type(&self) -> &'static str { "authorization_code" }
@@ -32,7 +34,7 @@ impl OAuthProvider for IFlowProvider {
             ("redirect_uri", redirect_uri),
             ("scope", scopes),
             ("state", state),
-        ])?;
+        ]).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         Ok(Some(format!("{}?{}", authorize_url, params)))
     }
@@ -60,7 +62,7 @@ impl OAuthProvider for IFlowProvider {
             ("client_secret", client_secret),
             ("code", code),
             ("redirect_uri", redirect_uri),
-        ])?;
+        ]).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         let response = reqwest::Client::new()
             .post(token_url)
@@ -113,6 +115,7 @@ impl OAuthProvider for IFlowProvider {
                 .to_string(),
             refresh_token: str_of(tokens, "refresh_token").map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(Json::as_i64),
+            expires_at: None,
             email: None,
             display_name: None,
             name: None,

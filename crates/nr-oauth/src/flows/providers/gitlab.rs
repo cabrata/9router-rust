@@ -1,11 +1,13 @@
 //! GitLab Duo OAuth provider - authorization_code_pkce flow
 
+use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json, json::str_of};
 use serde_json::json;
 
 pub struct GitLabProvider;
 
+#[async_trait]
 impl OAuthProvider for GitLabProvider {
     fn config_id(&self) -> &'static str { "gitlab" }
     fn flow_type(&self) -> &'static str { "authorization_code_pkce" }
@@ -42,7 +44,7 @@ impl OAuthProvider for GitLabProvider {
             ("state", state),
             ("code_challenge", code_challenge.unwrap_or("")),
             ("code_challenge_method", if code_challenge.is_some() { "S256" } else { "" }),
-        ])?;
+        ]).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         Ok(Some(format!("{}/oauth/authorize?{}", base_url, params)))
     }
@@ -130,6 +132,7 @@ impl OAuthProvider for GitLabProvider {
                 .to_string(),
             refresh_token: str_of(tokens, "refresh_token").map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(Json::as_i64),
+            expires_at: None,
             scope: str_of(tokens, "scope").map(|s| s.to_string()),
             email: None,
             display_name: None,

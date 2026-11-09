@@ -4,6 +4,7 @@
 use async_trait::async_trait;
 use nr_core::{Result, Logger, Json};
 use super::{MappedTokens, DeviceCodeResponse};
+use base64::Engine as _;
 
 // Provider modules (oauth agent port of src/lib/oauth/providers/*.js)
 // Assigned to oauth agent: antigravity, claude, cline, clinepass, codex, gemini-cli,
@@ -259,7 +260,7 @@ pub async fn poll_device_token(
 
 /// Generate PKCE code verifier and challenge (S256).
 fn generate_pkce() -> (String, String) {
-    use sha2::Sha256;
+    use sha2::{Sha256, Digest};
 
     // Generate 32 random bytes and base64-encode (no padding)
     let random: [u8; 32] = rand::random();

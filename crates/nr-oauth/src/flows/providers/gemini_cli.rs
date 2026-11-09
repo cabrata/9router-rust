@@ -1,11 +1,13 @@
 //! Google Gemini CLI OAuth provider - standard OAuth2
 
+use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json, json::str_of};
 use serde_json::json;
 
 pub struct GeminiCliProvider;
 
+#[async_trait]
 impl OAuthProvider for GeminiCliProvider {
     fn config_id(&self) -> &'static str { "gemini-cli" }
     fn flow_type(&self) -> &'static str { "authorization_code_pkce" }
@@ -32,7 +34,7 @@ impl OAuthProvider for GeminiCliProvider {
             ("state", state),
             ("code_challenge", code_challenge.unwrap_or("")),
             ("code_challenge_method", if code_challenge.is_some() { "S256" } else { "" }),
-        ])?;
+        ]).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         Ok(Some(format!("{}?{}", authorize_url, params)))
     }
@@ -117,6 +119,7 @@ impl OAuthProvider for GeminiCliProvider {
                 .to_string(),
             refresh_token: str_of(tokens, "refresh_token").map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(Json::as_i64),
+            expires_at: None,
             id_token: str_of(tokens, "id_token").map(|s| s.to_string()),
             email: None,
             display_name: None,

@@ -204,13 +204,10 @@ fn get_refresh_lock_key(provider: &str, creds: &Credentials) -> String {
         .or_else(|| creds.get("email").and_then(|v| v.as_str()))
         .or_else(|| creds.get("name").and_then(|v| v.as_str()))
         .or_else(|| {
-            creds.refresh_token().map(|rt| {
-                // Use last 16 chars of refresh token as fallback
-                let chars: String = rt.chars().rev().take(16).collect();
-                chars
-            })
+            // Fall back to the refresh token itself as a stable identifier
+            creds.refresh_token()
         })
-        .unwrap_or_else(|| "default".to_string());
+        .unwrap_or_else(|| "default");
 
     format!("{}:{}", provider, stable_id)
 }

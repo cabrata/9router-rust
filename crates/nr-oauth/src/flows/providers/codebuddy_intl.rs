@@ -44,6 +44,7 @@ impl OAuthProvider for CodebuddyIntlProvider {
             verification_uri_complete: None,
             expires_in: 600,
             interval: 2,
+            extra: None,
         })
     }
 
@@ -85,8 +86,12 @@ impl OAuthProvider for CodebuddyIntlProvider {
             refresh_token: tokens.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string()),
             expires_in: Some(expires_in),
             expires_at: None,
+            scope: None,
+            project_id: None,
+            id_token: None,
             email: None,
             display_name: None,
+            name: None,
             provider_specific_data: None,
         })
     }

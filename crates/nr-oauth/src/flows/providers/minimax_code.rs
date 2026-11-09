@@ -1,5 +1,6 @@
 //! MiniMax Code OAuth provider - device_code flow (CN and global variants)
 
+use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json, json::str_of};
 use serde_json::json;
@@ -24,7 +25,7 @@ impl MinimaxCodeVariant {
             ("audience", "agent-backend"),
             ("code_challenge", code_challenge),
             ("code_challenge_method", "S256"),
-        ])?;
+        ]).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         let response = reqwest::Client::new()
             .post(&device_url)
@@ -75,9 +76,10 @@ impl MinimaxCodeVariant {
             device_code: device_code.unwrap_or_else(|| user_code.clone()),
             user_code,
             verification_uri: uri,
+            verification_uri_complete: None,
             expires_in,
             interval,
-            extra,
+            extra: Some(extra),
         })
     }
 
@@ -106,7 +108,7 @@ impl MinimaxCodeVariant {
             fields.push(("code_verifier", &code_verifier_str));
         }
 
-        let params = serde_urlencoded::to_string(&fields)?;
+        let params = serde_urlencoded::to_string(&fields).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         let response = reqwest::Client::new()
             .post(&token_url)
@@ -148,6 +150,7 @@ impl MinimaxCodeVariant {
 
 pub struct MinimaxCnProvider;
 
+#[async_trait]
 impl OAuthProvider for MinimaxCnProvider {
     fn config_id(&self) -> &'static str { "minimax-code" }
     fn flow_type(&self) -> &'static str { "device_code" }
@@ -222,6 +225,7 @@ impl OAuthProvider for MinimaxCnProvider {
                 .to_string(),
             refresh_token: str_of(tokens, "refresh_token").map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(Json::as_i64),
+            expires_at: None,
             email: None,
             display_name: None,
             name: None,
@@ -235,6 +239,7 @@ impl OAuthProvider for MinimaxCnProvider {
 
 pub struct MinimaxGlobalProvider;
 
+#[async_trait]
 impl OAuthProvider for MinimaxGlobalProvider {
     fn config_id(&self) -> &'static str { "minimax-code-global" }
     fn flow_type(&self) -> &'static str { "device_code" }
@@ -309,6 +314,7 @@ impl OAuthProvider for MinimaxGlobalProvider {
                 .to_string(),
             refresh_token: str_of(tokens, "refresh_token").map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(Json::as_i64),
+            expires_at: None,
             email: None,
             display_name: None,
             name: None,

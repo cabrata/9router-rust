@@ -43,6 +43,7 @@ impl OAuthProvider for MuseProvider {
             verification_uri_complete: None,
             expires_in: 600,
             interval: 5,
+            extra: None,
         })
     }
 
@@ -64,7 +65,7 @@ impl OAuthProvider for MuseProvider {
     async fn post_exchange(&self, tokens: &Json, _meta: Option<&Json>, _log: &Logger) -> Result<Option<Json>> {
         // TODO: Mint subscription API key via POST to https://api.meta.ai/muse-code/key
         // Returns: { api_key, user_email, is_subs_active, subs_tier_name }
-        Ok(Some(json!({ "key": None })))
+        Ok(Some(json!({ "key": serde_json::Value::Null })))
     }
 
     fn map_tokens(&self, tokens: &Json, extra: Option<&Json>) -> Result<MappedTokens> {
@@ -90,9 +91,13 @@ impl OAuthProvider for MuseProvider {
             refresh_token: None,
             expires_in: None,
             expires_at: None,
+            scope: None,
+            project_id: None,
+            id_token: None,
             email,
             display_name: None,
             provider_specific_data: None,
+            ..Default::default()
         })
     }
 }

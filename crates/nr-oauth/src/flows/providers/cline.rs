@@ -1,11 +1,13 @@
 //! Cline OAuth provider - authorization_code flow with base64-encoded token
 
+use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json, json::str_of};
 use serde_json::json;
 
 pub struct ClineProvider;
 
+#[async_trait]
 impl OAuthProvider for ClineProvider {
     fn config_id(&self) -> &'static str { "cline" }
     fn flow_type(&self) -> &'static str { "authorization_code" }
@@ -26,7 +28,7 @@ impl OAuthProvider for ClineProvider {
             ("client_type", "extension"),
             ("callback_url", redirect_uri),
             ("redirect_uri", redirect_uri),
-        ])?;
+        ]).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         Ok(Some(format!("{}?{}", authorize_url, params)))
     }
@@ -125,6 +127,7 @@ impl OAuthProvider for ClineProvider {
                 .to_string(),
             refresh_token: str_of(tokens, "refresh_token").map(|s| s.to_string()),
             expires_in,
+            expires_at: None,
             email: str_of(tokens, "email").map(|s| s.to_string()),
             display_name: None,
             name: None,
@@ -142,8 +145,10 @@ fn decode_base64_token(code: &str) -> Result<String> {
     while padded.len() % 4 != 0 {
         padded.push('=');
     }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(&padded)?;
-    Ok(String::from_utf8(bytes)?)
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&padded)
+        .map_err(|e| nr_core::Error::Other(e.to_string()))?;
+    Ok(String::from_utf8(bytes).map_err(|e| nr_core::Error::Other(e.to_string()))?)
 }
 
 pub static PROVIDER: ClineProvider = ClineProvider;

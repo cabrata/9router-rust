@@ -1,5 +1,6 @@
 //! Kimi Coding OAuth provider - device_code flow
 
+use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json, json::str_of};
 use serde_json::json;
@@ -7,6 +8,7 @@ use serde_json::json;
 
 pub struct KimiProvider;
 
+#[async_trait]
 impl OAuthProvider for KimiProvider {
     fn config_id(&self) -> &'static str { "kimi" }
     fn flow_type(&self) -> &'static str { "device_code" }
@@ -52,7 +54,7 @@ impl OAuthProvider for KimiProvider {
         let params = serde_urlencoded::to_string([
             ("client_id", client_id),
             ("scope", scopes),
-        ])?;
+        ]).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         let response = reqwest::Client::new()
             .post(device_url)
@@ -85,9 +87,10 @@ impl OAuthProvider for KimiProvider {
             verification_uri: str_of(&data, "verification_uri")
                 .ok_or_else(|| nr_core::Error::BadRequest("Missing verification_uri".into()))?
                 .to_string(),
+            verification_uri_complete: None,
             expires_in: data.get("expires_in").and_then(Json::as_i64).unwrap_or(600),
             interval: data.get("interval").and_then(Json::as_i64).unwrap_or(5),
-            extra,
+            extra: Some(extra),
         })
     }
 
@@ -116,7 +119,7 @@ impl OAuthProvider for KimiProvider {
             fields.push(("code_verifier", &code_verifier_str));
         }
 
-        let params = serde_urlencoded::to_string(&fields)?;
+        let params = serde_urlencoded::to_string(&fields).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         let response = reqwest::Client::new()
             .post(token_url)
@@ -125,9 +128,10 @@ impl OAuthProvider for KimiProvider {
             .send()
             .await?;
 
+        let status = response.status().is_success();
         let data = response.json().await.unwrap_or_else(|_| json!({}));
         Ok(json!({
-            "ok": response.status().is_success(),
+            "ok": status,
             "data": data
         }))
     }
@@ -148,6 +152,7 @@ impl OAuthProvider for KimiProvider {
                 .to_string(),
             refresh_token: str_of(tokens, "refresh_token").map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(Json::as_i64),
+            expires_at: None,
             email: None,
             display_name: None,
             name: None,

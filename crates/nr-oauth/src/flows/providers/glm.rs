@@ -1,5 +1,6 @@
 //! Z.ai GLM Coding OAuth provider - CLI polling flow with business token exchange
 
+use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json, json::str_of};
 use serde_json::json;
@@ -7,6 +8,7 @@ use serde_json::json;
 
 pub struct GlmProvider;
 
+#[async_trait]
 impl OAuthProvider for GlmProvider {
     fn config_id(&self) -> &'static str { "glm" }
     fn flow_type(&self) -> &'static str { "device_code" }
@@ -44,8 +46,10 @@ impl OAuthProvider for GlmProvider {
         _log: &Logger,
     ) -> Result<DeviceCodeResponse> {
         use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let poll_token: String = (0..32).map(|_| format!("{:02x}", rng.gen::<u8>())).collect();
+        let poll_token: String = {
+            let mut rng = rand::thread_rng();
+            (0..32).map(|_| format!("{:02x}", rng.gen::<u8>())).collect()
+        };
 
         let cli_init_url = str_of(config, "cliInitUrl")
             .ok_or_else(|| nr_core::Error::Config("GLM: missing cliInitUrl".into()))?;
@@ -96,9 +100,10 @@ impl OAuthProvider for GlmProvider {
             device_code: flow_id,
             user_code: "zai".to_string(),
             verification_uri: authorize_url,
+            verification_uri_complete: None,
             expires_in,
             interval,
-            extra,
+            extra: Some(extra),
         })
     }
 
@@ -196,6 +201,7 @@ impl OAuthProvider for GlmProvider {
                 .to_string(),
             refresh_token: str_of(tokens, "_zaiRefreshToken").map(|s| s.to_string()),
             expires_in: None,
+            expires_at: None,
             email: None,
             display_name: None,
             name: None,
@@ -205,7 +211,7 @@ impl OAuthProvider for GlmProvider {
             provider_specific_data: Some(json!({
                 "authMethod": "cli_poll",
                 "zcodeJwtToken": str_of(tokens, "_zcodeJwtToken"),
-            })),
+            }).as_object().cloned().unwrap_or_default()),
         })
     }
 }

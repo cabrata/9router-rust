@@ -1,5 +1,6 @@
 //! GitHub Copilot OAuth provider - device_code flow
 
+use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json, json::str_of};
 use serde_json::json;
@@ -7,6 +8,7 @@ use serde_json::json;
 
 pub struct GitHubProvider;
 
+#[async_trait]
 impl OAuthProvider for GitHubProvider {
     fn config_id(&self) -> &'static str { "github" }
     fn flow_type(&self) -> &'static str { "device_code" }
@@ -53,7 +55,7 @@ impl OAuthProvider for GitHubProvider {
         let params = serde_urlencoded::to_string([
             ("client_id", client_id),
             ("scope", scopes),
-        ])?;
+        ]).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         let response = reqwest::Client::new()
             .post(device_code_url)
@@ -78,6 +80,7 @@ impl OAuthProvider for GitHubProvider {
             verification_uri: str_of(&data, "verification_uri")
                 .ok_or_else(|| nr_core::Error::BadRequest("Missing verification_uri".into()))?
                 .to_string(),
+            verification_uri_complete: None,
             expires_in: data.get("expires_in").and_then(Json::as_i64).unwrap_or(900),
             interval: data.get("interval").and_then(Json::as_i64).unwrap_or(5),
             extra: Some(serde_json::Map::new()),
@@ -101,7 +104,7 @@ impl OAuthProvider for GitHubProvider {
             ("client_id", client_id),
             ("device_code", device_code),
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-        ])?;
+        ]).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         let response = reqwest::Client::new()
             .post(token_url)
@@ -111,9 +114,10 @@ impl OAuthProvider for GitHubProvider {
             .send()
             .await?;
 
+        let status = response.status().is_success();
         let data: serde_json::Value = response.json().await.unwrap_or_else(|_| json!({}));
         Ok(json!({
-            "ok": response.status().is_success(),
+            "ok": status,
             "data": data
         }))
     }
@@ -124,7 +128,8 @@ impl OAuthProvider for GitHubProvider {
         _meta: Option<&Json>,
         _log: &Logger,
     ) -> Result<Option<Json>> {
-        let access_token = str_of(tokens, "access_token")?;
+        let access_token = str_of(tokens, "access_token")
+            .ok_or_else(|| nr_core::Error::BadRequest("Missing access_token".into()))?;
         let api_version = "2022-11-28";
 
         // Fetch Copilot token
@@ -137,7 +142,7 @@ impl OAuthProvider for GitHubProvider {
             .await;
 
         let copilot_token = if let Ok(res) = copilot_res {
-            res.json().await.ok()
+            res.json::<serde_json::Value>().await.ok()
         } else {
             None
         };
@@ -152,7 +157,7 @@ impl OAuthProvider for GitHubProvider {
             .await;
 
         let user_info = if let Ok(res) = user_res {
-            res.json().await.ok()
+            res.json::<serde_json::Value>().await.ok()
         } else {
             None
         };
@@ -171,13 +176,14 @@ impl OAuthProvider for GitHubProvider {
                 .to_string(),
             refresh_token: str_of(tokens, "refresh_token").map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(Json::as_i64),
+            expires_at: None,
             name: user_info.and_then(|u| str_of(u, "login")).map(|s| s.to_string()),
             display_name: user_info.and_then(|u| str_of(u, "name")).map(|s| s.to_string()),
             email: user_info.and_then(|u| str_of(u, "email")).map(|s| s.to_string()),
             project_id: None,
             id_token: None,
             scope: None,
-            provider_specific_data: extra.cloned(),
+            provider_specific_data: extra.and_then(|v| v.as_object().cloned()),
         })
     }
 }

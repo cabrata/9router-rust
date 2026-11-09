@@ -45,6 +45,7 @@ impl OAuthProvider for QoderCnProvider {
             verification_uri_complete: Some(format!("{}?nonce=QODER_CN_NONCE", login_url)),
             expires_in: 300,
             interval: 2,
+            extra: None,
         })
     }
 
@@ -79,8 +80,12 @@ impl OAuthProvider for QoderCnProvider {
             refresh_token: tokens.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(|v| v.as_i64()),
             expires_at: None,
+            scope: None,
+            project_id: None,
+            id_token: None,
             email: None,
             display_name: None,
+            name: None,
             provider_specific_data: None,
         })
     }

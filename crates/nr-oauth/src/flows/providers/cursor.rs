@@ -110,8 +110,12 @@ impl OAuthProvider for CursorProvider {
             refresh_token: None,
             expires_in: Some(expires_in),
             expires_at: None,
+            scope: None,
+            project_id: None,
+            id_token: None,
             email: None,
             display_name: None,
+            name: None,
             provider_specific_data: Some(provider_specific_data),
         })
     }

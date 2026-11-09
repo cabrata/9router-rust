@@ -1,10 +1,12 @@
 //! ClinePass OAuth provider - shares Cline's endpoints
 
+use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json};
 
 pub struct ClinePassProvider;
 
+#[async_trait]
 impl OAuthProvider for ClinePassProvider {
     fn config_id(&self) -> &'static str { "clinepass" }
     fn flow_type(&self) -> &'static str { "authorization_code" }
@@ -25,7 +27,7 @@ impl OAuthProvider for ClinePassProvider {
             ("client_type", "extension"),
             ("callback_url", redirect_uri),
             ("redirect_uri", redirect_uri),
-        ])?;
+        ]).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         Ok(Some(format!("{}?{}", authorize_url, params)))
     }
@@ -101,6 +103,7 @@ impl OAuthProvider for ClinePassProvider {
                 .to_string(),
             refresh_token: nr_core::json::str_of(tokens, "refresh_token").map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(Json::as_i64),
+            expires_at: None,
             email: None,
             display_name: None,
             name: None,

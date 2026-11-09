@@ -1,11 +1,13 @@
 //! Google Antigravity OAuth provider - authorization_code flow with custom postExchange
 
+use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json, json::str_of};
 use serde_json::json;
 
 pub struct AntigravityProvider;
 
+#[async_trait]
 impl OAuthProvider for AntigravityProvider {
     fn config_id(&self) -> &'static str { "antigravity" }
     fn flow_type(&self) -> &'static str { "authorization_code" }
@@ -40,7 +42,7 @@ impl OAuthProvider for AntigravityProvider {
             ("state", state),
             ("access_type", "offline"),
             ("prompt", "consent"),
-        ])?;
+        ]).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         Ok(Some(format!("{}?{}", authorize_url, params)))
     }
@@ -68,7 +70,7 @@ impl OAuthProvider for AntigravityProvider {
             ("client_secret", client_secret),
             ("code", code),
             ("redirect_uri", redirect_uri),
-        ])?;
+        ]).map_err(|e| nr_core::Error::Other(e.to_string()))?;
 
         let response = reqwest::Client::new()
             .post(token_url)
@@ -112,7 +114,8 @@ impl OAuthProvider for AntigravityProvider {
         _meta: Option<&Json>,
         _log: &Logger,
     ) -> Result<Option<Json>> {
-        let access_token = str_of(tokens, "access_token")?;
+        let access_token = str_of(tokens, "access_token")
+            .ok_or_else(|| nr_core::Error::BadRequest("Antigravity: missing access_token".into()))?;
 
         // Fetch user info
         let user_res = reqwest::Client::new()
@@ -122,7 +125,7 @@ impl OAuthProvider for AntigravityProvider {
             .send()
             .await;
 
-        let user_info = if let Ok(res) = user_res {
+        let user_info: Option<Json> = if let Ok(res) = user_res {
             res.json().await.ok()
         } else {
             None
@@ -144,6 +147,7 @@ impl OAuthProvider for AntigravityProvider {
                 .to_string(),
             refresh_token: str_of(tokens, "refresh_token").map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(Json::as_i64),
+            expires_at: None,
             scope: str_of(tokens, "scope").map(|s| s.to_string()),
             email: user_info.and_then(|u| str_of(u, "email")).map(|s| s.to_string()),
             display_name: None,

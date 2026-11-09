@@ -95,8 +95,12 @@ impl OAuthProvider for TraeProvider {
             expires_in: tokens.get("expiresIn").or_else(|| tokens.get("expires_in"))
                 .and_then(|v| v.as_i64()),
             expires_at: None,
+            scope: None,
+            project_id: None,
+            id_token: None,
             email: None,
             display_name: None,
+            name: None,
             provider_specific_data: None,
         })
     }

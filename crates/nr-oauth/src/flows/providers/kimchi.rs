@@ -1,5 +1,6 @@
 //! Kimchi OAuth provider - browser token callback flow
 
+use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json, json::str_of};
 use serde_json::json;
@@ -7,6 +8,7 @@ use serde_json::json;
 
 pub struct KimchiProvider;
 
+#[async_trait]
 impl OAuthProvider for KimchiProvider {
     fn config_id(&self) -> &'static str { "kimchi" }
     fn flow_type(&self) -> &'static str { "device_code" }
@@ -88,6 +90,7 @@ impl OAuthProvider for KimchiProvider {
                 .to_string(),
             refresh_token: str_of(tokens, "refresh_token").map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(Json::as_i64),
+            expires_at: None,
             email: None,
             display_name: None,
             name: None,

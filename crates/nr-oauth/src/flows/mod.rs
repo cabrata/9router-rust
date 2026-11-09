@@ -14,7 +14,7 @@ use nr_core::Json;
 /// Mapped tokens in standard connection record format.
 /// Returned by OAuthProvider::map_tokens(...).
 /// Port of the connection record schema from src/lib/oauth services.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MappedTokens {
     #[serde(rename = "accessToken")]
     pub access_token: String,
@@ -36,6 +36,22 @@ pub struct MappedTokens {
     #[serde(rename = "displayName")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+
+    /// OAuth scope granted (best-effort)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+
+    /// Provider project id (Vertex/Bedrock style, best-effort)
+    #[serde(default, rename = "projectId", skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+
+    /// Account label (best-effort)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// OIDC id_token when provider returns one
+    #[serde(default, rename = "idToken", skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
 
     /// Provider-specific fields (scope, idToken, userId, etc.)
     #[serde(rename = "providerSpecificData")]
@@ -104,6 +120,10 @@ mod tests {
             expires_at: None,
             email: Some("user@example.com".to_string()),
             display_name: None,
+            scope: None,
+            project_id: None,
+            name: None,
+            id_token: None,
             provider_specific_data: None,
         };
 

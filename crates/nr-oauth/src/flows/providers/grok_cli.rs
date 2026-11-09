@@ -46,6 +46,7 @@ impl OAuthProvider for GrokCliProvider {
             verification_uri_complete: None,
             expires_in: 600,
             interval: 5,
+            extra: None,
         })
     }
 
@@ -70,7 +71,7 @@ impl OAuthProvider for GrokCliProvider {
 
     async fn post_exchange(&self, tokens: &Json, _meta: Option<&Json>, _log: &Logger) -> Result<Option<Json>> {
         // TODO: Fetch user info from cli-chat-proxy.grok.com/v1/user with Bearer token
-        Ok(Some(json!({ "user": None })))
+        Ok(Some(json!({ "user": serde_json::Value::Null })))
     }
 
     fn map_tokens(&self, tokens: &Json, extra: Option<&Json>) -> Result<MappedTokens> {
@@ -92,8 +93,12 @@ impl OAuthProvider for GrokCliProvider {
             refresh_token: tokens.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(|v| v.as_i64()),
             expires_at: None,
+            scope: None,
+            project_id: None,
+            id_token: None,
             email: user_email,
             display_name: None,
+            name: None,
             provider_specific_data: Some(serde_json::Map::new()),
         })
     }

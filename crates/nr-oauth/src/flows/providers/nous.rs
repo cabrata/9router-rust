@@ -45,6 +45,7 @@ impl OAuthProvider for NousProvider {
             verification_uri_complete: None,
             expires_in: 600,
             interval: 5,
+            extra: None,
         })
     }
 
@@ -64,7 +65,7 @@ impl OAuthProvider for NousProvider {
 
     async fn post_exchange(&self, tokens: &Json, _meta: Option<&Json>, _log: &Logger) -> Result<Option<Json>> {
         // TODO: Mint agent key via POST to agentKeyUrl with Bearer token
-        Ok(Some(json!({ "agentKey": None })))
+        Ok(Some(json!({ "agentKey": serde_json::Value::Null })))
     }
 
     fn map_tokens(&self, tokens: &Json, extra: Option<&Json>) -> Result<MappedTokens> {
@@ -86,8 +87,12 @@ impl OAuthProvider for NousProvider {
             refresh_token: tokens.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(|v| v.as_i64()),
             expires_at: None,
+            scope: None,
+            project_id: None,
+            id_token: None,
             email: None,
             display_name: None,
+            name: None,
             provider_specific_data: None,
         })
     }

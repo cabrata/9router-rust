@@ -1,5 +1,6 @@
 //! KiloCode OAuth provider - custom device auth flow
 
+use async_trait::async_trait;
 use super::*;
 use nr_core::{Result, Logger, Json, json::str_of};
 use serde_json::json;
@@ -7,6 +8,7 @@ use serde_json::json;
 
 pub struct KiloCodeProvider;
 
+#[async_trait]
 impl OAuthProvider for KiloCodeProvider {
     fn config_id(&self) -> &'static str { "kilocode" }
     fn flow_type(&self) -> &'static str { "device_code" }
@@ -77,9 +79,10 @@ impl OAuthProvider for KiloCodeProvider {
             verification_uri: str_of(&data, "verification_uri")
                 .ok_or_else(|| nr_core::Error::BadRequest("Missing verification_uri".into()))?
                 .to_string(),
+            verification_uri_complete: None,
             expires_in: data.get("expires_in").and_then(Json::as_i64).unwrap_or(600),
             interval: data.get("interval").and_then(Json::as_i64).unwrap_or(5),
-            extra,
+            extra: Some(extra),
         })
     }
 
@@ -101,9 +104,10 @@ impl OAuthProvider for KiloCodeProvider {
             .send()
             .await?;
 
+        let status = response.status().is_success();
         let data = response.json().await.unwrap_or_else(|_| json!({}));
         Ok(json!({
-            "ok": response.status().is_success(),
+            "ok": status,
             "data": data
         }))
     }
@@ -124,6 +128,7 @@ impl OAuthProvider for KiloCodeProvider {
                 .to_string(),
             refresh_token: str_of(tokens, "refresh_token").map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(Json::as_i64),
+            expires_at: None,
             email: None,
             display_name: None,
             name: None,

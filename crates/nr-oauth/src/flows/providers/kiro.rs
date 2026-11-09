@@ -43,6 +43,7 @@ impl OAuthProvider for KiroProvider {
             verification_uri_complete: None,
             expires_in: 600,
             interval: 5,
+            extra: None,
         })
     }
 
@@ -77,9 +78,13 @@ impl OAuthProvider for KiroProvider {
             refresh_token: tokens.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(|v| v.as_i64()),
             expires_at: None,
+            scope: None,
+            project_id: None,
+            id_token: None,
             email: None,
             display_name: None,
             provider_specific_data: None,
+            ..Default::default()
         })
     }
 }
