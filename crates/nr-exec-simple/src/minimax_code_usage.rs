@@ -541,14 +541,23 @@ mod tests {
                 }
             ]
         });
+        // JS pushes a window for every line whose status is not 3 and whose
+        // remaining percent is present (or status is 2), so "general" and "pei"
+        // each contribute an interval and a week: 4 windows.
         let windows = parse_plan_windows(&body).expect("parses");
-        assert_eq!(windows.len(), 3, "general interval + general week + pei interval");
+        assert_eq!(windows.len(), 4, "general interval + general week + pei interval + pei week");
         assert_eq!(windows[0].get("name").and_then(Json::as_str), Some("5 hours"));
         assert_eq!(windows[0].get("remaining").and_then(Json::as_u64), Some(80));
         assert!(windows[0].get("resetAt").and_then(Json::as_str).is_some());
         assert_eq!(windows[1].get("name").and_then(Json::as_str), Some("7 days"));
-        assert_eq!(windows[2].get("name").and_then(Json::as_str), Some("Pei · 7 days"));
-        assert_eq!(windows[2].get("remaining").and_then(Json::as_u64), Some(100));
+        assert_eq!(windows[1].get("remaining").and_then(Json::as_u64), Some(50));
+        // Status 2 means the interval is exhausted: remaining is forced to 0.
+        // pei carries no interval timestamps, so its interval label is the
+        // duration-less "Allowance" bucket the JS uses for span 0.
+        assert_eq!(windows[2].get("name").and_then(Json::as_str), Some("Pei · Allowance"));
+        assert_eq!(windows[2].get("remaining").and_then(Json::as_u64), Some(0));
+        assert_eq!(windows[3].get("name").and_then(Json::as_str), Some("Pei · 7 days"));
+        assert_eq!(windows[3].get("remaining").and_then(Json::as_u64), Some(100));
     }
 
     #[test]
