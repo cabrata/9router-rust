@@ -316,11 +316,17 @@ pub async fn translate_post(
                 return translate_error(format!("No active connection for provider: {provider}"));
             };
             let credentials = connection_credentials(&connection);
-            let executor = nr_executors::get_executor(&provider);
 
-            // `buildUrl` / `buildHeaders` / `transformRequest` live on the
-            // executor's BaseHooks impl, which the Executor trait does not
-            // expose; the default executor is reconstructible for it.
+            // `buildUrl` / `buildHeaders` / `transformRequest` live on each
+            // executor's `BaseHooks` impl, which the frozen `nr_core::Executor`
+            // trait does not expose (no downcast, no hook getter).
+            //
+            // shortcut: step 3 renders the *default* wire request for every
+            // provider. Providers that override the hooks in JS (kiro, cursor,
+            // vertex, github, azure, the codebuddy pair, …) will show this
+            // route's generic URL/headers instead of their real ones. Upgrade
+            // when `Executor` grows a `build_wire_request`-style hook (an
+            // nr-core/nr-executors change) — then call it here.
             let default_exec = nr_exec_base::DefaultExecutor::new(&provider);
             use nr_exec_base::BaseHooks;
             let url = match default_exec.build_url(&model, stream, 0, &credentials) {
@@ -339,7 +345,6 @@ pub async fn translate_post(
             let final_body = default_exec
                 .transform_request(&model, &translated, stream, &credentials)
                 .unwrap_or(translated);
-            let _ = executor;
 
             Json(json!({
                 "success": true,
