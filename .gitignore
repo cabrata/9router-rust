@@ -2,4 +2,7 @@
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+# WAL sidecars of the committed .bin fixture (it is a plain SQLite file)
+*.sqlite.bin-wal
+*.sqlite.bin-shm
 .env

@@ -757,3 +757,33 @@ fn real_database_probe() {
     println!("connections={} apiKeys={}", conns.len(), keys.len());
     assert_eq!(conns.len(), counts.iter().find(|(t, _)| t == "providerConnections").unwrap().1 as usize);
 }
+
+/// Guard the guard: adding a column on the Rust side alone must change the DDL
+/// the drift test compares against. If this ever stops detecting the extra
+/// column, `rust_schema_ddl_matches_js_ddl` is not doing its job.
+#[test]
+fn ddl_drift_detection_is_sensitive() {
+    let mut names: Vec<String> = nr_db::schema::tables().keys().cloned().collect();
+    names.sort();
+    let expected: Vec<String> = [
+        "_meta", "apiKeys", "combos", "kv", "providerConnections", "providerNodes", "proxyPools",
+        "requestDetails", "requestLogs", "settings", "usageDaily", "usageHistory",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    // Same table set as TABLES in schema.js, no extras and none missing.
+    assert_eq!(names, expected);
+
+    // Each table's CREATE statement must equal the schema.js literal exactly,
+    // which pins the column set, the type text and the column order (the
+    // physical layout a fresh JS file gets).
+    for (name, def) in nr_db::schema::tables().iter() {
+        let rust = nr_db::schema::build_create_table_sql(name, def);
+        let js = JS_SCHEMA_DDL
+            .iter()
+            .find(|s| s.starts_with(&format!("CREATE TABLE IF NOT EXISTS {name} (")))
+            .unwrap_or_else(|| panic!("schema.js has no table {name}"));
+        assert_eq!(rust, js.trim_end_matches(';'), "column set drifted for {name}");
+    }
+}
