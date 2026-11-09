@@ -6,19 +6,17 @@
 //! `nr_oauth::flows::providers`, and `/api/oauth/{provider}/{action}` keeps
 //! serving the dynamic flows.
 //!
-//! Routes that need a live upstream validation call (`kiro/import`,
-//! `kiro/api-key`, `kiro/social-*`, `iflow/cookie`, `zed/import`,
-//! `xiaomi-mimo/login/*`, `perchai/plan/*`, `cursor/import`) return a typed
-//! `501` naming the missing helper instead of pretending to succeed — see each
-//! handler's note. Everything that only writes a connection row or reads local
-//! state is complete.
+//! The routes that need a live upstream validation call (`kiro/*`, `iflow/cookie`,
+//! `zed/import`, `xiaomi-mimo/*`, `perchai/plan/*`, `cursor/import`) live in
+//! `super::oauth_flow`, next to the dynamic provider flows they share helpers
+//! with.
 
 use axum::extract::Query;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use nr_db::{create_provider_connection, get_provider_connections, Db};
+use nr_db::{create_provider_connection, Db};
 use serde_json::{json, Value};
 
 use super::oauth_jwt::{decode_jwt_payload, extract_codex_account_info, extract_email_from_access_token};
@@ -681,33 +679,6 @@ pub async fn zed_auto_import() -> Response {
     .into_response()
 }
 
-// ─── routes needing an unported upstream helper ─────────────────────────────
-
-/// GET /api/oauth/cursor/import is a POST-only import plus this GET status.
-pub async fn cursor_import_status() -> Response {
-    Json(json!({ "success": true, "supported": false })).into_response()
-}
-
-/// GET /api/oauth/perchai/plan/status
-pub async fn perchai_plan_status(Query(params): Query<std::collections::HashMap<String, String>>) -> Response {
-    if let Some(connection_id) = params.get("connectionId").filter(|v| !v.is_empty()) {
-        if let Ok(db) = nr_db::db() {
-            let conns = get_provider_connections(&db, Some(&json!({ "provider": "perchai" })))
-                .unwrap_or_default();
-            let exists = conns.iter().any(|c| {
-                c.get("id").and_then(|v| v.as_str()) == Some(connection_id.as_str())
-            });
-            if !exists {
-                return err_json(
-                    StatusCode::NOT_FOUND,
-                    "Perch AI connection not found. Connect a Perch AI account first.",
-                );
-            }
-        }
-    }
-    not_ported("Perch plan status")
-}
-
 pub fn routes() -> Router {
     Router::new()
         // codex
@@ -717,12 +688,10 @@ pub fn routes() -> Router {
         .route("/api/oauth/grok-cli/bulk-import", post(grok_cli_bulk_import))
         // gitlab
         .route("/api/oauth/gitlab/pat", post(gitlab_pat))
-        // perchai
+        // perchai import surface (plan routes live in oauth_flow)
         .route("/api/oauth/perchai/import", post(perchai_import))
         .route("/api/oauth/perchai/auto-import", get(perchai_auto_import))
-        .route("/api/oauth/perchai/plan/status", get(perchai_plan_status))
-        .route("/api/oauth/perchai/plan/claim", post(perchai_plan_claim))
-        // auto-imports with no upstream call
+        // auto-imports that only read local state
         .route(
             "/api/oauth/commandcode/auto-import",
             get(commandcode_auto_import),
@@ -731,101 +700,6 @@ pub fn routes() -> Router {
         .route("/api/oauth/kiro/auto-import", get(kiro_auto_import))
         .route("/api/oauth/xiaomi-mimo/auto-import", get(xiaomi_mimo_auto_import))
         .route("/api/oauth/zed/auto-import", get(zed_auto_import))
-        // imports that need an upstream validation helper
-        .route("/api/oauth/cursor/import", get(cursor_import_status).post(cursor_import))
-        .route("/api/oauth/kiro/import", post(kiro_import))
-        .route("/api/oauth/kiro/import-cli-proxy", post(kiro_import_cli_proxy))
-        .route("/api/oauth/kiro/api-key", post(kiro_api_key))
-        .route("/api/oauth/kiro/social-authorize", get(kiro_social_authorize))
-        .route("/api/oauth/kiro/social-exchange", post(kiro_social_exchange))
-        .route("/api/oauth/iflow/cookie", post(iflow_cookie))
-        .route("/api/oauth/zed/import", post(zed_import))
-        .route("/api/oauth/xiaomi-mimo/api-key", post(xiaomi_mimo_api_key))
-        .route("/api/oauth/xiaomi-mimo/login/start", post(xiaomi_mimo_login_start))
-        .route("/api/oauth/xiaomi-mimo/login/status", get(xiaomi_mimo_login_status))
-}
-
-// ─── handlers that need a helper owned by another crate ─────────────────────
-
-/// The handlers below need an upstream validation helper that lives in
-/// `src/lib/oauth/services/**` and is not ported to `nr_oauth` yet. Each returns
-/// `501` with a stable `code` so the dashboard can fall back to manual paste,
-/// instead of storing an unvalidated credential.
-pub async fn cursor_import(Json(_body): Json<Value>) -> Response {
-    // `CursorService.validateImportToken` is in `src/lib/oauth/services/cursor.js`
-    // (an API round-trip + worker handshake) and is not ported to `nr_oauth`.
-    not_ported("Cursor token validation")
-}
-
-/// POST /api/oauth/kiro/import — needs `KiroService.refreshToken`.
-pub async fn kiro_import(Json(_body): Json<Value>) -> Response {
-    not_ported("Kiro refresh-token import")
-}
-
-/// POST /api/oauth/kiro/import-cli-proxy — needs `normalizeKiroExternalIdpAuth`.
-pub async fn kiro_import_cli_proxy(Json(_body): Json<Value>) -> Response {
-    not_ported("Kiro CLIProxyAPI import")
-}
-
-/// POST /api/oauth/kiro/api-key — needs `KiroService.validateApiKey`.
-pub async fn kiro_api_key(Json(_body): Json<Value>) -> Response {
-    not_ported("Kiro API-key validation")
-}
-
-/// GET /api/oauth/kiro/social-authorize — needs the AWS SSO social flow.
-pub async fn kiro_social_authorize() -> Response {
-    not_ported("Kiro social sign-in")
-}
-
-/// POST /api/oauth/kiro/social-exchange — needs the AWS SSO social flow.
-pub async fn kiro_social_exchange(Json(_body): Json<Value>) -> Response {
-    not_ported("Kiro social sign-in")
-}
-
-/// POST /api/oauth/iflow/cookie — needs the iFlow apikey exchange.
-pub async fn iflow_cookie(Json(body): Json<Value>) -> Response {
-    // The cookie-shape validation is ours and worth keeping verbatim.
-    let Some(cookie) = trimmed(&body, "cookie") else {
-        return err_json(StatusCode::BAD_REQUEST, "Cookie is required");
-    };
-    if !cookie.contains("BXAuth=") {
-        return err_json(StatusCode::BAD_REQUEST, "Cookie must contain BXAuth field");
-    }
-    not_ported("iFlow cookie-to-API-key exchange")
-}
-
-/// POST /api/oauth/zed/import — needs `fetchZedAuthenticatedUser`.
-pub async fn zed_import(Json(body): Json<Value>) -> Response {
-    if trimmed(&body, "accessToken").is_none() {
-        return err_json(StatusCode::BAD_REQUEST, "Access token is required");
-    }
-    if body.get("userId").map(|v| v.is_null()).unwrap_or(true) {
-        return err_json(StatusCode::BAD_REQUEST, "User id is required");
-    }
-    not_ported("Zed token validation")
-}
-
-/// POST /api/oauth/xiaomi-mimo/api-key — needs the MiMo key validation call.
-pub async fn xiaomi_mimo_api_key(Json(body): Json<Value>) -> Response {
-    if trimmed(&body, "apiKey").is_none() {
-        return err_json(StatusCode::BAD_REQUEST, "API key is required");
-    }
-    not_ported("Xiaomi MiMo API-key validation")
-}
-
-/// POST /api/oauth/xiaomi-mimo/login/start — needs the browser login session.
-pub async fn xiaomi_mimo_login_start(Json(_body): Json<Value>) -> Response {
-    not_ported("Xiaomi MiMo interactive login")
-}
-
-/// GET /api/oauth/xiaomi-mimo/login/status — needs the browser login session.
-pub async fn xiaomi_mimo_login_status() -> Response {
-    not_ported("Xiaomi MiMo interactive login")
-}
-
-/// POST /api/oauth/perchai/plan/claim — needs `claimPerchPlan`.
-pub async fn perchai_plan_claim(Json(_body): Json<Value>) -> Response {
-    not_ported("Perch plan claim")
 }
 
 #[cfg(test)]
@@ -946,57 +820,6 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn unported_routes_return_501_with_a_code() {
-        let resp = kiro_import(Json(json!({}))).await;
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-        let body = axum::body::to_bytes(resp.into_body(), 100_000).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["code"], json!("NOT_IMPLEMENTED"));
-    }
-
-    #[tokio::test]
-    async fn iflow_cookie_validates_before_giving_up() {
-        let resp = iflow_cookie(Json(json!({}))).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        let resp = iflow_cookie(Json(json!({ "cookie": "no-auth-field" }))).await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-
-        let resp = iflow_cookie(Json(json!({ "cookie": "BXAuth=abc" }))).await;
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-    }
-
-    #[tokio::test]
-    async fn zed_import_requires_token_and_user_id() {
-        assert_eq!(
-            zed_import(Json(json!({}))).await.status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            zed_import(Json(json!({ "accessToken": "t" }))).await.status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            zed_import(Json(json!({ "accessToken": "t", "userId": "u" })))
-                .await
-                .status(),
-            StatusCode::NOT_IMPLEMENTED
-        );
-    }
-
-    #[tokio::test]
-    async fn xiaomi_api_key_requires_a_key() {
-        assert_eq!(
-            xiaomi_mimo_api_key(Json(json!({}))).await.status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            xiaomi_mimo_api_key(Json(json!({ "apiKey": "sk-x" }))).await.status(),
-            StatusCode::NOT_IMPLEMENTED
-        );
     }
 
     #[test]
