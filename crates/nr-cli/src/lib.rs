@@ -42,9 +42,12 @@
 
 pub mod connect_tools;
 pub mod launcher_process;
+pub mod menus;
 pub mod port_management;
 pub mod process_management;
+pub mod tray;
 pub mod ui;
+pub mod xai_video;
 
 pub use launcher_process::{read_pid_record, write_pid_record, PidRecord, PID_FILE_NAME};
 pub use port_management::{is_port_in_use, wait_for_port_free};

@@ -14,7 +14,7 @@ path = "src/main.rs"
 default = []
 # Opt-in tray icon. Needs GTK dev libs on Linux, so it is never a default dep:
 # `cargo build -p nr-cli --features tray`.
-tray = ["tray-icon", "gtk"]
+tray = ["dep:tray-icon", "dep:gtk"]
 
 [dependencies]
 nr-core.workspace = true
@@ -31,19 +31,23 @@ open = "5"
 libc = "0.2"  # for signal handling and process management
 regex.workspace = true
 chrono.workspace = true
-reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { workspace = true, features = ["blocking"] }
+base64.workspace = true
+sha2.workspace = true
+urlencoding.workspace = true
 toml_edit = "0.22"
 serde_yaml = "0.9"
-# Optional, only pulled in with `--features tray`.
-tray-icon = { version = "0.19", optional = true }
-gtk = { version = "0.18", optional = true }
 dirs = "5"
+
+# Optional, only pulled in with `--features tray`.
+tray-icon = { version = "0.19", optional = true, default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3", features = ["winsock2", "winnt", "psapi"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["process"] }
+gtk = { version = "0.18", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 nix = { version = "0.29", features = ["process"] }

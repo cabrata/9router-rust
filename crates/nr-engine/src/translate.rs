@@ -38,15 +38,31 @@ pub fn translate_request_to_provider(
     stream: bool,
     credentials: Option<&mut Credentials>,
 ) -> Json {
-    translate_request(
-        source_format,
-        target_format,
-        model,
-        body,
-        stream,
-        credentials,
-        &TranslationOptions::default(),
-    )
+    translate_request_to_provider_for(source_format, target_format, model, body, stream, credentials, None)
+}
+
+/// Same as [`translate_request_to_provider`], but resolves the model's `strip[]`
+/// list (image/audio parts the upstream rejects) when `provider` is known.
+pub fn translate_request_to_provider_for(
+    source_format: &str,
+    target_format: &str,
+    model: &str,
+    body: Json,
+    stream: bool,
+    credentials: Option<&mut Credentials>,
+    provider: Option<&str>,
+) -> Json {
+    let alias_or_id = provider.unwrap_or("");
+    let options = TranslationOptions {
+        // `getModelStrip(alias, modelId)` — empty when the entry has no strip[].
+        strip_content_types: if alias_or_id.is_empty() {
+            Vec::new()
+        } else {
+            nr_data::get_model_strip(alias_or_id, model)
+        },
+        ..TranslationOptions::default()
+    };
+    translate_request(source_format, target_format, model, body, stream, credentials, &options)
 }
 
 /// Translate one upstream response chunk into client-format chunks.

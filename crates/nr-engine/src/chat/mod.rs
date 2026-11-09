@@ -22,7 +22,7 @@ use crate::credentials::{
 };
 use crate::model::get_model_info;
 use crate::stream::{build_stream_error_bytes, json_error, transform_sse_to_client};
-use crate::translate::{detect_format_by_endpoint, target_format_for, translate_request_to_provider};
+use crate::translate::{detect_format_by_endpoint, target_format_for, translate_request_to_provider_for};
 
 /// A chat request handed over from the HTTP gateway.
 #[derive(Clone, Debug)]
@@ -251,13 +251,14 @@ async fn execute_on_account(
         }
         b
     } else {
-        translate_request_to_provider(
+        translate_request_to_provider_for(
             source_format,
             target_format,
             &model,
             body.clone(),
             stream,
             Some(&mut credentials),
+            Some(&provider),
         )
     };
 

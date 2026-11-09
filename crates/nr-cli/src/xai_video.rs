@@ -365,7 +365,7 @@ extern "C" fn on_sigint(_sig: libc::c_int) {
 #[cfg(unix)]
 fn install_sigint() {
     unsafe {
-        libc::signal(libc::SIGINT, on_sigint as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
     }
 }
 
@@ -442,7 +442,6 @@ pub fn run_with<A: VideoApi>(api: &A, opts: &VideoOptions, out: &mut dyn Write) 
 
     let deadline = Instant::now() + Duration::from_secs(opts.timeout_sec);
     let mut last_line = String::new();
-    let mut last_progress = String::new();
     loop {
         if cancelled() {
             let _ = fs::remove_file(&part);
@@ -491,7 +490,6 @@ pub fn run_with<A: VideoApi>(api: &A, opts: &VideoOptions, out: &mut dyn Write) 
                 };
                 if line != last_line {
                     last_line = line.clone();
-                    last_progress = line.clone();
                     write_progress(out, &line);
                 }
             }
@@ -533,27 +531,23 @@ fn finish_download<A: VideoApi>(api: &A, body: &Value, output: &str, part: &str,
 }
 
 fn report_create_failure(status: u16, body: Option<&Value>, raw: &str, out: &mut dyn Write) {
-    let detail = body
-        .and_then(|b| b.get("error"))
-        .map(|e| match e {
+    // `body?.error?.message || body?.error || raw || HTTP status`
+    let from_error = body.and_then(|b| b.get("error")).and_then(|e| match e {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Object(_) => e
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        _ => None,
+    });
+    let detail = from_error
+        .or_else(|| body.and_then(|b| b.get("error")).map(|e| match e {
             Value::String(s) => s.clone(),
-            Value::Object(_) => e
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
             other => other.to_string(),
-        })
+        }))
         .filter(|s| !s.is_empty())
-        .or_else(|| body.and_then(|b| b.get("request_id")).map(|_| String::new()))
-        .unwrap_or_else(|| {
-            if raw.is_empty() {
-                format!("HTTP {status}")
-            } else {
-                raw.to_string()
-            }
-        });
-    let detail = if detail.is_empty() { format!("HTTP {status}") } else { detail };
+        .unwrap_or_else(|| if raw.is_empty() { format!("HTTP {status}") } else { raw.to_string() });
     let clean = sanitize_text(&detail);
     let trimmed: String = clean.chars().take(500).collect();
     let _ = writeln!(out, "❌ Create failed: {trimmed}");

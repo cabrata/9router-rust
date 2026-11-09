@@ -2468,3 +2468,968 @@ pub async fn perchai_plan_claim(body: Option<Json<Value>>) -> Response {
         }),
     )
 }
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    /// Env-var-mutating tests share one process, so they must not interleave.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        keys: Vec<String>,
+    }
+
+    impl EnvGuard {
+        fn set(pairs: &[(&str, &str)]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut keys = Vec::new();
+            for (key, value) in pairs {
+                std::env::set_var(key, value);
+                keys.push((*key).to_string());
+            }
+            Self { _lock: lock, keys }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for key in &self.keys {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    fn test_db() -> (tempfile::TempDir, nr_db::Db) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = nr_db::Db::open_in(dir.path()).unwrap();
+        (dir, db)
+    }
+
+    async fn body_json(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    struct MockRequest {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl MockRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+
+        fn json(&self) -> Value {
+            serde_json::from_str(&self.body).unwrap_or(Value::Null)
+        }
+    }
+
+    struct MockServer {
+        url: String,
+        requests: Arc<Mutex<Vec<MockRequest>>>,
+    }
+
+    impl MockServer {
+        fn paths(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.path.clone())
+                .collect()
+        }
+
+        fn requests(&self) -> Vec<MockRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    /// One request per connection: `Connection: close` stops reqwest from
+    /// reusing a socket the mock never reads twice.
+    fn start_mock<F>(handler: F) -> MockServer
+    where
+        F: Fn(&MockRequest) -> (u16, String) + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        let requests: Arc<Mutex<Vec<MockRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let handler = Arc::new(handler);
+
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut stream) = conn else { return };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let Some((head, body)) = read_request(&mut stream) else { continue };
+
+                let mut lines = head.lines();
+                let request_line = lines.next().unwrap_or_default();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+                let headers: Vec<(String, String)> = lines
+                    .filter_map(|line| line.split_once(':'))
+                    .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                    .collect();
+
+                let request = MockRequest { method, path, headers, body };
+                recorded.lock().unwrap().push(request.clone());
+                let (status, payload) = handler(&request);
+                let response = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        MockServer { url: format!("http://{addr}"), requests }
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Option<(String, String)> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+        };
+
+        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+        let mut body = buf[head_end + 4..].to_vec();
+        let length = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while body.len() < length {
+            let n = stream.read(&mut chunk).ok()?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        Some((head, String::from_utf8_lossy(&body).to_string()))
+    }
+
+    /// A JWT shaped `header.payload.signature` with no real signature.
+    fn fake_jwt(claims: Value) -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        format!("h.{payload}.s")
+    }
+
+    // ─── cursor ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cursor_instructions_describe_both_required_fields() {
+        let json = body_json(cursor_import_instructions().await).await;
+        assert_eq!(json["provider"], json!("cursor"));
+        assert_eq!(json["method"], json!("import_token"));
+        assert_eq!(json["requiredFields"][0]["name"], json!("accessToken"));
+        assert_eq!(json["requiredFields"][1]["name"], json!("machineId"));
+        // Paths come from the oauth constants dump, not from literals here.
+        assert!(json["instructions"]["steps"][3]
+            .as_str()
+            .unwrap()
+            .contains("state.vscdb"));
+    }
+
+    #[tokio::test]
+    async fn cursor_import_rejects_bad_input() {
+        assert_eq!(
+            cursor_import(Json(json!({}))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            cursor_import(Json(json!({ "accessToken": "t" }))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let token = fake_jwt(json!({ "email": "c@x" }));
+        // A short token fails `validateImportToken`, which the JS catch maps to 500.
+        let short = cursor_import(Json(json!({
+            "accessToken": "too-short",
+            "machineId": "0123456789abcdef0123456789abcdef"
+        })))
+        .await;
+        assert_eq!(short.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = body_json(short).await;
+        assert!(json["error"].as_str().unwrap().contains("too short"));
+
+        // A non-UUID machine id is the other thrown validation error.
+        let bad_uuid = cursor_import(Json(json!({
+            "accessToken": token,
+            "machineId": "not-a-uuid"
+        })))
+        .await;
+        assert_eq!(bad_uuid.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body_json(bad_uuid).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("machine ID"));
+    }
+
+    #[tokio::test]
+    async fn cursor_import_stores_a_connection() {
+        let (_dir, db) = test_db();
+        let token = fake_jwt(json!({ "email": "cursor@example.com", "sub": "user-1" }));
+        let machine_id = "0123456789abcdef0123456789abcdef";
+
+        let response = cursor_import(Json(json!({
+            "accessToken": format!("  {token}  "),
+            "machineId": format!(" {machine_id} "),
+        })))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["success"], json!(true));
+        assert_eq!(json["connection"]["provider"], json!("cursor"));
+        assert_eq!(json["connection"]["email"], json!("cursor@example.com"));
+
+        let connection = nr_db::get_provider_connection_by_id(
+            &db,
+            json["connection"]["id"].as_str().unwrap(),
+        )
+        .unwrap()
+        .expect("connection row");
+        assert_eq!(connection["authType"], json!("oauth"));
+        assert_eq!(
+            connection["providerSpecificData"]["machineId"],
+            json!(machine_id),
+            "the token and machine id are trimmed before storage"
+        );
+        assert_eq!(
+            connection["providerSpecificData"]["authMethod"],
+            json!("imported")
+        );
+    }
+
+    // ─── kiro ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn kiro_import_cli_proxy_accepts_a_string_payload() {
+        let (_dir, db) = test_db();
+        let auth = json!({
+            "auth_method": "external_idp",
+            "access_token": fake_jwt(json!({ "upn": "dev@corp.example" })),
+            "refresh_token": "rt-1",
+            "client_id": "client-1",
+            "token_endpoint": "https://login.microsoftonline.com/tenant/oauth2/v2.0/token",
+            "profile_arn": "arn:aws:codewhisperer:us-east-1:1:profile/A",
+            "scopes": ["offline_access", "sso"],
+            "expires_in": 1800,
+        });
+
+        let response = kiro_import_cli_proxy(Json(json!({
+            "cliProxyAuth": auth.to_string(),
+        })))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["success"], json!(true));
+        assert_eq!(json["connection"]["email"], json!("dev@corp.example"));
+
+        let connection = nr_db::get_provider_connection_by_id(
+            &db,
+            json["connection"]["id"].as_str().unwrap(),
+        )
+        .unwrap()
+        .expect("connection row");
+        assert_eq!(
+            connection["providerSpecificData"]["authMethod"],
+            json!("external_idp")
+        );
+        assert_eq!(
+            connection["providerSpecificData"]["scope"],
+            json!("offline_access sso"),
+            "an array of scopes joins with spaces, like normalizeScope"
+        );
+        assert_eq!(connection["providerSpecificData"]["provider"], json!("CLIProxyAPI"));
+    }
+
+    #[tokio::test]
+    async fn kiro_import_cli_proxy_rejects_bad_input() {
+        // Non-Microsoft token endpoint would be an SSRF pivot.
+        let bad_endpoint = kiro_import_cli_proxy(Json(json!({
+            "access_token": "a",
+            "refresh_token": "r",
+            "client_id": "c",
+            "profile_arn": "arn:aws:codewhisperer:us-east-1:1:profile/A",
+            "token_endpoint": "https://attacker.example/token",
+            "scopes": "s",
+        })))
+        .await;
+        assert_eq!(bad_endpoint.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(bad_endpoint).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("Microsoft login endpoint"));
+
+        let wrong_method = kiro_import_cli_proxy(Json(json!({
+            "auth_method": "builder_id",
+            "access_token": "a",
+        })))
+        .await;
+        assert_eq!(wrong_method.status(), StatusCode::BAD_REQUEST);
+
+        assert_eq!(
+            kiro_import_cli_proxy(Json(json!({ "cliProxyAuth": "not json" })))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_import_requires_a_refresh_token() {
+        let response = kiro_import(Json(json!({ "refreshToken": "   " }))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["error"],
+            json!("Refresh token is required")
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_api_key_rejects_bad_input_before_validating() {
+        assert_eq!(
+            kiro_api_key(Json(json!({}))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            kiro_api_key(Json(json!({ "apiKey": "  " }))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        // A region is interpolated into the upstream URL, so a bad one never gets that far.
+        assert_eq!(
+            kiro_api_key(Json(json!({ "apiKey": "k", "region": "evil.example/x" })))
+                .await
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_social_authorize_builds_the_cognito_url() {
+        let response = kiro_social_authorize(Query(HashMap::from([(
+            "provider".to_string(),
+            "google".to_string(),
+        )])))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["provider"], json!("google"));
+        let url = json["authUrl"].as_str().unwrap();
+        assert!(url.contains("idp=Google"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("redirect_uri=kiro%3A%2F%2Fkiro.kiroAgent"));
+        assert!(url.contains(&format!("code_challenge={}", json["codeChallenge"].as_str().unwrap())));
+        assert!(json["codeVerifier"].as_str().unwrap().len() >= 43);
+
+        for provider in ["", "facebook"] {
+            let response = kiro_social_authorize(Query(HashMap::from([(
+                "provider".to_string(),
+                provider.to_string(),
+            )])))
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(
+            kiro_social_authorize(Query(HashMap::new())).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn kiro_social_exchange_requires_all_three_fields() {
+        assert_eq!(
+            kiro_social_exchange(Json(json!({ "code": "c" }))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            kiro_social_exchange(Json(json!({ "code": "c", "codeVerifier": "v", "provider": "x" })))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    // ─── iflow ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn iflow_cookie_exchanges_bxauth_for_an_api_key() {
+        let (_dir, db) = test_db();
+        let server = start_mock(|request| {
+            if request.method == "GET" {
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": { "name": "my-key", "other": 1 },
+                    })
+                    .to_string(),
+                )
+            } else {
+                (
+                    200,
+                    json!({
+                        "success": true,
+                        "data": {
+                            "apiKey": "sk-abcdefghijklmnop",
+                            "name": "my-key",
+                            "expireTime": 1_700_000_000_000i64,
+                        },
+                    })
+                    .to_string(),
+                )
+            }
+        });
+        let _env = EnvGuard::set(&[("NR_OAUTH_ENDPOINT_IFLOW_APIKEY", &server.url)]);
+
+        let response = iflow_cookie(Json(json!({
+            "cookie": "BXAuth=tok-123; other=1",
+        })))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["success"], json!(true));
+        assert_eq!(json["connection"]["apiKey"], json!("sk-abcdefg..."));
+        assert_eq!(json["connection"]["email"], json!("my-key"));
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "GET");
+        // The cookie is normalised with a trailing `;` and only BXAuth is kept.
+        assert_eq!(requests[0].header("cookie"), Some("BXAuth=tok-123; other=1;"));
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].json()["name"], json!("my-key"));
+
+        let connection = nr_db::get_provider_connection_by_id(
+            &db,
+            json["connection"]["id"].as_str().unwrap(),
+        )
+        .unwrap()
+        .expect("connection row");
+        assert_eq!(connection["authType"], json!("cookie"));
+        assert_eq!(
+            connection["providerSpecificData"]["cookie"],
+            json!("BXAuth=tok-123;")
+        );
+    }
+
+    #[tokio::test]
+    async fn iflow_cookie_rejects_a_cookie_without_bxauth() {
+        assert_eq!(
+            iflow_cookie(Json(json!({}))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let response = iflow_cookie(Json(json!({ "cookie": "SESSION=abc" }))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["error"],
+            json!("Cookie must contain BXAuth field")
+        );
+    }
+
+    // ─── zed ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn zed_import_validates_against_the_cloud_api() {
+        let (_dir, db) = test_db();
+        let server = start_mock(|request| {
+            assert_eq!(request.path, "/client/users/me");
+            assert_eq!(request.header("authorization"), Some("user-1 zed-token"));
+            assert_eq!(request.header("x-zed-system-id"), Some("sys-1"));
+            (
+                200,
+                json!({
+                    "email": "zed@example.com",
+                    "name": "Zed User",
+                    "organizations": [
+                        { "id": "org-work" },
+                        { "id": "org-personal", "is_personal": true },
+                    ],
+                })
+                .to_string(),
+            )
+        });
+        let _env = EnvGuard::set(&[("NR_OAUTH_ENDPOINT_ZED_CLOUD", &server.url)]);
+
+        let response = zed_import(Json(json!({
+            "accessToken": " zed-token ",
+            "userId": "user-1",
+            "systemId": "sys-1",
+        })))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["success"], json!(true));
+        assert_eq!(json["connection"]["email"], json!("zed@example.com"));
+        assert_eq!(json["connection"]["displayName"], json!("Zed User"));
+
+        let connection = nr_db::get_provider_connection_by_id(
+            &db,
+            json["connection"]["id"].as_str().unwrap(),
+        )
+        .unwrap()
+        .expect("connection row");
+        assert_eq!(
+            connection["providerSpecificData"]["organizationId"],
+            json!("org-personal"),
+            "the personal organization wins when none is named"
+        );
+        assert_eq!(connection["providerSpecificData"]["authMethod"], json!("imported"));
+    }
+
+    #[tokio::test]
+    async fn zed_import_maps_a_rejected_token_to_401() {
+        let server = start_mock(|_| (401, json!({ "error": "unauthorized" }).to_string()));
+        let _env = EnvGuard::set(&[("NR_OAUTH_ENDPOINT_ZED_CLOUD", &server.url)]);
+
+        let response = zed_import(Json(json!({
+            "accessToken": "bad",
+            "userId": "user-1",
+        })))
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        assert_eq!(
+            zed_import(Json(json!({ "userId": "u" }))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            zed_import(Json(json!({ "accessToken": "t", "userId": null })))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn zed_organization_prefers_an_explicit_value() {
+        let body = json!({ "organizationId": "explicit" });
+        let user = json!({ "default_organization_id": "profile" });
+        assert_eq!(resolve_zed_organization_id(&body, &user), "explicit");
+
+        assert_eq!(
+            resolve_zed_organization_id(&json!({}), &user),
+            "profile"
+        );
+        assert_eq!(
+            resolve_zed_organization_id(&json!({}), &json!({ "organizations": [ { "id": ["first"] } ] })),
+            "first"
+        );
+        assert_eq!(resolve_zed_organization_id(&json!({}), &json!({})), "");
+    }
+
+    // ─── xiaomi-mimo ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn xiaomi_api_key_stores_a_validated_key() {
+        let (_dir, db) = test_db();
+        let server = start_mock(|request| {
+            assert_eq!(request.path, "/models");
+            assert_eq!(request.header("authorization"), Some("Bearer sk-test"));
+            (
+                200,
+                json!({ "data": [{ "id": "mimo-a" }, { "id": "mimo-b" }] }).to_string(),
+            )
+        });
+        let _env = EnvGuard::set(&[("NR_OAUTH_ENDPOINT_XIAOMI_MIMO_MODELS", &server.url)]);
+
+        let response = xiaomi_mimo_api_key(Json(json!({
+            "apiKey": "sk-test",
+            "uid": "42",
+            "baseUrl": "https://api.xiaomimimo.com/v1/",
+        })))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["validated"], json!(true));
+        assert_eq!(json["modelCount"], json!(2));
+        assert_eq!(json["connection"]["email"], json!("42@xiaomi"));
+
+        let connection = nr_db::get_provider_connection_by_id(
+            &db,
+            json["connection"]["id"].as_str().unwrap(),
+        )
+        .unwrap()
+        .expect("connection row");
+        // The trailing slash is trimmed from baseUrl.
+        assert_eq!(
+            connection["providerSpecificData"]["baseUrl"],
+            json!("https://api.xiaomimimo.com/v1")
+        );
+        assert_eq!(connection["authType"], json!("api_key"));
+    }
+
+    #[tokio::test]
+    async fn xiaomi_api_key_accepts_a_session_only_body_and_updates_in_place() {
+        let (_dir, db) = test_db();
+
+        let first = xiaomi_mimo_api_key(Json(json!({
+            "mimoPassToken": "pass-1",
+            "mimoUserId": "u-1",
+            "region": "cn",
+        })))
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let json = body_json(first).await;
+        assert_eq!(json["validated"], json!(false));
+        assert_eq!(json["connection"]["displayName"], json!("Xiaomi MiMo"));
+        let id = json["connection"]["id"].as_str().unwrap().to_string();
+
+        // Same session identity + region must update, not duplicate.
+        let second = xiaomi_mimo_api_key(Json(json!({
+            "mimoPassToken": "pass-2",
+            "mimoUserId": "u-1",
+            "region": "cn",
+        })))
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let json = body_json(second).await;
+        assert_eq!(json["updated"], json!(true));
+        assert_eq!(json["connection"]["id"], json!(id));
+
+        let connection = nr_db::get_provider_connection_by_id(&db, &id).unwrap().unwrap();
+        assert_eq!(
+            connection["providerSpecificData"]["mimoPassToken"],
+            json!("pass-2")
+        );
+        assert_eq!(
+            nr_db::get_provider_connections(&db, Some(&json!({ "provider": "xiaomi-mimo" })))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn xiaomi_api_key_rejects_bad_input() {
+        let response = xiaomi_mimo_api_key(Json(json!({}))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["error"],
+            json!("API key is required")
+        );
+
+        let response = xiaomi_mimo_api_key(Json(json!({ "apiKey": "nope" }))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("sk- prefix"));
+    }
+
+    #[tokio::test]
+    async fn xiaomi_login_status_expires_an_unknown_state() {
+        let response = xiaomi_mimo_login_status(Query(HashMap::from([(
+            "state".to_string(),
+            "never-issued".to_string(),
+        )])))
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["status"], json!("expired"));
+    }
+
+    #[tokio::test]
+    async fn xiaomi_login_start_reports_a_dead_upstream() {
+        // Port 9 (discard) refuses connections: the `me` hop must fail closed.
+        let _env = EnvGuard::set(&[("NR_OAUTH_ENDPOINT_MIMO_SGP", "http://127.0.0.1:9")]);
+        let response = xiaomi_mimo_login_start(Some(Json(json!({ "region": "sgp" })))).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn xiaomi_region_falls_back_to_sgp() {
+        assert_eq!(mimo_region_base("cn"), "https://mimo-server-cn.xiaomimimo.com");
+        assert_eq!(
+            mimo_region_base("nope"),
+            "https://mimo-server-sgp.xiaomimimo.com"
+        );
+    }
+
+    #[test]
+    fn mimo_cookie_helpers_scope_by_domain_and_path() {
+        let jar = vec![
+            MimoCookie {
+                name: "passToken".into(),
+                value: "pt".into(),
+                domain: "account.xiaomi.com".into(),
+                path: "/".into(),
+            },
+            MimoCookie {
+                name: "other".into(),
+                value: "x".into(),
+                domain: "mimo-server-cn.xiaomimimo.com".into(),
+                path: "/".into(),
+            },
+        ];
+        assert_eq!(
+            mimo_cookie_header(&jar, "https://account.xiaomi.com/pass/serviceLogin"),
+            "passToken=pt"
+        );
+        assert_eq!(mimo_cookie_header(&jar, "https://elsewhere.example/"), "");
+        assert!(mimo_domain_matches(".xiaomi.com", "account.xiaomi.com"));
+        assert!(!mimo_domain_matches("xiaomi.com", "notxiaomi.com"));
+    }
+
+    #[test]
+    fn mimo_identity_needs_a_live_pass_token() {
+        let mut session = MimoLoginSession {
+            state: "s".into(),
+            region: "sgp".into(),
+            upstream_base: "https://mimo-server-sgp.xiaomimimo.com".into(),
+            jar: Vec::new(),
+            created: std::time::Instant::now(),
+        };
+        assert!(mimo_session_identity(&session).is_none());
+
+        session.jar.push(MimoCookie {
+            name: "passToken".into(),
+            value: "EXPIRED".into(),
+            domain: "account.xiaomi.com".into(),
+            path: "/".into(),
+        });
+        assert!(mimo_session_identity(&session).is_none());
+
+        session.jar[0].value = "live".into();
+        session.jar.push(MimoCookie {
+            name: "userId".into(),
+            value: "42".into(),
+            domain: "account.xiaomi.com".into(),
+            path: "/".into(),
+        });
+        let identity = mimo_session_identity(&session).unwrap();
+        assert_eq!(identity.0, "live");
+        assert_eq!(identity.1.as_deref(), Some("42"));
+    }
+
+    // ─── perchai plan ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn perch_plan_status_reports_the_upstream_gate() {
+        let (_dir, db) = test_db();
+        nr_db::create_provider_connection(
+            &db,
+            &json!({
+                "provider": "perchai",
+                "authType": "oauth",
+                "accessToken": "perch-token",
+                "providerSpecificData": { "appUrl": "https://app.perchai.app" },
+            }),
+        )
+        .unwrap();
+
+        let server = start_mock(|request| {
+            assert_eq!(request.path, "/api/perch-terminal/cli-plan");
+            assert_eq!(request.header("authorization"), Some("Bearer perch-token"));
+            (
+                200,
+                json!({
+                    "ok": true,
+                    "planRequired": true,
+                    "starter": { "noticeVersion": "n-1", "notice": "pick a plan" },
+                    "proUrl": "https://chat.perchai.app/pro",
+                })
+                .to_string(),
+            )
+        });
+        let _env = EnvGuard::set(&[(
+            "TEST_PERCH_APP_URL",
+            &format!("{}/api/perch-terminal/cli-plan", server.url),
+        )]);
+
+        // The connection carries its own appUrl, so point that at the mock.
+        let conns = nr_db::get_provider_connections(&db, Some(&json!({ "provider": "perchai" })))
+            .unwrap();
+        let id = conns[0]["id"].as_str().unwrap().to_string();
+        nr_db::update_provider_connection(
+            &db,
+            &id,
+            &json!({
+                "providerSpecificData": { "appUrl": server.url },
+            }),
+        )
+        .unwrap();
+
+        let response = perchai_plan_status(Query(HashMap::new())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["ok"], json!(true));
+        assert_eq!(json["required"], json!(true));
+        assert_eq!(json["plan"], json!("starter"));
+        assert_eq!(json["planLabel"], json!("Starter"));
+        assert_eq!(
+            json["errorCode"],
+            json!(nr_exec_cli::perchai::PERCH_TIER_GATE_CODE)
+        );
+        assert_eq!(json["noticeVersion"], json!("n-1"));
+        assert_eq!(json["signupUrl"], json!("https://chat.perchai.app/pro"));
+        assert_eq!(json["options"][0]["id"], json!("starter"));
+        assert_eq!(json["connectionId"], json!(id));
+    }
+
+    #[tokio::test]
+    async fn perch_plan_status_404s_without_a_connection() {
+        let (_dir, db) = test_db();
+        let _ = db;
+        let response = perchai_plan_status(Query(HashMap::new())).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(body_json(response).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("Perch AI connection not found"));
+    }
+
+    #[tokio::test]
+    async fn perch_plan_claim_rejects_an_unknown_plan() {
+        let response = perchai_plan_claim(Some(Json(json!({ "plan": "platinum" })))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(response).await;
+        assert!(json["error"].as_str().unwrap().contains("Unknown Perch plan"));
+        assert_eq!(json["options"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn perch_plan_claim_sends_pro_to_the_web_app() {
+        let (_dir, db) = test_db();
+        nr_db::create_provider_connection(
+            &db,
+            &json!({
+                "provider": "perchai",
+                "authType": "oauth",
+                "accessToken": "perch-token",
+                "providerSpecificData": { "appUrl": "https://app.perchai.app" },
+            }),
+        )
+        .unwrap();
+
+        let response = perchai_plan_claim(Some(Json(json!({ "plan": "Pro" })))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(response).await;
+        assert_eq!(json["needsManualSelection"], json!(true));
+        assert_eq!(json["plan"], json!("pro"));
+        assert_eq!(json["signupUrl"], json!("https://chat.perchai.app"));
+    }
+
+    #[tokio::test]
+    async fn perch_plan_claim_accepts_starter_and_saves_it() {
+        let (_dir, db) = test_db();
+        let server = start_mock(|request| {
+            if request.method == "POST" {
+                assert_eq!(request.json()["plan"], json!("starter"));
+                assert_eq!(request.json()["noticeVersion"], json!("n-1"));
+                (200, json!({ "ok": true }).to_string())
+            } else {
+                // First probe: gate open. Second probe (after the claim): closed.
+                (
+                    200,
+                    json!({ "ok": true, "starter": { "noticeVersion": "n-1" } }).to_string(),
+                )
+            }
+        });
+
+        nr_db::create_provider_connection(
+            &db,
+            &json!({
+                "provider": "perchai",
+                "authType": "oauth",
+                "accessToken": "perch-token",
+                "providerSpecificData": { "appUrl": server.url },
+            }),
+        )
+        .unwrap();
+
+        let response = perchai_plan_claim(None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["ok"], json!(true));
+        assert_eq!(json["plan"], json!("starter"));
+        assert_eq!(json["connectionSaved"], json!(true));
+        assert_eq!(json["appliedVia"], json!(nr_exec_cli::perchai::PERCH_CLI_PLAN_PATH));
+        assert_eq!(server.paths().len(), 3, "probe + claim + confirm probe");
+
+        let conns = nr_db::get_provider_connections(&db, Some(&json!({ "provider": "perchai" })))
+            .unwrap();
+        assert_eq!(conns[0]["providerSpecificData"]["perchPlan"], json!("starter"));
+        assert_eq!(
+            conns[0]["providerSpecificData"]["perchPlanLabel"],
+            json!("Starter")
+        );
+    }
+
+    // ─── shared helpers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn scope_and_expiry_helpers_match_the_js_shapes() {
+        assert_eq!(normalize_scope(Some(&json!(["a", " b "]))), "a b");
+        assert_eq!(normalize_scope(Some(&json!("  c  "))), "c");
+        assert_eq!(normalize_scope(None), "");
+
+        let explicit = resolve_expires_at(&json!({ "expired": "2030-01-02T03:04:05Z" }));
+        assert!(explicit.starts_with("2030-01-02T03:04:05"));
+
+        let by_seconds = resolve_expires_at(&json!({ "expires_in": 60 }));
+        let parsed = chrono::DateTime::parse_from_rfc3339(&by_seconds).unwrap();
+        let now = chrono::Utc::now();
+        assert!((parsed.with_timezone(&chrono::Utc) - now).num_seconds() > 30);
+
+        let by_jwt = resolve_expires_at(&json!({
+            "access_token": fake_jwt(json!({ "exp": 1_900_000_000u64 })),
+        }));
+        assert!(by_jwt.starts_with("2030-"));
+
+        // Nothing usable: the 1 h default.
+        let fallback = resolve_expires_at(&json!({}));
+        assert!(chrono::DateTime::parse_from_rfc3339(&fallback).is_ok());
+    }
+
+    #[test]
+    fn microsoft_endpoints_are_allowlisted() {
+        assert!(validate_microsoft_token_endpoint(
+            "https://login.microsoftonline.com/t/oauth2/v2.0/token"
+        )
+        .is_ok());
+        assert!(validate_microsoft_token_endpoint("http://login.microsoftonline.com/t").is_err());
+        assert!(validate_microsoft_token_endpoint("https://evil.example/token").is_err());
+        assert!(validate_microsoft_token_endpoint("").is_err());
+    }
+
+    #[test]
+    fn masquerades_plan_labels_and_tokens() {
+        assert_eq!(describe_perch_plan("starter"), "Starter");
+        assert_eq!(describe_perch_plan("standard_max"), "Standard 1M");
+        assert_eq!(describe_perch_plan("custom"), "custom");
+    }
+
+    #[test]
+    fn kiro_social_url_targets_cognito() {
+        let url = kiro_social_login_url("github", "challenge", "state-1");
+        assert!(url.starts_with(KIRO_SOCIAL_HOST));
+        assert!(url.contains("idp=Github"));
+        assert!(url.contains("state=state-1"));
+        assert!(url.contains("prompt=select_account"));
+    }
+}

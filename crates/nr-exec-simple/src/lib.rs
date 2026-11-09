@@ -7,6 +7,7 @@ pub mod vertex;
 pub mod gemini_cli;
 pub mod iflow;
 pub mod kimchi;
+pub mod kimchi_models;
 pub mod ollama_local;
 pub mod xiaomi_tokenplan;
 pub mod xiaomi_mimo;

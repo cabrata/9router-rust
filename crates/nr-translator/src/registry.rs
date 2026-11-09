@@ -32,6 +32,42 @@ pub mod formats {
 #[derive(Clone, Debug, Default)]
 pub struct TranslationOptions {
     pub preserve_cache_control: bool,
+    /// `strip[]` from the target provider's model entry: content types the
+    /// upstream rejects (e.g. `["image"]` for a text-only model).
+    pub strip_content_types: Vec<String>,
+}
+
+/// `stripContentTypes(body, stripList)` — drop image/audio parts the target
+/// model cannot accept, collapsing an emptied content array to `""`.
+pub fn strip_content_types(body: &mut Json, strip_list: &[String]) {
+    if strip_list.is_empty() {
+        return;
+    }
+    let should_strip = |part_type: &str| -> bool {
+        match part_type {
+            "image_url" | "image" => strip_list.iter().any(|s| s == "image"),
+            "audio_url" | "input_audio" => strip_list.iter().any(|s| s == "audio"),
+            _ => false,
+        }
+    };
+    let Some(messages) = body.get_mut("messages").and_then(Json::as_array_mut) else {
+        return;
+    };
+    for msg in messages.iter_mut() {
+        let Some(content) = msg.get_mut("content").and_then(Json::as_array_mut) else {
+            continue;
+        };
+        let before = content.len();
+        content.retain(|part| {
+            part.get("type")
+                .and_then(Json::as_str)
+                .map(|t| !should_strip(t))
+                .unwrap_or(true)
+        });
+        if content.is_empty() && before > 0 {
+            msg["content"] = Json::String(String::new());
+        }
+    }
 }
 
 /// JS request translator `(model, body, stream, credentials, options) => body`.
@@ -134,9 +170,9 @@ pub fn translate_request(
     use crate::concerns::thinkingUnified;
     use nr_common::provider;
 
-    // Strip explicit content types (opt-in via strip[] in PROVIDER_MODELS)
-    // TODO(dedupe): stripContentTypes requires PROVIDER_MODELS[provider].strip; deferred
-    // until caller threads `provider` through translate_request (currently not in signature).
+    // Strip explicit content types (opt-in via strip[] in PROVIDER_MODELS). The
+    // caller resolves the list from the target provider/model, like chatCore.
+    strip_content_types(&mut body, &options.strip_content_types);
 
     // Role the client actually ended on, before any translator drops an emptied
     // turn. detectClientLastRole: not every source uses messages[] (Gemini uses
@@ -561,6 +597,67 @@ mod tests {
         let out = translate_request("openai", "claude", "claude-sonnet-4-5", body, true, None, &TranslationOptions::default());
         let messages = out["messages"].as_array().unwrap();
         assert_eq!(messages.last().unwrap()["role"], "user");
+    }
+
+    #[test]
+    fn test_strip_content_types_drops_image_parts_only() {
+        // Unit: exactly the JS stripContentTypes contract.
+        let mut body = json!({"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "data": "AA"}}
+            ]},
+            {"role": "user", "content": "plain string"}
+        ]});
+        strip_content_types(&mut body, &["image".to_string()]);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[0]["content"][0]["type"], json!("text"));
+        // A message that only held an image collapses to an empty string.
+        assert_eq!(messages[1]["content"], json!(""));
+        // Non-array content is untouched.
+        assert_eq!(messages[2]["content"], json!("plain string"));
+
+        // Audio lists are independent of image lists.
+        let mut audio = json!({"messages": [{"role": "user", "content": [
+            {"type": "input_audio", "input_audio": {"data": "AA"}},
+            {"type": "image_url", "image_url": {"url": "u"}}
+        ]}]});
+        strip_content_types(&mut audio, &["audio".to_string()]);
+        let parts = audio["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], json!("image_url"));
+    }
+
+    #[test]
+    fn test_translate_request_applies_the_configured_strip_list() {
+        // `strip[]: ["image"]` for the target model removes the image before the
+        // Claude translator sees it.
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}
+        ]}]});
+        let options = TranslationOptions {
+            strip_content_types: vec!["image".into()],
+            ..TranslationOptions::default()
+        };
+        let out = translate_request("openai", "claude", "claude-sonnet-4-5", body, true, None, &options);
+        let content = &out["messages"][0]["content"];
+        let parts = content.as_array().map(|a| a.clone()).unwrap_or_default();
+        let has_image = parts.iter().any(|p| p["type"] == json!("image"));
+        assert!(!has_image, "image should be stripped: {out}");
+    }
+
+    #[test]
+    fn test_strip_content_types_noop_without_list() {
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "u"}}
+        ]}]});
+        let out = translate_request("openai", "openai", "x", body.clone(), true, None, &TranslationOptions::default());
+        assert_eq!(out["messages"][0]["content"].as_array().unwrap().len(), 1);
     }
 
     #[test]

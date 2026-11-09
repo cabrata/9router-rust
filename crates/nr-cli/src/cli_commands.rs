@@ -1,8 +1,9 @@
 //! CLI command handlers for subcommands like `connect`, `show`, `xai video`.
 //! These commands run without requiring the server to be started.
-//! Port of cli/src/cli/commands/{connect,show}.js.
+//! Port of cli/src/cli/commands/{connect,show,xaiVideo}.js.
 
 use nr_cli::connect_tools::{self, ApplyCtx, ToolConfig};
+use nr_cli::xai_video;
 use crate::{CliCommand, XaiCommand};
 use anyhow::{anyhow, Result};
 use inquire::{Password, Select};
@@ -50,24 +51,6 @@ Options:
   --tools <list>   Comma-separated tools (same as positional names)
   --json           Machine-readable output (API key still masked)
   -h, --help       Show this help
-"#;
-
-const HELP_XAI_VIDEO: &str = r#"
-Usage: 9router xai video --prompt "..." [options]
-
-Generate a Grok Imagine video via your local 9router gateway.
-
-Options:
-  --prompt <text>         Video description (required)
-  --output <file>         Output MP4 path (default: video.mp4)
-  --model <id>            Model (default: xai/grok-imagine-video)
-  --duration <seconds>    Video duration
-  --aspect-ratio <ratio>  e.g. 16:9, 9:16, 1:1
-  --resolution <res>      480p | 720p | 1080p
-  --timeout <seconds>     Max wait (default: 600)
-  --port <port>           Gateway port (default: 20128)
-  --api-key <key>         9router API key (or env NINE_ROUTER_API_KEY)
-  -h, --help              Show this help
 "#;
 
 /// Handle subcommands that don't require the server.
@@ -758,80 +741,23 @@ fn print_record(r: &Value) {
     }
 }
 
-// ── xai video (unchanged stub) ───────────────────────────────────────────────
+// ── xai video ────────────────────────────────────────────────────────────────
 
+/// `9router xai video …` — port of cli/src/cli/commands/xaiVideo.js.
+///
+/// The HTTP calls block, so they run on a blocking thread instead of stalling
+/// the tokio runtime that also serves the launcher.
 async fn handle_xai(cmd: XaiCommand) -> Result<()> {
     match cmd {
         XaiCommand::Video { args } => {
-            let mut help = false;
-            let mut prompt: Option<String> = None;
-            let mut output = "video.mp4".to_string();
-            let mut port = 20128u16;
-            let mut timeout_sec = 600u32;
-            let mut _api_key = std::env::var("NINE_ROUTER_API_KEY").ok();
-
-            let mut i = 0;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "-h" | "--help" => help = true,
-                    "--prompt" => {
-                        i += 1;
-                        if i < args.len() {
-                            prompt = Some(args[i].clone());
-                        }
-                    }
-                    "--output" | "-o" => {
-                        i += 1;
-                        if i < args.len() {
-                            output = args[i].clone();
-                        }
-                    }
-                    "--port" | "-p" => {
-                        i += 1;
-                        if i < args.len() {
-                            port = args[i].parse().unwrap_or(20128);
-                        }
-                    }
-                    "--timeout" => {
-                        i += 1;
-                        if i < args.len() {
-                            timeout_sec = args[i].parse().unwrap_or(600);
-                        }
-                    }
-                    "--api-key" => {
-                        i += 1;
-                        if i < args.len() {
-                            _api_key = Some(args[i].clone());
-                        }
-                    }
-                    _ => {}
-                }
-                i += 1;
+            let code = tokio::task::spawn_blocking(move || xai_video::run(&args))
+                .await
+                .unwrap_or(1);
+            if code == 0 {
+                Ok(())
+            } else {
+                Err(anyhow!("xai video exited with code {code}"))
             }
-
-            if help {
-                print!("{HELP_XAI_VIDEO}");
-                return Ok(());
-            }
-
-            println!("\n🎬 Grok Imagine Video Generation\n");
-
-            let Some(p) = prompt else {
-                println!("   ❌ Error: --prompt is required");
-                print!("{HELP_XAI_VIDEO}");
-                return Err(anyhow!("Missing required --prompt argument"));
-            };
-
-            println!("   Prompt:    {p}");
-            println!("   Output:    {output}");
-            println!("   Port:      {port}");
-            println!("   Timeout:   {timeout_sec}s");
-            println!("\n   🔄 Requires running gateway with xAI account configured.");
-            println!("   Start gateway: 9router --port {port}");
-            println!("   Then retry this command.\n");
-
-            // TODO(dedupe): POST /v1/videos/generations, poll GET /v1/videos/{id}, download.
-            Ok(())
         }
     }
 }
