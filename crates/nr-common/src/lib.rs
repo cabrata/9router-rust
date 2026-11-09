@@ -25,7 +25,22 @@ pub mod thought_signature_store;
 pub use client_detector::{detect_client_tool, is_native_passthrough};
 pub use upstream_headers::upstream_response_headers;
 pub use session_manager::{generate_binary_style_id, derive_session_id, resolve_session_id, resolve_continuation_id};
-pub use provider::{detect_format, get_target_format};
+pub use provider::{detect_format, get_target_format, normalize_thinking_config};
 pub use model::{parse_model, resolve_provider_alias};
-pub use claude_cloaking::{cloak_claude_tools, decloak_tool_names};
+pub use claude_cloaking::{cloak_claude_tools, decloak_tool_names, decloak_stream_chunk, apply_cloaking};
 pub use reasoning_content_injector::inject_reasoning_content;
+pub use claude_signature::{has_claude_signature_prefix, is_valid_claude_signature};
+pub use model_markers::strip_model_context_marker;
+pub use tag_blocks::find_tag_blocks;
+pub use web_cookie_auth::{
+    normalize_session_cookie_header, normalize_session_cookie_headers, extract_cookie_value,
+    build_grok_cookie_header, to_playwright_cookies, strip_cookie_input_prefix,
+};
+pub use gemini_cookies::{normalize_gemini_cookie_input, normalize_gemini_validation_cookie};
+pub use usage_tracking::{
+    canonicalize_usage, extract_usage, normalize_usage, merge_usage, add_buffer_to_usage,
+    filter_usage_for_format, estimate_usage, estimate_input_tokens, estimate_output_tokens,
+    format_usage, has_valid_usage, log_usage,
+};
+pub use writable_data_dir::get_writable_data_dir;
+pub use debug_log::{dbg, is_dev_enabled};
