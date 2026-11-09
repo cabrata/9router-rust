@@ -106,18 +106,25 @@ pub fn record_success(ip: &str) {
     limiter_map().lock().remove(ip);
 }
 
+/// `hasTrustedPeerHeaders(request)`: the real-IP header is only trustworthy
+/// when custom-server.js stamped it with the per-process secret it generated at
+/// boot. Without the proof the header is attacker-supplied input.
+pub fn has_trusted_peer_headers(headers: &HeaderMap) -> bool {
+    let Some(token) = std::env::var("NINEROUTER_PEER_TOKEN").ok().filter(|t| !t.is_empty()) else {
+        return false;
+    };
+    headers
+        .get("x-9r-peer-token")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == token)
+}
+
 pub fn get_client_ip(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> String {
     // Trusted real IP header from reverse proxy/custom server if peer token matches
-    if let Some(peer_token) = std::env::var("NINEROUTER_PEER_TOKEN").ok() {
-        if !peer_token.is_empty() {
-            if let Some(hdr) = headers.get("x-9r-peer-token") {
-                if hdr.to_str().unwrap_or("") == peer_token {
-                    if let Some(real_ip) = headers.get("x-9r-real-ip") {
-                        if let Ok(ip_str) = real_ip.to_str() {
-                            return ip_str.trim().to_string();
-                        }
-                    }
-                }
+    if has_trusted_peer_headers(headers) {
+        if let Some(real_ip) = headers.get("x-9r-real-ip") {
+            if let Ok(ip_str) = real_ip.to_str() {
+                return ip_str.trim().to_string();
             }
         }
     }

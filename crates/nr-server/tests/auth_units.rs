@@ -10,8 +10,8 @@
 use axum::http::{HeaderMap, HeaderValue};
 use nr_core::paths::data_dir;
 use nr_server::routes::auth::{
-    check_lock, create_dashboard_auth_token, get_client_ip, get_jwt_secret, record_fail,
-    record_success, verify_dashboard_auth_token,
+    check_lock, create_dashboard_auth_token, get_client_ip, get_jwt_secret,
+    has_trusted_peer_headers, record_fail, record_success, verify_dashboard_auth_token,
 };
 
 /// A loopback peer address for cases that must not trip the remote-access
@@ -71,6 +71,49 @@ fn proxy_trust_rules() {
     h.insert("x-9r-peer-token", HeaderValue::from_static("nope"));
     assert_eq!(get_client_ip(&h, Some(loopback_addr())), "127.0.0.1");
     drop(token_guard);
+}
+
+/// `hasTrustedPeerHeaders` on its own: no configured secret means no trust,
+/// even if the client sends the header.
+#[test]
+fn trusted_peer_requires_a_configured_secret() {
+    let prev = std::env::var_os("NINEROUTER_PEER_TOKEN");
+    std::env::remove_var("NINEROUTER_PEER_TOKEN");
+
+    let mut h = HeaderMap::new();
+    h.insert("x-9r-peer-token", HeaderValue::from_static(""));
+    h.insert("x-9r-real-ip", HeaderValue::from_static("9.9.9.9"));
+    assert!(!has_trusted_peer_headers(&h), "unset secret never trusts");
+    assert_eq!(get_client_ip(&h, Some(loopback_addr())), "127.0.0.1");
+
+    // An empty secret is as good as unset: an attacker can send an empty header.
+    std::env::set_var("NINEROUTER_PEER_TOKEN", "");
+    assert!(!has_trusted_peer_headers(&h));
+
+    match prev {
+        Some(v) => std::env::set_var("NINEROUTER_PEER_TOKEN", v),
+        None => std::env::remove_var("NINEROUTER_PEER_TOKEN"),
+    }
+}
+
+/// The ladder is 30s, 2m, 10m, 30m and then stays at 30m.
+#[test]
+fn lock_steps_escalate_and_max_out() {
+    let ip = "lockout-ladder-ip";
+    let mut observed = Vec::new();
+    for _ in 0..5 {
+        for _ in 0..6 {
+            record_fail(ip);
+        }
+        let st = check_lock(ip);
+        assert!(st.locked, "6 failures must lock");
+        observed.push(st.retry_after);
+        // Release the lock without forgetting the level so the next rung shows.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(observed[0] <= 30 && observed[0] > 0, "first rung 30s: {observed:?}");
+    assert!(observed[1] > observed[0], "second rung is longer: {observed:?}");
+    assert_eq!(observed.last().copied(), observed.get(3).copied(), "caps at 30m");
 }
 
 /// RAII: set an env var for the duration of a scope, restore it after.

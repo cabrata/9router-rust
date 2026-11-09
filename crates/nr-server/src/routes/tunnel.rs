@@ -168,8 +168,14 @@ fn is_cloudflared_running() -> bool {
 /// `killCloudflaredByPort(port)`: kill any cloudflared whose command line
 /// targets this port. The boundary class (`:20128` must not match `:201280`)
 /// is what makes the pattern safe.
+fn cloudflared_port_pattern(port: u16) -> String {
+    // JS: `cloudflared.*:${port}([^0-9]|$)` — the `$` arm matters for a command
+    // line that ends exactly at the port.
+    format!("cloudflared.*:{}[^0-9]|cloudflared.*:{}$", port, port)
+}
+
 fn kill_cloudflared_by_port(port: u16) {
-    let pattern = format!("cloudflared.*:{}[^0-9]", port);
+    let pattern = cloudflared_port_pattern(port);
     let _ = Command::new("pkill")
         .args(["-f", &pattern])
         .stdout(Stdio::null())
@@ -1004,6 +1010,16 @@ fn is_custom_daemon_running() -> bool {
 }
 
 /// `isDaemonTunMode()`: `pgrep -af "tailscaled.*<socket>"`, `None` when absent.
+/// Pure parse of `pgrep -af` output: `None` = no daemon, `Some(false)` =
+/// userspace networking, `Some(true)` = TUN mode.
+fn parse_daemon_tun_mode(text: &str) -> Option<bool> {
+    let line = text.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(!line.contains("--tun=userspace-networking"))
+}
+
 fn daemon_tun_mode() -> Option<bool> {
     let socket = tailscale_socket().to_string_lossy().into_owned();
     let out = Command::new("pgrep")
@@ -1011,11 +1027,7 @@ fn daemon_tun_mode() -> Option<bool> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.trim();
-    if line.is_empty() {
-        return None;
-    }
-    Some(!line.contains("--tun=userspace-networking"))
+    parse_daemon_tun_mode(&text)
 }
 
 /// `isDaemonAlive()`: a tailscaled process exists for our socket, regardless of
@@ -2022,5 +2034,46 @@ mod tests {
         configure_tunnel_monitoring(&json!({ "tunnelEnabled": false, "tailscaleEnabled": false }));
         assert!(MONITOR.lock().watchdog.is_none());
         assert!(MONITOR.lock().monitor.is_none());
+    }
+
+    #[test]
+    fn port_kill_pattern_has_a_digit_boundary() {
+        let pattern = cloudflared_port_pattern(20128);
+        let re = regex::Regex::new(&pattern).expect("pattern compiles");
+        // The real argv keeps going after the URL (`--no-autoupdate`), which is
+        // what the `[^0-9]` boundary consumes.
+        assert!(re.is_match("cloudflared tunnel --url http://localhost:20128 --no-autoupdate"));
+        assert!(!re.is_match("cloudflared tunnel --url http://localhost:201280 --no-autoupdate"));
+        assert!(!re.is_match("cloudflared tunnel --url http://localhost:2012 --no-autoupdate"));
+        // A command line that ends at the port still matches (the `$` arm).
+        assert!(re.is_match("cloudflared tunnel --url http://localhost:20128"));
+        assert!(!re.is_match("cloudflared tunnel --url http://localhost:201281"));
+    }
+
+    #[test]
+    fn daemon_tun_mode_parses_pgrep_output() {
+        assert_eq!(parse_daemon_tun_mode(""), None);
+        assert_eq!(parse_daemon_tun_mode("   \n"), None);
+        assert_eq!(
+            parse_daemon_tun_mode("812 tailscaled --socket=/x.sock --tun=userspace-networking"),
+            Some(false)
+        );
+        assert_eq!(parse_daemon_tun_mode("812 tailscaled --socket=/x.sock"), Some(true));
+    }
+
+    #[test]
+    fn pid_alive_rejects_non_positive_pids() {
+        assert!(!is_pid_alive(0));
+        assert!(!is_pid_alive(-1));
+    }
+
+    #[test]
+    fn saving_pid_is_readable_back() {
+        // Round-trip through the real DATA_DIR file, then clear it so a later
+        // `is_cloudflared_running` cannot see a stale pid.
+        save_pid(4321);
+        assert_eq!(load_pid(), Some(4321));
+        clear_pid();
+        assert_eq!(load_pid(), None);
     }
 }
