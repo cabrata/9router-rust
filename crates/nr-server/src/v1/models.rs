@@ -207,7 +207,8 @@ async fn build_catalog(
     // 1. Combos first
     if let Ok(combos) = get_combos(db) {
         for c in combos {
-            let combo_kind = c.kind.as_deref().unwrap_or("llm");
+            // JS: `combo?.kind || LLM_KIND`, so a missing *or empty* kind is llm.
+            let combo_kind = c.kind.as_deref().filter(|k| !k.is_empty()).unwrap_or("llm");
             if !kind_filter.contains(&combo_kind) {
                 continue;
             }

@@ -17,9 +17,8 @@ use crate::mitm::logger;
 /// Per-tool DNS hosts — written to the hosts file as `127.0.0.1 <host>`.
 /// Mirrors `src/shared/constants/mitmToolHosts.js` via the nr-data dump.
 pub fn tool_hosts() -> Value {
+    // `nr_data::export` already resolves `exports.<name>`.
     nr_data::export("src/shared/constants/mitmToolHosts", "TOOL_HOSTS")
-        .or_else(|| nr_data::export("src/shared/constants/mitmToolHosts", "module.exports"))
-        .and_then(|v| v.get("TOOL_HOSTS"))
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}))
 }

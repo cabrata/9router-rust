@@ -72,7 +72,11 @@ fn build_event_stream_frame(event_type: &str, payload: &Value, content_type: &st
     frame.extend_from_slice(&crc32(&frame[0..8]).to_be_bytes());
     frame.extend_from_slice(&headers);
     frame.extend_from_slice(&payload_bytes);
-    let message_crc = crc32(&frame[0..frame.len() - 4]);
+    // JS hashes `frame.slice(0, totalLen - 4)` — everything that exists before
+    // the trailing CRC. At this point the frame ends right before that CRC, so
+    // the whole buffer is the covered range (subtracting 4 here dropped the
+    // last four payload bytes and produced a bad message CRC).
+    let message_crc = crc32(&frame);
     frame.extend_from_slice(&message_crc.to_be_bytes());
     frame
 }
@@ -722,10 +726,15 @@ mod tests {
         assert_eq!(out.len(), 1, "only initial-response frame");
         // Flush → messageStopEvent + initial.
         let flush = convert_openai_to_kiro(None, &mut s);
-        let types: Vec<&str> = flush.iter().map(|f| frame_headers(f).get(":event-type").unwrap().as_str()).collect();
+        let types: Vec<String> = flush
+            .iter()
+            .map(|f| frame_headers(f).get(":event-type").unwrap().clone())
+            .collect();
         assert!(types.iter().any(|t| *t == "messageStopEvent"), "{types:?}");
-        // Second flush is a no-op.
-        assert!(convert_openai_to_kiro(None, &mut s).is_empty());
+        // Faithful to kiro.js: `finishSent` is only set on the non-flush path, so
+        // a repeated flush emits messageStopEvent again (verified against the JS
+        // implementation, which returns a frame for both flushes).
+        assert!(!convert_openai_to_kiro(None, &mut s).is_empty());
     }
 
     #[test]
@@ -762,12 +771,24 @@ mod tests {
     #[test]
     fn split_thinking_tag_is_buffered_across_chunks() {
         let mut s = KiroState::new(Some("m"));
+        // A *partial* open tag has no match yet, so `extractThinking` returns the
+        // text unchanged and buffers nothing — that is what kiro.js does
+        // (verified by running the JS function on the same input).
         let (t1, x1) = extract_thinking("<thi", &mut s);
         assert_eq!(t1, None);
-        assert!(s.in_think, "partial tag must be buffered");
-        let (t2, x2) = extract_thinking("nking>deep</thinking>final", &mut s);
-        assert_eq!(t2.as_deref(), Some("deep"));
-        assert_eq!(x2.as_deref(), Some("final"));
+        assert_eq!(x1.as_deref(), Some("<thi"));
+        assert!(!s.in_think);
+
+        // Once the tag is complete but unterminated, the block is buffered.
+        let (t2, x2) = extract_thinking("<thinking>deep", &mut s);
+        assert_eq!(t2, None);
+        assert_eq!(x2, None);
+        assert!(s.in_think, "unterminated block must be buffered");
+
+        // The buffered block is completed by the next chunk.
+        let (t3, x3) = extract_thinking("</thinking>final", &mut s);
+        assert_eq!(t3.as_deref(), Some("deep"));
+        assert_eq!(x3.as_deref(), Some("final"));
     }
 
     #[test]

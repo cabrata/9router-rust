@@ -213,7 +213,7 @@ impl Executor for DevinCliExecutor {
             .env("DEVIN_PERMISSION_MODE", env::var("DEVIN_PERMISSION_MODE").unwrap_or_else(|_| "bypass".to_string()))
             .spawn()
             .map_err(|e| {
-                let msg = if e.to_string().contains("not found") {
+                let msg = if e.kind() == std::io::ErrorKind::NotFound || e.to_string().contains("not found") {
                     format!("Devin CLI not found: {devin_bin}. Install via https://cli.devin.ai or set CLI_DEVIN_BIN env var.")
                 } else {
                     format!("Devin CLI spawn error: {e}")
@@ -243,7 +243,8 @@ impl Executor for DevinCliExecutor {
         let created = chrono::Utc::now().timestamp();
         let mut role_emitted = false;
         let mut total_text = String::new();
-        let mut finished = false;
+        // Any normal stop signal (message_stop, agent_stopped) ends the loop; the
+        // finish chunk is emitted once after it, mirroring JS `finish()`.
         let mut id_counter = 2u32;
         let mut output_events = String::new();
 
@@ -318,7 +319,6 @@ impl Executor for DevinCliExecutor {
                     // Check for stop signals
                     if let Some(Json::String(type_val)) = params.get("type") {
                         if matches!(type_val.as_str(), "message_stop" | "stop" | "done") {
-                            finished = true;
                             break;
                         }
                     }
@@ -327,27 +327,28 @@ impl Executor for DevinCliExecutor {
 
             // Handle agent stopped
             if msg.get("method").and_then(Json::as_str) == Some("_cognition.ai/agent_stopped") {
-                finished = true;
                 break;
             }
         }
 
-        if !finished && role_emitted {
-            let finish_chunk = json!({
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": {
-                    "prompt_tokens": (prompt_text.len() / 4).max(1),
-                    "completion_tokens": (total_text.len() / 4).max(1),
-                    "total_tokens": ((prompt_text.len() + total_text.len()) / 4).max(1),
-                    "estimated": true
-                }
-            });
-            output_events.push_str(&format!("data: {}\n\n", finish_chunk));
-        }
+        // JS `finish()` always emits the finish chunk (with or without deltas) and
+        // ends the stream, so an agent that stops before streaming still gets an
+        // OpenAI-shaped turn instead of a bare `[DONE]`.
+        let tokens = |s: &str| ((s.len() as i64) + 3) / 4;
+        let finish_chunk = json!({
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": tokens(&prompt_text),
+                "completion_tokens": tokens(&total_text),
+                "total_tokens": tokens(&prompt_text) + tokens(&total_text),
+                "estimated": true
+            }
+        });
+        output_events.push_str(&format!("data: {}\n\n", finish_chunk));
 
         output_events.push_str("data: [DONE]\n\n");
 

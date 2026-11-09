@@ -63,7 +63,17 @@ fn header_list(headers: &HeaderMap) -> HeaderList {
     out
 }
 
-async fn check_auth(db: &Db, headers: &HeaderMap, uri: &axum::http::Uri) -> Option<Response> {
+/// Auth + per-key endpoint/model allow-list gate for the media endpoints.
+///
+/// `kind` is the `ENDPOINT_KINDS` value the JS `withRequestLog` wrapper uses for
+/// this route (embeddings, images, tts, stt, video, search, fetch, systemone).
+async fn check_auth(
+    db: &Db,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    kind: &str,
+    model: Option<&str>,
+) -> Option<Response> {
     let settings = get_settings(db).unwrap_or_else(|_| json!({}));
     let require_api_key = settings.get("requireApiKey").and_then(Value::as_bool).unwrap_or(true);
     let key = support::extract_key(headers, support::query_api_key(uri).as_deref());
@@ -74,6 +84,7 @@ async fn check_auth(db: &Db, headers: &HeaderMap, uri: &axum::http::Uri) -> Opti
                 if !rec.is_active {
                     return Some(support::error_response(401, "API key is inactive"));
                 }
+                return key_permission_error(&rec, kind, model);
             }
         }
         return None;
@@ -95,7 +106,18 @@ async fn check_auth(db: &Db, headers: &HeaderMap, uri: &axum::http::Uri) -> Opti
             }
         }
     }
-    None
+    key_permission_error(&rec, kind, model)
+}
+
+/// 403 when the key's allow-lists exclude this endpoint kind or model.
+fn key_permission_error(
+    rec: &nr_db::repos::ApiKey,
+    kind: &str,
+    model: Option<&str>,
+) -> Option<Response> {
+    crate::request_log::check_key_permissions(rec, kind, model, nr_core::json::now_ms())
+        .err()
+        .map(|message| support::error_response(403, &message))
 }
 
 // ─── Embeddings ─────────────────────────────────────────────────────────────
@@ -110,7 +132,7 @@ async fn post_embeddings(
         Some(b) => b,
         None => return support::error_response(400, "Invalid JSON body"),
     };
-    if let Some(err) = check_auth(&db, &headers, &uri).await {
+    if let Some(err) = check_auth(&db, &headers, &uri, "embeddings", body.get("model").and_then(Value::as_str)).await {
         return err;
     }
     let model = match body.get("model").and_then(Value::as_str) {
@@ -145,7 +167,7 @@ async fn post_images(
         Some(b) => b,
         None => return support::error_response(400, "Invalid JSON body"),
     };
-    if let Some(err) = check_auth(&db, &headers, &uri).await {
+    if let Some(err) = check_auth(&db, &headers, &uri, "images", body.get("model").and_then(Value::as_str)).await {
         return err;
     }
     let req = ImagesRequest {
@@ -172,7 +194,7 @@ async fn post_audio_speech(
         Some(b) => b,
         None => return support::error_response(400, "Invalid JSON body"),
     };
-    if let Some(err) = check_auth(&db, &headers, &uri).await {
+    if let Some(err) = check_auth(&db, &headers, &uri, "tts", body.get("model").and_then(Value::as_str)).await {
         return err;
     }
     let req = AudioRequest {
@@ -194,7 +216,7 @@ async fn post_audio_transcriptions(
     uri: axum::http::Uri,
     body: Option<Json<Value>>,
 ) -> Response {
-    if let Some(err) = check_auth(&db, &headers, &uri).await {
+    if let Some(err) = check_auth(&db, &headers, &uri, "stt", None).await {
         return err;
     }
     let body = body.map(|Json(b)| b).unwrap_or_else(|| json!({}));
@@ -271,7 +293,7 @@ async fn post_search(
         Some(b) => b,
         None => return support::error_response(400, "Invalid JSON body"),
     };
-    if let Some(err) = check_auth(&db, &headers, &uri).await {
+    if let Some(err) = check_auth(&db, &headers, &uri, "search", body.get("model").and_then(Value::as_str)).await {
         return err;
     }
     match handle_search(body, header_list(&headers)).await {
@@ -290,7 +312,7 @@ async fn post_fetch(
         Some(b) => b,
         None => return support::error_response(400, "Invalid JSON body"),
     };
-    if let Some(err) = check_auth(&db, &headers, &uri).await {
+    if let Some(err) = check_auth(&db, &headers, &uri, "fetch", None).await {
         return err;
     }
     match handle_fetch(body, header_list(&headers)).await {
@@ -311,7 +333,7 @@ async fn post_systemone(
         Some(b) => b,
         None => return support::error_response(400, "Invalid JSON body"),
     };
-    if let Some(err) = check_auth(&db, &headers, &uri).await {
+    if let Some(err) = check_auth(&db, &headers, &uri, "systemone", body.get("model").and_then(Value::as_str)).await {
         return err;
     }
     if body.get("model").and_then(Value::as_str).is_none() {
@@ -375,7 +397,11 @@ async fn dispatch_video(
     action: &str,
     id: Option<String>,
 ) -> Response {
-    if let Some(err) = check_auth(&db, &headers, &uri).await {
+    let model = body
+        .as_ref()
+        .and_then(|Json(b)| b.get("model"))
+        .and_then(Value::as_str);
+    if let Some(err) = check_auth(&db, &headers, &uri, "video", model).await {
         return err;
     }
     let req = VideoRequest {

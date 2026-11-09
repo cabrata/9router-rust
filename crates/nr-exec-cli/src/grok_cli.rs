@@ -24,7 +24,7 @@ pub fn grok_cli_const(key: &str) -> Option<String> {
 }
 
 /// Count user turns in a Responses `input` array (≈ user messages).
-pub(crate) fn count_user_turns(input: Option<&Json>) -> usize {
+pub fn count_user_turns(input: Option<&Json>) -> usize {
     let Some(arr) = input.and_then(Json::as_array) else {
         return 1;
     };

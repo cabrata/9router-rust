@@ -23,7 +23,9 @@ use crate::support;
 pub fn routes() -> Router {
     Router::new()
         .route("/v1beta/models", get(get_models).options(options))
-        .route("/v1beta/models/{model}", post(post_generate).options(options))
+        // JS registers a catch-all (`[...path]`) so both `models/{model}` and
+        // `models/{provider}/{model}` resolve.
+        .route("/v1beta/models/{*path}", post(post_generate).options(options))
 }
 
 async fn options() -> Response {
@@ -119,10 +121,10 @@ async fn get_models() -> Response {
     Json(json!({ "models": models })).into_response()
 }
 
-/// POST /v1beta/models/{model}[:action]
+/// POST /v1beta/models/{provider}/{model}[:action]
 async fn post_generate(
     axum::Extension(db): axum::Extension<Db>,
-    Path(model): Path<String>,
+    Path(path): Path<String>,
     headers: HeaderMap,
     uri: axum::http::Uri,
     body: Option<Json<Value>>,
@@ -137,11 +139,16 @@ async fn post_generate(
 
     // Gemini path is `provider/model:action` or `model:action`. Streaming is
     // decided by the URL action, not a body field.
-    let (model_id, stream) = match model.split_once(':') {
-        Some((m, action)) if action.contains("streamGenerateContent") => (m.to_string(), true),
-        Some((m, _)) => (m.to_string(), false),
-        None => (model.clone(), false),
+    let segments: Vec<&str> = path.split('/').collect();
+    let (model_id, action) = if segments.len() >= 2 {
+        (format!("{}/{}", segments[0], segments[1]), segments[1])
+    } else {
+        (path.clone(), path.as_str())
     };
+    let stream = action.contains(":streamGenerateContent");
+    let model_id = model_id
+        .replace(":streamGenerateContent", "")
+        .replace(":generateContent", "");
 
     let chat_body = gemini_to_chat(body, &model_id, stream);
     let req = ChatRequest {

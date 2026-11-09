@@ -43,62 +43,73 @@ fn header_list(headers: &HeaderMap) -> HeaderList {
 
 /// Auth + model checks shared by chat routes. Mirrors the `settings.requireApiKey`
 /// guard in `handlers/chat.js`: local installs (key off) pass through without a key.
+///
+/// Returns the resolved key record alongside the response so the caller can
+/// attribute the request log (JS `withRequestLog` reads the same record).
 async fn preflight(
     db: &Db,
     headers: &HeaderMap,
     uri: &axum::http::Uri,
     body: &Value,
-) -> Option<Response> {
+) -> Result<Option<nr_db::repos::ApiKey>, Response> {
     let settings = get_settings(db).unwrap_or_else(|_| json!({}));
     let require_api_key = settings.get("requireApiKey").and_then(Value::as_bool).unwrap_or(true);
     let key = support::extract_key(headers, support::query_api_key(uri).as_deref());
     if !require_api_key {
+        // Local mode still honours an identified key's own restrictions.
         if let Some(k) = &key {
             if let Ok(Some(rec)) = get_api_key_by_key(db, k) {
                 if !rec.is_active {
-                    return Some(support::error_response(401, "API key is inactive"));
+                    return Err(support::error_response(401, "API key is inactive"));
                 }
+                if let Some(err) = key_permissions_error(&rec, body) {
+                    return Err(err);
+                }
+                return Ok(Some(rec));
             }
         }
         if let Some(model) = body.get("model").and_then(Value::as_str) {
             if model.trim().is_empty() {
-                return Some(support::error_response(400, "Missing model"));
+                return Err(support::error_response(400, "Missing model"));
             }
         }
-        return None;
+        return Ok(None);
     }
 
     let Some(k) = key else {
-        return Some(support::error_response(401, "Missing API key"));
+        return Err(support::error_response(401, "Missing API key"));
     };
     let Ok(Some(rec)) = get_api_key_by_key(db, &k) else {
-        return Some(support::error_response(401, "Invalid API key"));
+        return Err(support::error_response(401, "Invalid API key"));
     };
     if !rec.is_active {
-        return Some(support::error_response(401, "API key is inactive"));
+        return Err(support::error_response(401, "API key is inactive"));
     }
     if let Some(exp) = &rec.expired_at {
         if let Some(ts) = nr_core::json::parse_time_ms(&json!(exp.as_str())) {
             if ts <= nr_core::json::now_ms() {
-                return Some(support::error_response(401, "API key has expired"));
+                return Err(support::error_response(401, "API key has expired"));
             }
         }
     }
     if let Some(model) = body.get("model").and_then(Value::as_str) {
         if model.trim().is_empty() {
-            return Some(support::error_response(400, "Missing model"));
-        }
-        if !rec.allowed_models.is_empty() && !model_allowed(&model.replace("[1m]", ""), &rec.allowed_models) {
-            return Some(support::error_response(403, &format!("API key not allowed to use model: {model}")));
+            return Err(support::error_response(400, "Missing model"));
         }
     }
-    None
+    if let Some(err) = key_permissions_error(&rec, body) {
+        return Err(err);
+    }
+    Ok(Some(rec))
 }
 
-fn model_allowed(model: &str, allowed: &[String]) -> bool {
-    allowed.iter().any(|a| {
-        a == "*" || a == model || (a.ends_with("/*") && model.starts_with(&a[..a.len() - 1]))
-    })
+/// `withRequestLog`'s 403 gate: endpoint kind + model allow-lists.
+fn key_permissions_error(rec: &nr_db::repos::ApiKey, body: &Value) -> Option<Response> {
+    let model = body.get("model").and_then(Value::as_str);
+    match crate::request_log::check_key_permissions(rec, "chat", model, nr_core::json::now_ms()) {
+        Ok(()) => None,
+        Err(message) => Some(support::error_response(403, &message)),
+    }
 }
 
 /// Shared body of `chat/completions`, `messages`, `responses`, `api/chat`.
@@ -109,9 +120,16 @@ async fn dispatch_chat(
     body: Value,
     endpoint: String,
 ) -> Response {
-    if let Some(err) = preflight(&db, &headers, &uri, &body).await {
-        return err;
-    }
+    let key_record = match preflight(&db, &headers, &uri, &body).await {
+        Ok(record) => record,
+        Err(resp) => {
+            // Denied requests are logged too (JS logs before returning).
+            let ctx = request_log_context(&db, &headers, &uri, "chat", &body, None)
+                .with_key_record(None, None);
+            ctx.finish(&db, resp.status().as_u16());
+            return resp;
+        }
+    };
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -125,6 +143,8 @@ async fn dispatch_chat(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let api_key = support::extract_key(&headers, support::query_api_key(&uri).as_deref());
+    // Build the log context before `body` moves into the request.
+    let ctx = request_log_context(&db, &headers, &uri, "chat", &body, key_record.as_ref());
     let req = ChatRequest {
         model,
         body,
@@ -133,10 +153,37 @@ async fn dispatch_chat(
         endpoint,
         api_key,
     };
+
     match handle_chat(req).await {
-        Ok(resp) => support::upstream_response(resp),
-        Err(e) => support::error_response(e.status(), &e.to_string()),
+        Ok(resp) => support::upstream_response(crate::request_log::log_upstream_response(db.clone(), ctx, resp)),
+        Err(e) => {
+            let status = e.status();
+            ctx.finish(&db, status);
+            support::error_response(status, &e.to_string())
+        }
     }
+}
+
+/// Build the request-log context for one `/v1` call (JS `withRequestLog` ctx).
+fn request_log_context(
+    _db: &Db,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+    kind: &str,
+    body: &Value,
+    key_record: Option<&nr_db::repos::ApiKey>,
+) -> crate::request_log::RequestLogContext {
+    let raw_key = support::extract_key(headers, support::query_api_key(uri).as_deref());
+    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok());
+    // Display-only fallback: without a peer stamp the JS falls back to XFF.
+    let ip = crate::routes::auth::get_client_ip(headers, None);
+    let mut ctx = crate::request_log::RequestLogContext::new(kind, "POST", uri.path())
+        .with_request(raw_key.as_deref(), &ip, user_agent);
+    if let Some(rec) = key_record {
+        ctx = ctx.with_key_record(Some(&rec.id), rec.name.as_deref());
+    }
+    ctx.model = body.get("model").and_then(Value::as_str).map(str::to_string);
+    ctx
 }
 
 async fn post_chat_completions(

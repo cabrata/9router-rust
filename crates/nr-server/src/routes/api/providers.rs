@@ -28,6 +28,21 @@ const BLOCKED_HEADERS: &[&str] = &[
     "cookie",
 ];
 
+/// `usesAwsCredentialForm(provider)`: `AI_PROVIDERS[provider].credentialForm === "aws"`.
+///
+/// Read from the provider data rather than a hardcoded id list, so a newly
+/// added AWS-form provider is redacted automatically.
+pub fn uses_aws_credential_form(provider: &str) -> bool {
+    nr_data::export("src/shared/constants/providers", "AI_PROVIDERS")
+        .and_then(|v| v.get(provider))
+        .and_then(|v| v.get("credentialForm"))
+        .and_then(Value::as_str)
+        == Some("aws")
+}
+
+/// Port of `toProviderConnectionResponse`: strip secrets before the
+/// connection leaves the server, and drop `sessionToken` for AWS-form
+/// providers (the region/client keep working without it).
 pub fn to_provider_connection_response(mut conn: Value) -> Value {
     if let Some(obj) = conn.as_object_mut() {
         obj.remove("apiKey");
@@ -36,8 +51,7 @@ pub fn to_provider_connection_response(mut conn: Value) -> Value {
         obj.remove("idToken");
 
         let provider = obj.get("provider").and_then(Value::as_str).unwrap_or("");
-        let is_aws = provider == "bedrock" || provider == "bedrock-xai";
-        if is_aws {
+        if uses_aws_credential_form(provider) {
             if let Some(psd) = obj.get_mut("providerSpecificData").and_then(Value::as_object_mut) {
                 psd.remove("sessionToken");
             }
@@ -46,14 +60,38 @@ pub fn to_provider_connection_response(mut conn: Value) -> Value {
     conn
 }
 
+/// Port of `normalizeProviderId`: exact id, then the JS slug
+/// (`toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-$/g, "")`),
+/// then a case-insensitive display-name match; otherwise the trimmed input.
+/// `toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")`.
+///
+/// Runs of non-alphanumerics collapse into one dash; leading/trailing dashes are
+/// stripped. Non-ASCII characters are separators, matching the JS class.
+fn provider_slug(trimmed: &str) -> String {
+    let mut slug = String::with_capacity(trimmed.len());
+    let mut prev_dash = true; // also strips a leading dash
+    for c in trimmed.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
 fn normalize_provider_id(provider: &str) -> String {
     let trimmed = provider.trim();
     if let Some(provs) = nr_data::export("src/shared/constants/providers", "AI_PROVIDERS").and_then(Value::as_object) {
         if provs.contains_key(trimmed) {
             return trimmed.to_string();
         }
-        let slug = trimmed.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "-");
-        let slug = slug.trim_matches('-').to_string();
+        let slug = provider_slug(trimmed);
         if provs.contains_key(&slug) {
             return slug;
         }
@@ -196,6 +234,23 @@ pub async fn post_providers(ext: Option<Extension<Db>>, Json(body): Json<Value>)
     let mut psd = psd_input.cloned().unwrap_or_else(|| json!({}));
     if !psd.is_object() {
         psd = json!({});
+    }
+    // `normalizeProviderSpecificData`: ollama-local accepts its host URL under
+    // several body spellings (`baseUrl`/`baseURL`/`ollamaHostUrl`).
+    if provider == "ollama-local" {
+        let base_url = psd
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| body.get("baseUrl").and_then(Value::as_str).filter(|s| !s.trim().is_empty()))
+            .or_else(|| body.get("baseURL").and_then(Value::as_str).filter(|s| !s.trim().is_empty()))
+            .or_else(|| body.get("ollamaHostUrl").and_then(Value::as_str).filter(|s| !s.trim().is_empty()))
+            .map(|s| s.trim().to_string());
+        if let Some(url) = base_url {
+            if let Some(obj) = psd.as_object_mut() {
+                obj.insert("baseUrl".to_string(), Value::String(url));
+            }
+        }
     }
 
     if is_compatible {
@@ -817,4 +872,69 @@ pub async fn delete_providers_web_login() -> Response {
         Json(json!({ "cancelled": true })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_slug_matches_js() {
+        // Values produced by providerNormalization.js:
+        // `p.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")`
+        assert_eq!(provider_slug("OpenAI"), "openai");
+        assert_eq!(provider_slug("Anthropic"), "anthropic");
+        assert_eq!(provider_slug("Bedrock Xai"), "bedrock-xai");
+        assert_eq!(provider_slug("a__b"), "a-b");
+        assert_eq!(provider_slug("--x--"), "x");
+        // Non-ASCII is a separator in the JS class, leaving the ASCII remainder.
+        assert_eq!(provider_slug("Ünïcode"), "n-code");
+    }
+
+    #[test]
+    fn provider_id_resolution_order() {
+        // Known display name → provider id.
+        assert_eq!(normalize_provider_id("OpenAI"), "openai");
+        assert_eq!(normalize_provider_id("  Anthropic  "), "anthropic");
+        // Unknown ids pass through trimmed, never slugged or renamed.
+        assert_eq!(normalize_provider_id("  some-custom  "), "some-custom");
+        assert_eq!(normalize_provider_id("a__b"), "a__b");
+    }
+
+    #[test]
+    fn aws_form_is_data_driven() {
+        assert!(uses_aws_credential_form("bedrock"));
+        assert!(uses_aws_credential_form("bedrock-xai"));
+        assert!(!uses_aws_credential_form("openai"));
+        assert!(!uses_aws_credential_form("nonexistent-provider"));
+    }
+
+    #[test]
+    fn connection_response_strips_secrets() {
+        let conn = json!({
+            "id": "c1",
+            "provider": "openai",
+            "apiKey": "sk-secret",
+            "accessToken": "at",
+            "refreshToken": "rt",
+            "idToken": "it",
+            "providerSpecificData": { "sessionToken": "keep-me" }
+        });
+        let safe = to_provider_connection_response(conn);
+        assert!(safe.get("apiKey").is_none());
+        assert!(safe.get("accessToken").is_none());
+        assert!(safe.get("refreshToken").is_none());
+        assert!(safe.get("idToken").is_none());
+        // Non-AWS providers keep their providerSpecificData untouched.
+        assert_eq!(safe["providerSpecificData"]["sessionToken"], json!("keep-me"));
+
+        let aws = json!({
+            "id": "c2",
+            "provider": "bedrock",
+            "providerSpecificData": { "sessionToken": "secret", "region": "us-east-1" }
+        });
+        let safe = to_provider_connection_response(aws);
+        assert!(safe["providerSpecificData"].get("sessionToken").is_none());
+        assert_eq!(safe["providerSpecificData"]["region"], json!("us-east-1"));
+    }
 }

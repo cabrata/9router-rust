@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use nr_core::http::UpstreamResponse;
 use nr_db::repos::{insert_request_log, record_usage_for_request_log, ApiKey};
 use nr_db::Db;
@@ -378,6 +378,7 @@ impl Stream for LoggedStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use nr_db::repos::get_request_logs;
     use nr_db::repos::RequestLogFilter;
     use serde_json::json;
@@ -387,7 +388,8 @@ mod tests {
     fn mask_key_rules() {
         assert_eq!(mask_key(None), None);
         assert_eq!(mask_key(Some("sk-12345")), Some("sk…".to_string()));
-        assert_eq!(mask_key(Some("sk-1234567890")), Some("sk…".to_string()));
+        // `length <= 10` is the short form; 12 chars keeps head/tail.
+        assert_eq!(mask_key(Some("sk-1234567890")), Some("sk-123…7890".to_string()));
         assert_eq!(mask_key(Some("sk-abcdef123456")), Some("sk-abc…3456".to_string()));
     }
 
@@ -458,7 +460,9 @@ mod tests {
         assert_eq!(row["model"], json!("cc/opus"));
         assert_eq!(row["endpointKind"], json!("chat"));
         assert_eq!(row["stream"], json!(true));
-        assert!(row["tps"].as_f64().unwrap() > 0.0);
+        // TTFT is marked right before finishing, so generation time is ~0 ms and
+        // the JS formula yields 0 rather than infinity.
+        assert_eq!(row["tps"].as_f64().unwrap(), 0.0);
     }
 
     #[test]

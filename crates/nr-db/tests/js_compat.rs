@@ -12,11 +12,32 @@
 //!     `accessAllow` and whose `requestLogs` predates some of its columns, i.e.
 //!     a file grown by `syncSchemaFromTables()` via ALTER TABLE — that is where
 //!     column *order* stops matching the declaration and `SELECT *` breaks.
+//!
+//! Plus `tests/fixtures/js-created-data.sqlite.bin`: a database actually written
+//! by the JS app (`node src/lib/db/driver.js` under a temp DATA_DIR, rows seeded
+//! through `src/lib/db/index.js`), so the DDL strings above are not the only
+//! evidence. Regenerate with `scripts/make-js-db-fixture.mjs`.
 
 use nr_db::repos::*;
 use nr_db::Db;
 use serde_json::{json, Value};
 use tempfile::TempDir;
+
+/// How `tests/fixtures/js-created-data.sqlite` was produced, run from
+/// `../9router` with `node --import <alias+extension loader> <script>`:
+///
+///   DATA_DIR=<tmp>  driver.js `getAdapter()`  (creates + migrates the file)
+///   then, through the identical barrel the app uses (src/lib/db/index.js):
+///     updateSettings, createProviderConnection, createProviderNode,
+///     createProxyPool, createApiKey + updateApiKey(access*), createCombo,
+///     setModelAlias, addCustomModel, setMitmAliasAll, updatePricing,
+///     disableModels, saveRequestDetail, requestLogsRepo.insertRequestLog,
+///     usageDb.saveRequestUsage
+///
+/// The committed copy is unmodified output from that run. It is named `.bin`
+/// rather than `.sqlite` because the repo ignores `*.sqlite` (runtime data).
+const JS_FIXTURE: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/js-created-data.sqlite.bin");
 
 /// `PRAGMA_SQL` from src/lib/db/schema.js.
 const JS_PRAGMA_SQL: &str = "
@@ -460,4 +481,185 @@ fn export_shape_matches_js_export_db() {
     // Values survive the round trip into JSON.
     assert_eq!(exported["apiKeys"][0]["key"], json!("sk-live-abcdefghijkl"));
     assert_eq!(exported["apiKeys"][0]["access"]["restricted"], json!(true));
+}
+
+// ─── The file the JS app itself wrote ────────────────────────────────────
+//
+// Every other test below builds its database from DDL strings this repo copied
+// by hand. This one opens a database produced by running the *original* JS
+// layer, so it fails if `buildCreateTableSql()`/the repos and the Rust port
+// disagree about anything the JS app actually persisted.
+
+#[test]
+fn opens_database_written_by_the_js_app() {
+    let fixture = std::path::Path::new(JS_FIXTURE);
+    assert!(
+        fixture.exists(),
+        "missing JS fixture at {JS_FIXTURE}; regenerate per JS_FIXTURE_PROVENANCE"
+    );
+
+    // Work on a copy: Db::open migrates, and the fixture must stay pristine
+    // (it is the reference for what the JS app wrote).
+    let dir = TempDir::new().unwrap();
+    let copy = dir.path().join("js.sqlite");
+    std::fs::copy(fixture, &copy).unwrap();
+
+    // Before any Rust write, the file is exactly what the JS app left behind.
+    let before = rusqlite::Connection::open(&copy).unwrap();
+    let js_version: String = before
+        .query_row("SELECT value FROM _meta WHERE key='schemaVersion'", [], |r| r.get(0))
+        .unwrap();
+    let js_app_version: String = before
+        .query_row("SELECT value FROM _meta WHERE key='appVersion'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(js_version, "1", "fixture should be the JS migration-1 file");
+    assert_eq!(js_app_version, "0.5.116", "fixture should be JS-authored");
+    drop(before);
+
+    // The Rust layer adopts it.
+    let db = Db::open(&copy).unwrap();
+
+    // 1. Settings: raw JSON written by updateSettings(), merged with defaults.
+    let settings = get_settings(&db).unwrap();
+    assert_eq!(settings["requireApiKey"], json!(true));
+    assert_eq!(settings["stickyRoundRobinLimit"], json!(3));
+    assert_eq!(settings["cloudEnabled"], json!(false));
+    // A key the JS file never stored still comes from DEFAULT_SETTINGS.
+    assert!(settings["providerStrategies"].is_object());
+
+    // 2. Connections: `data` JSON merged to the top level, isActive as bool.
+    let conns = get_provider_connections(&db, None).unwrap();
+    assert_eq!(conns.len(), 1);
+    assert_eq!(conns[0]["provider"], json!("openai"));
+    assert_eq!(conns[0]["authType"], json!("apikey"));
+    assert_eq!(conns[0]["apiKey"], json!("sk-test-123456789"));
+    assert_eq!(conns[0]["isActive"], json!(true));
+    assert!(conns[0]["isActive"].is_boolean(), "isActive must be a JSON bool");
+    assert_eq!(
+        conns[0]["providerSpecificData"]["baseUrl"],
+        json!("https://x.test/v1")
+    );
+    let by_id = get_provider_connection_by_id(&db, conns[0]["id"].as_str().unwrap())
+        .unwrap()
+        .expect("connection by id");
+    assert_eq!(by_id["name"], json!("Main"));
+
+    // 3. Nodes and proxy pools.
+    let nodes = get_provider_nodes(&db, None).unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["baseUrl"], json!("https://n.test/v1"));
+    assert_eq!(nodes[0]["prefix"], json!("nc"));
+    let pools = get_proxy_pools(&db, None).unwrap();
+    assert_eq!(pools.len(), 1);
+    assert_eq!(pools[0]["testStatus"], json!("active"));
+    assert_eq!(pools[0]["isActive"], json!(true));
+
+    // 4. API keys: camelCase fields, JSON list columns, access columns.
+    let keys = get_api_keys(&db).unwrap();
+    assert_eq!(keys.len(), 1);
+    let key = &keys[0];
+    assert_eq!(key.name.as_deref(), Some("Main key"));
+    assert_eq!(key.machine_id.as_deref(), Some("machine1234"));
+    assert!(key.is_active);
+    assert_eq!(key.limit_concurrent, 2);
+    assert_eq!(key.rpm, 5);
+    assert!(key.allowed_models.is_empty(), "JS stored NULL for an empty list");
+    assert!(key.access.restricted);
+    assert_eq!(key.access.allow, vec!["openai/gpt-4o".to_string()]);
+    assert!(validate_api_key(&db, &key.key).unwrap());
+    assert!(get_api_key_by_key(&db, &key.key).unwrap().is_some());
+
+    // 5. Combos.
+    let combos = get_combos(&db).unwrap();
+    assert_eq!(combos.len(), 1);
+    assert_eq!(combos[0].name, "fast");
+    assert_eq!(combos[0].kind.as_deref(), Some("fallback"));
+    assert_eq!(
+        combos[0].models,
+        vec!["openai/gpt-4o".to_string(), "openai/gpt-4o-mini".to_string()]
+    );
+
+    // 6. kv-backed reads: aliases, custom models, mitm, pricing, disabled.
+    assert_eq!(
+        get_model_aliases(&db).unwrap()["fast"],
+        json!("openai/gpt-4o-mini")
+    );
+    let custom = get_custom_models(&db).unwrap();
+    assert_eq!(custom.len(), 1);
+    assert_eq!(custom[0]["id"], json!("custom-1"));
+    assert_eq!(
+        get_mitm_alias(&db, Some("cursor")).unwrap()["gpt-5"],
+        json!("openai/gpt-4o")
+    );
+    let pricing = get_pricing_for_model(&db, "openai", "gpt-4o").unwrap().unwrap();
+    // The JS build stored these verbatim from the caller's JSON, so `10` stays an
+    // integer: the Rust layer must not coerce it.
+    assert_eq!(pricing["input"], json!(2.5));
+    assert_eq!(pricing["output"], json!(10));
+    assert_eq!(
+        get_disabled_by_provider(&db, "openai").unwrap(),
+        vec!["gpt-3.5".to_string()]
+    );
+
+    // 7. Usage: history row, daily aggregate, stats, chart, recent logs.
+    let history = get_usage_history(&db, None).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0]["provider"], json!("openai"));
+    // usageRepo.getUsageHistory() projects `tokens`, not promptTokens columns.
+    assert_eq!(history[0]["tokens"]["prompt_tokens"], json!(10));
+    assert_eq!(history[0]["tokens"]["completion_tokens"], json!(20));
+    assert!(history[0]["apiKeyMasked"].is_string());
+
+    let stats = get_usage_stats(&db, Some("all")).unwrap();
+    assert_eq!(stats["totalRequests"], json!(1));
+    assert_eq!(stats["totalPromptTokens"], json!(10));
+    assert_eq!(stats["totalCompletionTokens"], json!(20));
+
+    assert_eq!(get_chart_data(&db, Some("7d")).unwrap().len(), 1);
+    // usageRepo's text lines (JS `getRecentLogs`): "date | model | PROVIDER | ...".
+    let recent = nr_db::repos::usage::get_recent_logs(&db, 10).unwrap();
+    assert_eq!(recent.len(), 1);
+    assert!(recent[0].contains("OPENAI"), "got {:?}", recent[0]);
+    // requestLogsRepo's compact projection.
+    let compact = nr_db::repos::request_logs::get_recent_logs(&db, 10).unwrap();
+    assert_eq!(compact.len(), 1);
+    assert_eq!(compact[0]["status"], json!(200));
+
+    // 8. Request logs written by the JS repo: id is INTEGER, stream a bool.
+    let logs = get_request_logs(&db, &RequestLogFilter::from_json(None)).unwrap();
+    let rows = logs["logs"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["apiKeyName"], json!("Main key"));
+    assert_eq!(rows[0]["status"], json!(200));
+    assert_eq!(rows[0]["stream"], json!(false));
+    assert_eq!(rows[0]["endpointKind"], json!("chat"));
+    assert_eq!(rows[0]["tps"], json!(20.5));
+    assert_eq!(logs["pagination"]["totalItems"], json!(1));
+
+    // 9. After the Rust migration ran, the JS build's own version key is intact
+    //    and the schema version moved to the newest migration both sides know.
+    let backup_version: String = db
+        .query_row("SELECT value FROM _meta WHERE key='backupSchemaVersion'", &[], |r| r.get(0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(backup_version, "3");
+    let migrated: String = db
+        .query_row("SELECT value FROM _meta WHERE key='schemaVersion'", &[], |r| r.get(0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(migrated, nr_db::migrate::latest_version().to_string());
+
+    // 10. The JS app's own columns are all still present, in their original
+    //     order: the Rust layer must never rebuild a JS table.
+    let key_cols: Vec<String> = db
+        .query_all("PRAGMA table_info(apiKeys)", &[], |r| r.get::<_, String>(1))
+        .unwrap();
+    assert_eq!(
+        key_cols,
+        vec![
+            "id", "key", "name", "machineId", "isActive", "expiredAt", "limitConcurrent",
+            "rpm", "createdAt", "allowedModels", "allowedEndpoints", "accessRestricted",
+            "accessAllow",
+        ]
+    );
 }
