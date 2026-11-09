@@ -6,50 +6,18 @@ pub mod openai_to_ollama;
 pub mod gemini_to_openai;
 pub mod openai_to_claude;
 pub mod claude_to_openai;
-
 pub mod openai_to_gemini;
 pub mod openai_to_vertex;
+pub mod antigravity_to_openai;
+pub mod openai_responses;
+pub mod openai_to_cursor;
+pub mod openai_to_commandcode;
 
-pub mod antigravity_to_openai {
-    use nr_core::{Credentials, Json};
-    use crate::TranslationOptions;
-    pub fn antigravity_to_openai_request(_model: &str, body: Json, _stream: bool, _credentials: Option<&mut Credentials>, _options: &TranslationOptions) -> Json {
-        // TODO: implement
-        body
-    }
-}
-
-pub mod openai_responses {
-    use nr_core::{Credentials, Json};
-    use crate::TranslationOptions;
-    pub fn openai_responses_request(_model: &str, body: Json, _stream: bool, _credentials: Option<&mut Credentials>, _options: &TranslationOptions) -> Json {
-        // TODO: implement - converts OpenAI Responses API format
-        body
-    }
-}
-
+// Stub modules for remaining translators
 pub mod openai_to_kiro {
     use nr_core::{Credentials, Json};
     use crate::TranslationOptions;
     pub fn openai_to_kiro_request(_model: &str, body: Json, _stream: bool, _credentials: Option<&mut Credentials>, _options: &TranslationOptions) -> Json {
-        // TODO: implement
-        body
-    }
-}
-
-pub mod openai_to_cursor {
-    use nr_core::{Credentials, Json};
-    use crate::TranslationOptions;
-    pub fn openai_to_cursor_request(_model: &str, body: Json, _stream: bool, _credentials: Option<&mut Credentials>, _options: &TranslationOptions) -> Json {
-        // TODO: implement
-        body
-    }
-}
-
-pub mod openai_to_commandcode {
-    use nr_core::{Credentials, Json};
-    use crate::TranslationOptions;
-    pub fn openai_to_commandcode_request(_model: &str, body: Json, _stream: bool, _credentials: Option<&mut Credentials>, _options: &TranslationOptions) -> Json {
         // TODO: implement
         body
     }
@@ -86,7 +54,8 @@ pub fn register_all(reg: &mut Registry) {
     reg.register("antigravity", "openai", Some(antigravity_to_openai::antigravity_to_openai_request), None);
 
     // openai-responses (self-contained handler)
-    reg.register("openai-responses", "openai", Some(openai_responses::openai_responses_request), None);
+    reg.register("openai-responses", "openai", Some(openai_responses::openai_responses_to_openai_request), None);
+    reg.register("openai", "openai-responses", Some(openai_responses::openai_to_openai_responses_request), None);
 
     // openai-to-kiro
     reg.register("openai", "kiro", Some(openai_to_kiro::openai_to_kiro_request), None);

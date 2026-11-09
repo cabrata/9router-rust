@@ -274,7 +274,8 @@ pub fn openai_to_commandcode_request(
     _credentials: Option<&mut Credentials>,
     _options: &TranslationOptions,
 ) -> Json {
-    let (messages, system) = convert_messages(body.get("messages").and_then(|m| m.as_array()).unwrap_or(&[]));
+    let msgs = body.get("messages").and_then(|m| m.as_array()).map(|v| v.as_slice()).unwrap_or(&[]);
+    let (messages, system) = convert_messages(msgs);
     let mut params = json!({
         "model": model,
         "messages": messages,

@@ -130,14 +130,18 @@ pub fn translate_request(
     options: &TranslationOptions,
 ) -> Json {
     use crate::concerns::tool_call;
+    use crate::concerns::thinkingUnified;
+    use nr_common::provider;
 
-    // Pre-translation setup (happens even if formats are the same)
-    // TODO(dedupe): normalizeThinkingConfig - needs nr-common provider.js
-    // TODO(dedupe): captureThinking - extract thinking from original body for later application
-    // TODO(dedupe): captureSessionId - extract session ID for upstream
+    // Strip explicit content types (opt-in via strip[] in PROVIDER_MODELS)
+    // TODO(dedupe): stripContentTypes requires PROVIDER_MODELS[provider].strip; deferred
+    // until caller threads `provider` through translate_request (currently not in signature).
 
-    // stripContentTypes: remove explicit content types (opt-in via strip[] in PROVIDER_MODELS)
-    // TODO: implement stripContentTypes(body, stripList) using provider capabilities
+    // Pre-translation: normalize provider-native thinking config against last message role.
+    provider::normalize_thinking_config(&mut body);
+
+    // Capture thinking intent before any translator strips/renames the fields.
+    let thinking_intent = thinkingUnified::capture_thinking(&body);
 
     // Ensure tool calls have IDs
     tool_call::ensure_tool_call_ids(&mut body);
@@ -152,8 +156,11 @@ pub fn translate_request(
     if source_format == target_format {
         // Normalize to OpenAI format for consistency
         if target_format == formats::OPENAI {
-            // TODO(dedupe): filterToOpenAIFormat - normalize structure
+            crate::formats::openai::filter_to_openai_format(&mut body, &crate::formats::openai::FilterOptions {
+                preserve_cache_control: options.preserve_cache_control,
+            });
         }
+        thinkingUnified::apply_thinking(target_format, model, &mut body, None, thinking_intent.as_ref());
         return body;
     }
 
@@ -181,11 +188,25 @@ pub fn translate_request(
     }
 
     // Post-translation: apply thinking, Claude prep, cloaking
-    // TODO(dedupe): applyThinking(targetFormat, model, result, provider, thinkingIntent)
-    // TODO(dedupe): filterToOpenAIFormat (if target is OpenAI)
-    // TODO(dedupe): prepareClaudeRequest (if target is Claude)
-    // TODO(dedupe): ensureTrailingUserTurn (if target is Claude)
-    // TODO(dedupe): cloakClaudeTools (if OAuth provider with cloakToolsOnOAuth quirk)
+    thinkingUnified::apply_thinking(target_format, model, &mut body, None, thinking_intent.as_ref());
+    if target_format == formats::OPENAI {
+        crate::formats::openai::filter_to_openai_format(&mut body, &crate::formats::openai::FilterOptions {
+            preserve_cache_control: options.preserve_cache_control,
+        });
+    }
+    if target_format == formats::CLAUDE {
+        let api_key = credentials.as_deref().and_then(|c| c.str("key").or_else(|| c.str("apiKey"))).map(|s| s.to_string());
+        let connection_id = credentials.as_deref().and_then(|c| c.str("connection_id")).map(|s| s.to_string());
+        crate::formats::claude::prepare_claude_request(
+            &mut body,
+            None,
+            api_key.as_deref(),
+            connection_id.as_deref(),
+            None,
+            None,
+        );
+        crate::formats::claude::anchor_claude_cache(&mut body);
+    }
 
     body
 }
@@ -218,9 +239,11 @@ pub fn translate_response(
     // Same format: passthrough with stream tool-call ID fixup
     if source_format == target_format {
         if let Some(chunk) = chunk {
-            // TODO(dedupe): ensureStreamToolCallIds - fixup tool call IDs for openai passthrough
-            // TODO(dedupe): decloakStreamChunk - restore OAuth cloaked tool names
-            // TODO(dedupe): restoreToolNames - general tool name restoration
+            // Restore OAuth-cloaked tool names (state.toolNameMap set by cloak_claude_tools).
+            if let Some(map) = state.tool_name_map.as_ref() {
+                let restored = nr_common::claude_cloaking::decloak_stream_chunk(chunk, Some(map));
+                return vec![restored];
+            }
             return vec![chunk.clone()];
         }
         return Vec::new();

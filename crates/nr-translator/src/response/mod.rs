@@ -6,60 +6,12 @@ pub mod claude_to_openai;
 pub mod cursor_to_openai;
 pub mod openai_to_claude;
 pub mod gemini_to_openai;
-
-pub mod openai_to_antigravity {
-    use nr_core::Json;
-    use crate::StreamState;
-    pub fn openai_to_antigravity_response(_chunk: Option<&Json>, _state: &mut StreamState) -> Vec<Json> {
-        // TODO: implement
-        if let Some(chunk) = _chunk { vec![chunk.clone()] } else { Vec::new() }
-    }
-}
-
-pub mod openai_responses {
-    use nr_core::Json;
-    use crate::StreamState;
-    pub fn openai_responses_response(_chunk: Option<&Json>, _state: &mut StreamState) -> Vec<Json> {
-        // TODO: implement - converts OpenAI Responses API format
-        if let Some(chunk) = _chunk { vec![chunk.clone()] } else { Vec::new() }
-    }
-}
-
-pub mod kiro_to_openai {
-    use nr_core::Json;
-    use crate::StreamState;
-    pub fn kiro_to_openai_response(_chunk: Option<&Json>, _state: &mut StreamState) -> Vec<Json> {
-        // TODO: implement
-        if let Some(chunk) = _chunk { vec![chunk.clone()] } else { Vec::new() }
-    }
-}
-
-pub mod ollama_to_openai {
-    use nr_core::Json;
-    use crate::StreamState;
-    pub fn ollama_to_openai_response(_chunk: Option<&Json>, _state: &mut StreamState) -> Vec<Json> {
-        // TODO: implement
-        if let Some(chunk) = _chunk { vec![chunk.clone()] } else { Vec::new() }
-    }
-}
-
-pub mod commandcode_to_openai {
-    use nr_core::Json;
-    use crate::StreamState;
-    pub fn commandcode_to_openai_response(_chunk: Option<&Json>, _state: &mut StreamState) -> Vec<Json> {
-        // TODO: implement
-        if let Some(chunk) = _chunk { vec![chunk.clone()] } else { Vec::new() }
-    }
-}
-
-pub mod kiro_to_claude {
-    use nr_core::Json;
-    use crate::StreamState;
-    pub fn kiro_to_claude_response(_chunk: Option<&Json>, _state: &mut StreamState) -> Vec<Json> {
-        // TODO: implement direct route
-        if let Some(chunk) = _chunk { vec![chunk.clone()] } else { Vec::new() }
-    }
-}
+pub mod openai_to_antigravity;
+pub mod openai_responses;
+pub mod kiro_to_openai;
+pub mod ollama_to_openai;
+pub mod commandcode_to_openai;
+pub mod kiro_to_claude;
 
 /// Register every response translator (JS side-effect imports in translator/index.js).
 pub fn register_all(reg: &mut Registry) {
