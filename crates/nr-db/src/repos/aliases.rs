@@ -82,59 +82,65 @@ pub fn add_custom_model(
     let model_type = model_type.unwrap_or("llm");
     let key = custom_key(provider_alias, id, model_type);
 
-    // TODO(dedupe): Implement atomic read-modify-write (requires transaction)
-    let existing = db.query_row(
-        "SELECT value FROM kv WHERE scope = ? AND key = ?",
-        &[&CUSTOM_MODELS_SCOPE, &key],
-        |row| {
-            let value: String = row.get(0)?;
-            Ok(parse_json(Some(value), json!({})))
-        },
-    )?;
-
+    // Atomic upsert inside a transaction to prevent duplicate races.
+    // Re-adding an existing model updates caps/name/transport without resetting
+    // omitted fields (addCustomModel).
     let mut added = false;
-    if let Some(prev) = existing {
-        // Update existing
-        let mut next = prev.clone();
-        if let Some(n) = name {
-            next["name"] = Value::String(n.to_string());
-        }
-        if let Some(c) = caps {
-            next["caps"] = c.clone();
-        }
-        if let Some(t) = transport {
-            next["transport"] = Value::String(t.to_string());
-        }
-
-        let next_json = stringify_json(&next);
-        db.execute_with_params(
-            "UPDATE kv SET value = ? WHERE scope = ? AND key = ?",
-            [next_json, CUSTOM_MODELS_SCOPE.to_string(), key],
-        )?;
-    } else {
-        // Insert new
-        let mut value = json!({
-            "providerAlias": provider_alias,
-            "id": id,
-            "type": model_type,
-            "name": name.unwrap_or(id),
-        });
-
-        if let Some(c) = caps {
-            value["caps"] = c.clone();
-        }
-        if let Some(t) = transport {
-            value["transport"] = Value::String(t.to_string());
-        }
-
-        let value_json = stringify_json(&value);
-        db.execute_with_params(
-            "INSERT INTO kv(scope, key, value) VALUES(?, ?, ?)",
-            [CUSTOM_MODELS_SCOPE.to_string(), key, value_json],
+    db.with_tx(|tx| {
+        let existing = tx.query_row(
+            "SELECT value FROM kv WHERE scope = ? AND key = ?",
+            &[&CUSTOM_MODELS_SCOPE, &key],
+            |row| {
+                let value: String = row.get(0)?;
+                Ok(parse_json(Some(value), json!({})))
+            },
         )?;
 
-        added = true;
-    }
+        if let Some(prev) = existing {
+            // Update existing
+            let mut next = prev;
+            if let Some(n) = name {
+                next["name"] = Value::String(n.to_string());
+            }
+            if let Some(c) = caps {
+                next["caps"] = c.clone();
+            }
+            if let Some(t) = transport {
+                next["transport"] = Value::String(t.to_string());
+            }
+
+            let next_json = stringify_json(&next);
+            tx.execute_with_params(
+                "UPDATE kv SET value = ? WHERE scope = ? AND key = ?",
+                [next_json.as_str(), CUSTOM_MODELS_SCOPE, key.as_str()],
+            )?;
+        } else {
+            // Insert new
+            let mut value = json!({
+                "providerAlias": provider_alias,
+                "id": id,
+                "type": model_type,
+                "name": name.unwrap_or(id),
+            });
+
+            if let Some(c) = caps {
+                value["caps"] = c.clone();
+            }
+            if let Some(t) = transport {
+                value["transport"] = Value::String(t.to_string());
+            }
+
+            let value_json = stringify_json(&value);
+            tx.execute_with_params(
+                "INSERT INTO kv(scope, key, value) VALUES(?, ?, ?)",
+                [CUSTOM_MODELS_SCOPE, key.as_str(), value_json.as_str()],
+            )?;
+
+            added = true;
+        }
+
+        Ok(())
+    })?;
 
     Ok(added)
 }

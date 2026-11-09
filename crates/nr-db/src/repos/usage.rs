@@ -17,6 +17,7 @@ lazy_static::lazy_static! {
 struct PendingState {
     by_model: HashMap<String, i32>,
     by_account: HashMap<String, HashMap<String, i32>>,
+    pending_timers: HashMap<String, tokio::task::JoinHandle<()>>,
     last_error_provider: (String, i64),
 }
 
@@ -25,6 +26,7 @@ impl PendingState {
         PendingState {
             by_model: HashMap::new(),
             by_account: HashMap::new(),
+            pending_timers: HashMap::new(),
             last_error_provider: (String::new(), 0),
         }
     }
@@ -65,50 +67,142 @@ fn mask_api_key(key: Option<&str>) -> Option<String> {
     })
 }
 
-/// Track a pending request (increment/decrement counter)
+/// Track a pending request (increment/decrement counter).
+/// Mirrors usageRepo.trackPendingRequest: byModel/byAccount counts, a
+/// PENDING_TIMEOUT_MS watchdog that clears a stuck entry, and the 10s
+/// lastErrorProvider window surfaced by getActiveRequests().
 pub fn track_pending_request(
     _db: &Db,
     model: &str,
     provider: &str,
-    _connection_id: Option<&str>,
+    connection_id: Option<&str>,
     started: bool,
-    _error: bool,
+    error: bool,
 ) -> Result<()> {
-    let mut state = PENDING_REQUESTS.lock().unwrap();
     let model_key = if !provider.is_empty() {
         format!("{} ({})", model, provider)
     } else {
         model.to_string()
     };
+    let timer_key = format!("{}|{}", connection_id.unwrap_or(""), model_key);
 
-    if started {
-        let entry = state.by_model.entry(model_key).or_insert(0);
-        *entry += 1;
-    } else {
-        if let Some(entry) = state.by_model.get_mut(&model_key) {
-            *entry = (*entry - 1).max(0);
+    {
+        let mut state = PENDING_REQUESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let bump = |slot: &mut i32, delta: i32| {
+            *slot = (*slot + delta).max(0);
+        };
+
+        let model_slot = state.by_model.entry(model_key.clone()).or_insert(0);
+        bump(model_slot, if started { 1 } else { -1 });
+        if *model_slot == 0 {
+            state.by_model.remove(&model_key);
+        }
+
+        if let Some(conn_id) = connection_id.filter(|id| !id.is_empty()) {
+            let models = state.by_account.entry(conn_id.to_string()).or_default();
+            let slot = models.entry(model_key.clone()).or_insert(0);
+            bump(slot, if started { 1 } else { -1 });
+            if *slot == 0 {
+                models.remove(&model_key);
+                if models.is_empty() {
+                    state.by_account.remove(conn_id);
+                }
+            }
+        }
+
+        // Watchdog: clear a pending entry if its stream never finished.
+        if started {
+            let task_model_key = model_key.clone();
+            let task_conn_id = connection_id.map(str::to_string);
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(PENDING_TIMEOUT_MS)).await;
+                let mut state = PENDING_REQUESTS
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(slot) = state.by_model.get_mut(&task_model_key) {
+                    *slot = 0;
+                }
+                if let Some(conn_id) = task_conn_id {
+                    if let Some(models) = state.by_account.get_mut(&conn_id) {
+                        if let Some(slot) = models.get_mut(&task_model_key) {
+                            *slot = 0;
+                        }
+                    }
+                }
+            });
+            state.pending_timers.insert(timer_key, handle);
+        } else {
+            // clearTimeout: the request finished; drop the watchdog.
+            if let Some(handle) = state.pending_timers.remove(&timer_key) {
+                handle.abort();
+            }
+        }
+
+        // A failed request darkens that provider for 10s.
+        if !started && error && !provider.is_empty() {
+            state.last_error_provider = (provider.to_lowercase(), chrono::Utc::now().timestamp_millis());
         }
     }
 
-    // Note: stats event emission would go to dashboard via broadcast channel
-    // TODO(dedupe): Integrate tokio broadcast when async runtime is available
+    schedule_stats_event("pending", 150);
     Ok(())
 }
 
 /// Get active requests summary
 pub fn get_active_requests(db: &Db) -> Result<Value> {
-    let state = PENDING_REQUESTS.lock().unwrap();
+    // Connection display names, like getConnectionMapCached().
+    let connection_map: HashMap<String, String> = crate::repos::connections::get_provider_connections(db, None)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|c| {
+            let id = c.get("id").and_then(|v| v.as_str())?.to_string();
+            let name = c
+                .get("name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| c.get("email").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+                .unwrap_or(&id)
+                .to_string();
+            Some((id, name))
+        })
+        .collect();
+
+    let error_provider = {
+        let state = PENDING_REQUESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let recent = chrono::Utc::now().timestamp_millis() - state.last_error_provider.1 < 10000;
+        if recent {
+            state.last_error_provider.0.clone()
+        } else {
+            String::new()
+        }
+    };
 
     let mut active_requests = vec![];
-    for (model_key, count) in &state.by_model {
-        if *count > 0 {
-            if let Some((model, provider)) = model_key.split_once(" (") {
-                let provider = provider.trim_end_matches(')');
+    {
+        let state = PENDING_REQUESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (connection_id, models) in &state.by_account {
+            for (model_key, count) in models {
+                if *count <= 0 {
+                    continue;
+                }
+                let account_name = connection_map
+                    .get(connection_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let short: String = connection_id.chars().take(8).collect();
+                        format!("Account {short}...")
+                    });
+                let (model, provider) = match model_key.rsplit_once(" (") {
+                    Some((model, provider)) => {
+                        (model.to_string(), provider.trim_end_matches(')').to_string())
+                    }
+                    None => (model_key.clone(), "unknown".to_string()),
+                };
                 active_requests.push(json!({
                     "model": model,
                     "provider": provider,
-                    "account": "unknown",
-                    "count": count
+                    "account": account_name,
+                    "count": count,
                 }));
             }
         }
@@ -154,12 +248,6 @@ pub fn get_active_requests(db: &Db) -> Result<Value> {
         }
     }
 
-    let error_provider = if chrono::Utc::now().timestamp_millis() - state.last_error_provider.1 < 10000 {
-        state.last_error_provider.0.clone()
-    } else {
-        String::new()
-    };
-
     Ok(json!({
         "activeRequests": active_requests,
         "recentRequests": recent_requests,
@@ -167,13 +255,26 @@ pub fn get_active_requests(db: &Db) -> Result<Value> {
     }))
 }
 
-/// Calculate cost from tokens and pricing
-async fn calculate_cost(provider: Option<&str>, model: Option<&str>, tokens: Option<&Value>) -> f64 {
-    if tokens.is_none() || provider.is_none() || model.is_none() {
+/// Calculate cost from tokens and pricing.
+/// Mirrors usageRepo.calculateCost: resolve pricing for (provider, model), then
+/// delegate the math to the single source of truth (open-sse/providers/pricing.js).
+fn calculate_cost(db: &Db, provider: Option<&str>, model: Option<&str>, tokens: Option<&Value>) -> f64 {
+    let (Some(provider), Some(model), Some(tokens)) = (provider, model, tokens) else {
+        return 0.0;
+    };
+    if provider.is_empty() || model.is_empty() {
         return 0.0;
     }
-    // TODO(dedupe): Import calculate_cost_from_tokens from nr_data once ported
-    0.0
+    // Fail-open, exactly like the JS try/catch around this call.
+    let pricing = match crate::repos::pricing::get_pricing_for_model(db, provider, model) {
+        Ok(Some(p)) => p,
+        Ok(None) => return 0.0,
+        Err(e) => {
+            tracing::error!(error = %e, "Error calculating cost");
+            return 0.0;
+        }
+    };
+    nr_data::pricing::calculate_cost_from_tokens(Some(tokens), Some(&pricing))
 }
 
 /// Save usage entry to the database with deduplication
@@ -212,10 +313,10 @@ pub async fn save_request_usage(db: &Db, entry: &Value) -> Result<()> {
         .unwrap_or(0);
 
     // Calculate cost
-    let cost = calculate_cost(provider, model, Some(tokens)).await;
+    let cost = calculate_cost(db, provider, model, Some(tokens));
 
     // Transaction: check for duplicate, insert, update daily, increment lifetime counter
-    db.transaction(|db| {
+    let inserted = db.transaction(|db| -> Result<bool> {
         // Check for existing row with same key columns
         let existing = db.query_row(
             "SELECT id FROM usageHistory WHERE timestamp = ? AND COALESCE(provider, '') = COALESCE(?, '') AND COALESCE(model, '') = COALESCE(?, '') AND COALESCE(connectionId, '') = COALESCE(?, '') AND COALESCE(apiKey, '') = COALESCE(?, '') AND promptTokens = ? AND completionTokens = ? ORDER BY id DESC LIMIT 1",
@@ -239,7 +340,7 @@ pub async fn save_request_usage(db: &Db, entry: &Value) -> Result<()> {
                     (ep, timestamp.as_str(), provider),
                 )?;
             }
-            return Ok(());
+            return Ok(false);
         }
 
         let tokens_json = stringify_json(tokens);
@@ -316,13 +417,30 @@ pub async fn save_request_usage(db: &Db, entry: &Value) -> Result<()> {
             .unwrap_or(0) + 1;
         db.execute_with_params(
             "INSERT INTO _meta(key, value) VALUES('totalRequestsLifetime', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (&String::from("totalRequestsLifetime"), &next.to_string()),
+            // JS binds only the value; the key is a SQL literal here.
+            [next.to_string()],
         )?;
 
         // Note: stats event emission would go to dashboard via broadcast channel
-        // TODO(dedupe): Integrate tokio broadcast when async runtime is available
-        Ok(())
+        Ok(true)
     })?;
+
+    if inserted {
+        // Mirrors saveRequestUsage: one optimistically-applied row plus a
+        // coalesced update so subscribers re-read period totals.
+        stats_emitter().emit_live(&json!({
+            "timestamp": timestamp,
+            "provider": provider,
+            "model": model,
+            "connectionId": connection_id,
+            "promptTokens": prompt_tokens,
+            "completionTokens": completion_tokens,
+            "cachedTokens": cached_tokens,
+            "cost": cost,
+            "status": status,
+        }));
+        schedule_stats_event("update", 250);
+    }
 
     Ok(())
 }
@@ -464,16 +582,21 @@ pub fn get_realtime_summary(db: &Db, period: Option<&str>) -> Result<Value> {
 
     let cutoff = match period {
         "today" => {
+            // JS: new Date().setHours(0,0,0,0) then toISOString() - local
+            // midnight expressed in UTC. Interpret the local day start against
+            // the process timezone, rather than from_naive_utc_and_offset()
+            // which would misread local midnight as UTC and shift it.
             let now = chrono::Local::now();
             let start_of_day = now
                 .date_naive()
                 .and_hms_opt(0, 0, 0)
                 .unwrap_or_default();
-            chrono::DateTime::<chrono::Local>::from_naive_utc_and_offset(
-                start_of_day,
-                now.offset().to_owned(),
-            )
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            start_of_day
+                .and_local_timezone(now.timezone())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .earliest()
+                .unwrap_or_else(|| chrono::Utc::now())
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         }
         "24h" => {
             let now = chrono::Utc::now();
@@ -695,8 +818,319 @@ pub fn get_recent_logs(db: &Db, limit: usize) -> Result<Vec<String>> {
     Ok(logs)
 }
 
-/// Get stats emitter (would emit updates to dashboard via broadcast channel)
-/// TODO(dedupe): Implement tokio broadcast integration once async runtime is available
-pub fn get_stats_emitter() -> () {
-    () // Placeholder - returns unit type for now
+/// Realtime stats emitter, port of usageRepo.js `statsEmitter`.
+///
+/// JS exposes a Node EventEmitter with three events (`update`, `pending`,
+/// `live`); the usage SSE stream subscribes to all three. Tokio's broadcast
+/// channel carries the same three payloads, so every subscriber sees every
+/// event. Emissions are debounce-coalesced like scheduleStatsEvent().
+pub struct StatsEmitter {
+    update: tokio::sync::broadcast::Sender<Value>,
+    pending: tokio::sync::broadcast::Sender<Value>,
+    live: tokio::sync::broadcast::Sender<Value>,
+}
+
+pub static STATS_EMITTER: std::sync::LazyLock<StatsEmitter> = std::sync::LazyLock::new(|| {
+    StatsEmitter {
+        update: tokio::sync::broadcast::channel(64).0,
+        pending: tokio::sync::broadcast::channel(64).0,
+        live: tokio::sync::broadcast::channel(64).0,
+    }
+});
+
+impl StatsEmitter {
+    /// `statsEmitter.on("update", fn)` -> a receiver for `update` payloads.
+    pub fn subscribe_update(&self) -> tokio::sync::broadcast::Receiver<Value> {
+        self.update.subscribe()
+    }
+
+    /// `statsEmitter.on("pending", fn)` -> a receiver for `pending` payloads.
+    pub fn subscribe_pending(&self) -> tokio::sync::broadcast::Receiver<Value> {
+        self.pending.subscribe()
+    }
+
+    /// `statsEmitter.on("live", fn)` -> a receiver for `live` row payloads.
+    pub fn subscribe_live(&self) -> tokio::sync::broadcast::Receiver<Value> {
+        self.live.subscribe()
+    }
+
+    fn emit(&self, tx: &tokio::sync::broadcast::Sender<Value>, event: &str, payload: Value) {
+        // No receivers yet is normal (the stream may not be connected); JS
+        // EventEmitter.emit on zero listeners is the same no-op.
+        if let Err(e) = tx.send(payload) {
+            tracing::trace!(event, error = %e, "stats emitter: no active subscribers");
+        }
+    }
+
+    /// Emit `update`: period totals changed, so the summary should be re-read.
+    pub fn emit_update(&self, period: &str) {
+        self.emit(&self.update, "update", json!({ "period": period }));
+    }
+
+    /// Emit `pending`: active/recent request lists changed.
+    pub fn emit_pending(&self) {
+        self.emit(&self.pending, "pending", json!({}));
+    }
+
+    /// Emit `live`: one just-written usage row, applied optimistically by clients.
+    pub fn emit_live(&self, row: &Value) {
+        self.emit(&self.live, "live", row.clone());
+    }
+}
+
+/// Schedule a stats event after a short delay, coalescing repeats, exactly like
+/// scheduleStatsEvent(): `update` for a new usage row, `pending` for tracking.
+/// Each event type carries at most one timer.
+static STATS_EMIT_TIMERS: std::sync::LazyLock<Mutex<HashMap<&'static str, bool>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn schedule_stats_event(event: &str, delay_ms: u64) {
+    let mut timers = STATS_EMIT_TIMERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let key: &'static str = if event == "update" { "update" } else { "pending" };
+    if *timers.get(key).unwrap_or(&false) {
+        return;
+    }
+    timers.insert(key, true);
+    drop(timers);
+
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        STATS_EMIT_TIMERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, false);
+        // Coalesced fires don't know the period that triggered them; the
+        // subscriber re-reads from the DB for its own selected period anyway.
+        if key == "update" {
+            stats_emitter().emit_update("today");
+        } else {
+            stats_emitter().emit_pending();
+        }
+    });
+}
+
+/// Get the process-wide stats emitter (JS `statsEmitter`).
+pub fn stats_emitter() -> &'static StatsEmitter {
+    &STATS_EMITTER
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (TempDir, Db) {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open_in(dir.path()).unwrap();
+        (dir, db)
+    }
+
+    #[tokio::test]
+    async fn save_request_usage_roundtrip() {
+        let (_dir, db) = db();
+        let entry = json!({
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "provider": "acme",
+            "model": "acme-1",
+            "connectionId": "conn-1",
+            "apiKey": "key-1",
+            "endpoint": "chat",
+            "status": "ok",
+            "tokens": {"prompt_tokens": 1000, "completion_tokens": 500},
+        });
+        save_request_usage(&db, &entry).await.unwrap();
+
+        let history = get_usage_history(&db, None).unwrap();
+        assert_eq!(history.len(), 1);
+        let row = &history[0];
+        // get_usage_history's projection (matching JS) has no promptTokens column.
+        assert_eq!(row["provider"], json!("acme"));
+        assert_eq!(row["model"], json!("acme-1"));
+        assert_eq!(row["status"], json!("ok"));
+        assert_eq!(row["tokens"]["prompt_tokens"], json!(1000));
+        assert_eq!(row["tokens"]["completion_tokens"], json!(500));
+
+        // Daily aggregate was upserted. Read it back directly: the bucket date is
+        // the server's local date, which differs from UTC in the test env.
+        let day_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM usageDaily",
+                &[],
+                |row| row.get(0),
+            )
+            .unwrap()
+            .unwrap_or(0);
+        assert_eq!(day_count, 1);
+        let day: Value = serde_json::from_str(
+            &db.query_row(
+                "SELECT data FROM usageDaily",
+                &[],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(day["requests"], json!(1));
+        assert_eq!(day["promptTokens"], json!(1000));
+
+        // Lifetime counter incremented.
+        let lifetime = db
+            .query_row(
+                "SELECT value FROM _meta WHERE key = 'totalRequestsLifetime'",
+                &[],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(lifetime, "1");
+
+        // Duplicate timestamp/provider/model/tokens is a no-op (no double count).
+        save_request_usage(&db, &entry).await.unwrap();
+        let history = get_usage_history(&db, None).unwrap();
+        assert_eq!(history.len(), 1);
+        let lifetime = db
+            .query_row(
+                "SELECT value FROM _meta WHERE key = 'totalRequestsLifetime'",
+                &[],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(lifetime, "1");
+    }
+
+    #[tokio::test]
+    async fn realtime_summary_loads_saved_rows() {
+        let (_dir, db) = db();
+        // Use a "now" timestamp so the row lands inside the today/24h windows.
+        let entry = json!({
+            "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "provider": "acme",
+            "model": "acme-1",
+            "tokens": {"prompt_tokens": 300, "completion_tokens": 200},
+        });
+        save_request_usage(&db, &entry).await.unwrap();
+
+        let summary = get_realtime_summary(&db, Some("today")).unwrap();
+        assert_eq!(summary["totalRequests"], json!(1));
+        assert_eq!(summary["totalPromptTokens"], json!(300));
+        assert_eq!(summary["totalCompletionTokens"], json!(200));
+
+        let active = get_active_requests(&db).unwrap();
+        // by_account only counts in-flight (started) requests; this test never
+        // starts one, so none of its recent rows should be active. (Other tests
+        // share the process-wide pending map, so filter by our row's model.)
+        let active_for_model = active["activeRequests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["model"] == json!("acme-1"));
+        assert!(!active_for_model);
+        // recentRequests come from usageHistory, which is per-Db (temp dir).
+        let recent = active["recentRequests"].as_array().unwrap();
+        assert!(recent.iter().any(|r| r["model"] == json!("acme-1")));
+    }
+
+    #[tokio::test]
+    async fn calculate_cost_resolves_pricing() {
+        let (_dir, db) = db();
+        // acme-1 has no default pricing; verify cost is 0 for unlisted models.
+        let cost = calculate_cost(
+            &db,
+            Some("acme"),
+            Some("acme-1"),
+            Some(&json!({"prompt_tokens": 1000, "completion_tokens": 0})),
+        );
+        assert_eq!(cost, 0.0);
+
+        // A priced model: 1M input tokens at $1/M = $1.00.
+        crate::repos::pricing::update_pricing(
+            &db,
+            &json!({"acme": {"acme-1": {"input": 1.0, "output": 2.0}}}),
+        )
+        .unwrap();
+        let cost = calculate_cost(
+            &db,
+            Some("acme"),
+            Some("acme-1"),
+            Some(&json!({"prompt_tokens": 1_000_000, "completion_tokens": 0})),
+        );
+        assert!((cost - 1.0).abs() < 1e-9);
+
+        // Missing inputs are fail-open (0.0), never an error.
+        assert_eq!(calculate_cost(&db, None, Some("m"), Some(&json!({}))), 0.0);
+        assert_eq!(calculate_cost(&db, Some("p"), None, Some(&json!({}))), 0.0);
+        assert_eq!(calculate_cost(&db, Some("p"), Some("m"), None), 0.0);
+    }
+
+    #[tokio::test]
+    async fn track_pending_roundtrip_with_connection_names() {
+        let (_dir, db) = db();
+        // create_provider_connection assigns its own id (dedup rules in JS parity).
+        let conn = crate::repos::connections::create_provider_connection(
+            &db,
+            &json!({"provider": "openai", "name": "My Account", "authType": "api-key", "apiKey": "k"}),
+        )
+        .unwrap();
+        let conn_id = conn["id"].as_str().unwrap().to_string();
+
+        track_pending_request(&db, "gpt-5", "openai", Some(&conn_id), true, false).unwrap();
+        let active = get_active_requests(&db).unwrap();
+        let list = active["activeRequests"].as_array().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["model"], json!("gpt-5"));
+        assert_eq!(list[0]["provider"], json!("openai"));
+        assert_eq!(list[0]["account"], json!("My Account"));
+        assert_eq!(list[0]["count"], json!(1));
+
+        // Second start for the same key increments.
+        track_pending_request(&db, "gpt-5", "openai", Some(&conn_id), true, false).unwrap();
+        let active = get_active_requests(&db).unwrap();
+        assert_eq!(active["activeRequests"][0]["count"], json!(2));
+
+        // Finish one -> decrements; finish the rest -> entry disappears.
+        track_pending_request(&db, "gpt-5", "openai", Some(&conn_id), false, false).unwrap();
+        track_pending_request(&db, "gpt-5", "openai", Some(&conn_id), false, false).unwrap();
+        let active = get_active_requests(&db).unwrap();
+        assert!(active["activeRequests"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn track_pending_records_error_provider_for_10s() {
+        let (_dir, db) = db();
+        track_pending_request(&db, "m", "openai", Some("conn-9"), true, false).unwrap();
+        track_pending_request(&db, "m", "openai", Some("conn-9"), false, true).unwrap();
+
+        let active = get_active_requests(&db).unwrap();
+        assert_eq!(active["errorProvider"], json!("openai"));
+    }
+
+    #[test]
+    fn stats_emitter_broadcasts_update_and_live() {
+        let mut update_rx = stats_emitter().subscribe_update();
+        let mut live_rx = stats_emitter().subscribe_live();
+
+        stats_emitter().emit_update("today");
+        stats_emitter().emit_live(&json!({"model": "gpt-5", "promptTokens": 1}));
+
+        // broadcast delivers to every subscriber.
+        let update = update_rx.blocking_recv().unwrap();
+        assert_eq!(update["period"], json!("today"));
+        let live = live_rx.blocking_recv().unwrap();
+        assert_eq!(live["model"], json!("gpt-5"));
+    }
+
+    #[tokio::test]
+    async fn pending_track_schedules_emit_without_panicking_outside_runtime() {
+        // schedule_stats_event only spawns a task; even with no runtime attached
+        // (or a fresh one) the synchronous state updates still work.
+        let (_dir, db) = db();
+        track_pending_request(&db, "m", "openai", Some("conn-x"), true, false).unwrap();
+        let active = get_active_requests(&db).unwrap();
+        assert!(!active["activeRequests"].as_array().unwrap().is_empty());
+        track_pending_request(&db, "m", "openai", Some("conn-x"), false, false).unwrap();
+    }
 }

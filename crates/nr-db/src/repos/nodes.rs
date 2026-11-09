@@ -178,12 +178,113 @@ pub fn update_provider_node(db: &Db, id: &str, data: &Value) -> Result<Option<Va
     }
 }
 
-/// Delete a provider node
+/// Delete a provider node.
+///
+/// Mirrors nodesRepo.deleteProviderNode: removes the node and its
+/// `customModels` kv rows (`key LIKE '<id>|%'`) in one transaction.
 pub fn delete_provider_node(db: &Db, id: &str) -> Result<bool> {
-    // TODO(dedupe): Also delete custom models (kv table cleanup) inside a transaction
-    let rows = db.execute_with_params(
-        "DELETE FROM providerNodes WHERE id = ?",
-        [id],
-    )?;
-    Ok(rows > 0)
+    db.with_tx(|tx| {
+        let exists = tx.query_row(
+            "SELECT 1 FROM providerNodes WHERE id = ?",
+            &[&id],
+            |_row| Ok(()),
+        )?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+
+        tx.execute_with_params("DELETE FROM providerNodes WHERE id = ?", [id])?;
+        tx.execute_with_params(
+            "DELETE FROM kv WHERE scope = 'customModels' AND key LIKE ?",
+            [format!("{id}|%").as_str()],
+        )?;
+        Ok(true)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (TempDir, Db) {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open_in(dir.path()).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn create_get_update_delete_roundtrip() {
+        let (_dir, db) = db();
+        let created = create_provider_node(
+            &db,
+            &json!({
+                "id": "node-1",
+                "type": "openai-compatible",
+                "name": "Node One",
+                "baseUrl": "https://api.example.com",
+                "apiType": "chat",
+                "prefix": "acme"
+            }),
+        )
+        .unwrap();
+        assert_eq!(created["id"], json!("node-1"));
+        assert_eq!(created["name"], json!("Node One"));
+
+        // Extra (non-column) fields round-trip through the `data` blob.
+        let fetched = get_provider_node_by_id(&db, "node-1").unwrap().unwrap();
+        assert_eq!(fetched["baseUrl"], json!("https://api.example.com"));
+        assert_eq!(fetched["apiType"], json!("chat"));
+        assert_eq!(fetched["prefix"], json!("acme"));
+
+        // Filter by type.
+        let typed = get_provider_nodes(
+            &db,
+            Some(&json!({"type": "openai-compatible"})),
+        )
+        .unwrap();
+        assert_eq!(typed.len(), 1);
+        let none = get_provider_nodes(&db, Some(&json!({"type": "vertex"}))).unwrap();
+        assert!(none.is_empty());
+
+        // Update merges and keeps unspecified fields.
+        let updated = update_provider_node(&db, "node-1", &json!({"name": "Renamed"}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated["name"], json!("Renamed"));
+        assert_eq!(updated["baseUrl"], json!("https://api.example.com"));
+        let refetched = get_provider_node_by_id(&db, "node-1").unwrap().unwrap();
+        assert_eq!(refetched["name"], json!("Renamed"));
+        assert_ne!(refetched["updatedAt"], fetched["updatedAt"]);
+
+        // Update of a missing node returns None.
+        assert!(update_provider_node(&db, "nope", &json!({"name": "x"}))
+            .unwrap()
+            .is_none());
+
+        // Delete returns true once, then false.
+        assert!(delete_provider_node(&db, "node-1").unwrap());
+        assert!(!delete_provider_node(&db, "node-1").unwrap());
+        assert!(get_provider_node_by_id(&db, "node-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_removes_attached_custom_models() {
+        let (_dir, db) = db();
+        create_provider_node(
+            &db,
+            &json!({"id": "node-x", "type": "openai-compatible", "name": "X"}),
+        )
+        .unwrap();
+        crate::repos::aliases::add_custom_model(&db, "node-x", "model-a", None, None, None, None)
+            .unwrap();
+        crate::repos::aliases::add_custom_model(&db, "other", "model-b", None, None, None, None)
+            .unwrap();
+
+        assert!(delete_provider_node(&db, "node-x").unwrap());
+
+        let remaining = crate::repos::aliases::get_custom_models(&db).unwrap();
+        assert_eq!(remaining.len(), 1, "only the other provider's model survives");
+        assert_eq!(remaining[0]["id"], json!("model-b"));
+    }
 }
