@@ -3,8 +3,6 @@
 use nr_core::{Credentials, Json};
 use crate::{TranslationOptions, schema::*};
 
-const CLAUDE_OAUTH_TOOL_PREFIX: &str = "";
-
 /// Convert OpenAI request to Claude format.
 pub fn openai_to_claude_request(
     model: &str,
@@ -25,7 +23,7 @@ pub fn openai_to_claude_request(
 
     // Temperature
     if let Some(temp) = body.get("temperature").and_then(|v| v.as_f64()) {
-        result["temperature"] = Json::Number(serde_json::Number::from_f64(temp).unwrap_or_default());
+        result["temperature"] = serde_json::Number::from_f64(temp).map(Json::Number).unwrap_or(Json::Null);
     }
 
     // Messages

@@ -1,6 +1,5 @@
 //! Claude to OpenAI response translator. Port of open-sse/translator/response/claude-to-openai.js.
 
-use indexmap::indexmap;
 use nr_core::Json;
 use serde_json::json;
 
@@ -71,10 +70,10 @@ pub fn claude_to_openai_response(chunk: Option<&Json>, state: &mut StreamState) 
                 }
             }
 
-            results.push(chunk::build_chunk(
+            results.push(chunk::build_chunk_for(
                 &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
                 state.model.as_deref().unwrap_or(""),
-                &json!({ "role": schema::roles::ASSISTANT }),
+                json!({ "role": schema::roles::ASSISTANT }),
                 None,
             ));
         }
@@ -118,10 +117,10 @@ pub fn claude_to_openai_response(chunk: Option<&Json>, state: &mut StreamState) 
 
                     state.tool_calls.insert(idx, tool_call.clone());
 
-                    results.push(chunk::build_chunk(
+                    results.push(chunk::build_chunk_for(
                         &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
                         state.model.as_deref().unwrap_or(""),
-                        &json!({ "tool_calls": [tool_call] }),
+                        json!({ "tool_calls": [tool_call] }),
                         None,
                     ));
                 }
@@ -144,10 +143,10 @@ pub fn claude_to_openai_response(chunk: Option<&Json>, state: &mut StreamState) 
                         "text_delta" => {
                             if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
                                 if !text.is_empty() {
-                                    results.push(chunk::build_chunk(
+                                    results.push(chunk::build_chunk_for(
                                         &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
                                         state.model.as_deref().unwrap_or(""),
-                                        &json!({ "content": text }),
+                                        json!({ "content": text }),
                                         None,
                                     ));
                                 }
@@ -156,10 +155,10 @@ pub fn claude_to_openai_response(chunk: Option<&Json>, state: &mut StreamState) 
                         "thinking_delta" => {
                             if let Some(text) = delta.get("thinking").and_then(|v| v.as_str()) {
                                 if !text.is_empty() {
-                                    results.push(chunk::build_chunk(
+                                    results.push(chunk::build_chunk_for(
                                         &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
                                         state.model.as_deref().unwrap_or(""),
-                                        &reasoning::reasoning_delta(text),
+                                        reasoning::reasoning_delta(text, false),
                                         None,
                                     ));
                                 }
@@ -177,10 +176,10 @@ pub fn claude_to_openai_response(chunk: Option<&Json>, state: &mut StreamState) 
                                         }
                                     }
 
-                                    results.push(chunk::build_chunk(
+                                    results.push(chunk::build_chunk_for(
                                         &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
                                         state.model.as_deref().unwrap_or(""),
-                                        &json!({
+                                        json!({
                                             "tool_calls": [{
                                                 "index": block_index,
                                                 "id": tool_call.get("id"),
@@ -271,32 +270,32 @@ pub fn claude_to_openai_response(chunk: Option<&Json>, state: &mut StreamState) 
                             .and_then(|sd| sd.get("explanation"))
                             .and_then(|v| v.as_str())
                         {
-                            results.push(chunk::build_chunk(
+                            results.push(chunk::build_chunk_for(
                                 &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
                                 state.model.as_deref().unwrap_or(""),
-                                &json!({ "content": explanation }),
+                                json!({ "content": explanation }),
                                 None,
                             ));
                         }
                     }
 
-                    let mut final_chunk = chunk::build_chunk(
+                    let mut final_chunk = chunk::build_chunk_for(
                         &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
                         state.model.as_deref().unwrap_or(""),
-                        &json!({}),
+                        json!({}),
                         state.finish_reason.as_deref(),
                     );
 
                     if let Some(usage) = &state.usage {
-                        final_chunk["usage"] = usage::to_openai_usage(
-                            Some(&json!({
-                                "input_tokens": usage.get("input_tokens"),
-                                "output_tokens": usage.get("output_tokens"),
-                                "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
-                                "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
-                            })),
-                            "claude",
-                        );
+                        let raw = json!({
+                            "input_tokens": usage.get("input_tokens"),
+                            "output_tokens": usage.get("output_tokens"),
+                            "cache_read_input_tokens": usage.get("cache_read_input_tokens"),
+                            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+                        });
+                        if let Some(u) = usage::to_openai_usage(&raw, "claude") {
+                            final_chunk["usage"] = u;
+                        }
                     }
 
                     results.push(final_chunk);
@@ -318,10 +317,10 @@ pub fn claude_to_openai_response(chunk: Option<&Json>, state: &mut StreamState) 
                         }
                     });
 
-                let mut final_chunk = chunk::build_chunk(
+                let mut final_chunk = chunk::build_chunk_for(
                     &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
                     state.model.as_deref().unwrap_or(""),
-                    &json!({}),
+                    json!({}),
                     Some(&finish_reason),
                 );
 

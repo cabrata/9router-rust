@@ -52,13 +52,14 @@ pub fn openai_completion_to_claude_message(response_body: &Json) -> Json {
 
     // Extract tool calls
     if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+        let empty = Json::Object(serde_json::Map::new());
         for (idx, tool_call) in tool_calls.iter().enumerate() {
-            let fn_obj = tool_call.get("function").unwrap_or(&json!({}));
+            let fn_obj = tool_call.get("function").unwrap_or(&empty);
             let fn_name = fn_obj.get("name").or_else(|| tool_call.get("name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let fn_args = fn_obj.get("arguments").or_else(|| tool_call.get("arguments"))
-                .unwrap_or(&json!({}));
+                .unwrap_or(&empty);
             let tool_id = tool_call.get("id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())

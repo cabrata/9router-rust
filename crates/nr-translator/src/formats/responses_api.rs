@@ -48,8 +48,11 @@ pub fn clamp_responses_call_id(id: &str) -> String {
 /// Coerce Responses API arguments to valid JSON string
 pub fn coerce_responses_arguments(value: &Json) -> String {
     match value {
-        Json::Null | Json::String("") => "{}".to_string(),
+        Json::Null => "{}".to_string(),
         Json::String(s) => {
+            if s.is_empty() {
+                return "{}".to_string();
+            }
             if serde_json::from_str::<serde_json::Value>(s).is_ok() {
                 s.clone()
             } else {

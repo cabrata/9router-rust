@@ -5,16 +5,14 @@ use nr_core::Json;
 
 /// Prepare request for Claude format endpoints
 /// TODO: full implementation with cache_control management and message normalization
-pub fn prepare_claude_request(_body: &mut Json, _provider: Option<&str>, _api_key: Option<&str>, _connection_id: Option<&str>, _raw_headers: Option<&Json>, _session_id: Option<&str>) -> &mut Json {
-    // Stub: implementation needed
-    _body
+pub fn prepare_claude_request(_body: &mut Json, _provider: Option<&str>, _api_key: Option<&str>, _connection_id: Option<&str>, _raw_headers: Option<&Json>, _session_id: Option<&str>) {
+    // Stub: implementation needed (cache_control management + message normalization)
 }
 
 /// Ensure trailing user turn for Claude (no empty assistant prefill)
 /// TODO: full implementation with clientLastRole handling
-pub fn ensure_trailing_user_turn(messages: &mut Vec<Json>, _client_last_role: Option<&str>) -> &mut Vec<Json> {
-    // Stub: implementation needed
-    messages
+pub fn ensure_trailing_user_turn(_messages: &mut Vec<Json>, _client_last_role: Option<&str>) {
+    // Stub: implementation needed (clientLastRole handling)
 }
 
 /// Find last cacheable tool index

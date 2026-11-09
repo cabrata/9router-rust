@@ -2,10 +2,9 @@
 
 use nr_core::Json;
 use serde_json::json;
-use std::collections::HashMap;
 
 use crate::concerns::{finish_reason, reasoning};
-use crate::schema::{self, claude_blocks, claude_events, claude_deltas};
+use crate::schema::{claude_blocks, claude_events, claude_deltas};
 use crate::state::StreamState;
 
 const CLAUDE_OAUTH_TOOL_PREFIX: &str = "proxy_";

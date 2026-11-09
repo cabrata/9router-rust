@@ -6,9 +6,9 @@ use nr_core::Json;
 /// Filter messages to OpenAI standard format
 /// Remove: thinking, redacted_thinking, signature, and other non-OpenAI blocks
 /// TODO: full implementation with content block filtering and tool normalization
-pub fn filter_to_openai_format(body: &mut Json, _opts: &FilterOptions) -> &mut Json {
+pub fn filter_to_openai_format(body: &mut Json, _opts: &FilterOptions) {
     if !body.get("messages").and_then(|v| v.as_array()).is_some() {
-        return body;
+        return;
     }
 
     // Stub: full implementation needed
@@ -16,8 +16,6 @@ pub fn filter_to_openai_format(body: &mut Json, _opts: &FilterOptions) -> &mut J
     // - Filter invalid content types
     // - Remove empty text blocks
     // - Normalize tools from Claude/Gemini to OpenAI format
-
-    body
 }
 
 #[derive(Clone, Debug, Default)]
@@ -38,7 +36,7 @@ mod tests {
             ]
         });
         let opts = FilterOptions::default();
-        let result = filter_to_openai_format(&mut body, &opts);
-        assert!(result.is_object());
+        filter_to_openai_format(&mut body, &opts);
+        assert!(body.is_object());
     }
 }

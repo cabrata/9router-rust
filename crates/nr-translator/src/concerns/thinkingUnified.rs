@@ -3,7 +3,6 @@
 //! TODO(dedupe): full implementation with thinkingFormat resolution and application
 
 use nr_core::Json;
-use crate::concerns::thinking::{budget_to_level, effort_to_budget};
 
 /// Extract unified thinking intent from a request body (post-translation, mixed shapes).
 /// Returns { mode, budget?, level? } or null when no thinking intent present.

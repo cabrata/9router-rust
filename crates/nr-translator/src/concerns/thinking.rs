@@ -29,12 +29,12 @@ pub fn effort_to_budget(effort: &str) -> Option<i64> {
 
 /// OpenAI reasoning_effort → Gemini thinkingLevel (gemini-3 enum: minimal|low|medium|high).
 /// Gemini 3 cannot fully disable thinking; "none"/"off" map to "minimal".
-pub fn effort_to_thinking_level(effort: &str) -> &'static str {
+pub fn effort_to_thinking_level(effort: &str) -> String {
     let e = effort.to_lowercase().trim().to_string();
     match e.as_str() {
-        "none" | "off" => "minimal",
-        "xhigh" | "max" => "high",
-        _ => &e,
+        "none" | "off" => "minimal".to_string(),
+        "xhigh" | "max" => "high".to_string(),
+        _ => e,
     }
 }
 

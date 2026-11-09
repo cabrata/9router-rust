@@ -26,6 +26,20 @@ pub fn build_chunk(opts: &ChunkOptions, delta: Json, finish_reason: Option<&str>
     })
 }
 
+/// Convenience wrapper mirroring the JS `buildChunk(id, model, delta, finishReason)` call sites,
+/// which derive id/model from the stream state and use "now" for `created`.
+pub fn build_chunk_for(id: &str, model: &str, delta: Json, finish_reason: Option<&str>) -> Json {
+    let opts = ChunkOptions {
+        id: id.to_string(),
+        created: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        model: model.to_string(),
+    };
+    build_chunk(&opts, delta, finish_reason)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

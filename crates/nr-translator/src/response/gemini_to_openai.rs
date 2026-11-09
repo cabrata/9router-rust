@@ -3,7 +3,7 @@
 use nr_core::Json;
 use serde_json::json;
 
-use crate::concerns::{chunk, finish_reason, reasoning, usage};
+use crate::concerns::{chunk, reasoning, usage};
 use crate::schema::{self, openai_blocks, openai_finish};
 use crate::state::StreamState;
 
@@ -43,10 +43,10 @@ pub fn gemini_to_openai_response(chunk_opt: Option<&Json>, state: &mut StreamSta
         state.ext.insert("functionIndex".to_string(), json!(0));
         state.ext.insert("geminiToolCallCount".to_string(), json!(0));
 
-        results.push(chunk::build_chunk(
+        results.push(chunk::build_chunk_for(
             &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
             state.model.as_deref().unwrap_or(""),
-            &json!({ "role": schema::roles::ASSISTANT }),
+            json!({ "role": schema::roles::ASSISTANT }),
             None,
         ));
     }
@@ -80,15 +80,15 @@ pub fn gemini_to_openai_response(chunk_opt: Option<&Json>, state: &mut StreamSta
                 if has_text {
                     if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                         let delta = if is_thought {
-                            reasoning::reasoning_delta(text)
+                            reasoning::reasoning_delta(text, false)
                         } else {
                             json!({ "content": text })
                         };
 
-                        results.push(chunk::build_chunk(
+                        results.push(chunk::build_chunk_for(
                             &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
                             state.model.as_deref().unwrap_or(""),
-                            &delta,
+                            delta,
                             None,
                         ));
                     }
@@ -108,15 +108,15 @@ pub fn gemini_to_openai_response(chunk_opt: Option<&Json>, state: &mut StreamSta
             if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
                 if !text.is_empty() {
                     let delta = if is_thought {
-                        reasoning::reasoning_delta(text)
+                        reasoning::reasoning_delta(text, false)
                     } else {
                         json!({ "content": text })
                     };
 
-                    results.push(chunk::build_chunk(
+                    results.push(chunk::build_chunk_for(
                         &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
                         state.model.as_deref().unwrap_or(""),
-                        &delta,
+                        delta,
                         None,
                     ));
                 }
@@ -140,10 +140,10 @@ pub fn gemini_to_openai_response(chunk_opt: Option<&Json>, state: &mut StreamSta
 
                     let data_uri = format!("data:{};base64,{}", mime_type, data);
 
-                    results.push(chunk::build_chunk(
+                    results.push(chunk::build_chunk_for(
                         &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
                         state.model.as_deref().unwrap_or(""),
-                        &json!({
+                        json!({
                             "images": [{
                                 "type": openai_blocks::IMAGE_URL,
                                 "image_url": { "url": data_uri }
@@ -161,23 +161,24 @@ pub fn gemini_to_openai_response(chunk_opt: Option<&Json>, state: &mut StreamSta
         .get("usageMetadata")
         .or(chunk.get("usageMetadata"));
     if let Some(usage_data) = usage_meta {
-        let usage_obj = usage::to_openai_usage(Some(usage_data), "gemini");
-        state.usage = Some(usage_obj);
+        if let Some(usage_obj) = usage::to_openai_usage(usage_data, "gemini") {
+            state.usage = Some(usage_obj);
+        }
     }
 
     // Finish reason
     if let Some(finish_reason) = candidate.get("finishReason").and_then(|v| v.as_str()) {
-        let mut resolved_reason = finish_reason::gemini_to_openai_finish_reason(finish_reason);
+        let mut resolved_reason = gemini_finish::gemini_to_openai_finish_reason(finish_reason);
 
         let tool_count = state.ext.get("geminiToolCallCount").and_then(|v| v.as_i64()).unwrap_or(0);
         if resolved_reason == openai_finish::STOP && tool_count > 0 {
             resolved_reason = openai_finish::TOOL_CALLS;
         }
 
-        let mut final_chunk = chunk::build_chunk(
+        let mut final_chunk = chunk::build_chunk_for(
             &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
             state.model.as_deref().unwrap_or(""),
-            &json!({}),
+            json!({}),
             Some(resolved_reason),
         );
 
@@ -217,13 +218,14 @@ fn emit_function_call(
     let func_args = func_call.get("args").cloned().unwrap_or(json!({}));
 
     let func_index = state.ext.get("functionIndex").and_then(|v| v.as_i64()).unwrap_or(0);
+    let fallback_id = format!("{}-{}-{}", restored_name, std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis(), func_index);
     let call_id = func_call
         .get("id")
         .and_then(|v| v.as_str())
-        .unwrap_or(&format!("{}-{}-{}", restored_name, std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(), func_index));
+        .unwrap_or(&fallback_id);
 
     let tool_call = json!({
         "id": call_id,
@@ -241,16 +243,16 @@ fn emit_function_call(
         .and_then(|v| v.as_i64())
         .unwrap_or(0) + 1));
 
-    results.push(chunk::build_chunk(
+    results.push(chunk::build_chunk_for(
         &format!("chatcmpl-{}", state.message_id.as_deref().unwrap_or("unknown")),
         state.model.as_deref().unwrap_or(""),
-        &json!({ "tool_calls": [tool_call] }),
+        json!({ "tool_calls": [tool_call] }),
         None,
     ));
 }
 
 // Finish reason mapping
-mod finish_reason {
+mod gemini_finish {
     use crate::schema::openai_finish;
 
     pub fn gemini_to_openai_finish_reason(reason: &str) -> &'static str {
