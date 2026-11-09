@@ -8,6 +8,7 @@ pub mod image;
 pub mod json;
 #[allow(non_snake_case)]
 pub mod kiroConversation;
+pub mod kiro_session_replay;
 pub mod message;
 pub mod modality;
 #[allow(non_snake_case)]

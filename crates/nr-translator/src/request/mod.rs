@@ -12,25 +12,9 @@ pub mod antigravity_to_openai;
 pub mod openai_responses;
 pub mod openai_to_cursor;
 pub mod openai_to_commandcode;
-
-// Stub modules for remaining translators
-pub mod openai_to_kiro {
-    use nr_core::{Credentials, Json};
-    use crate::TranslationOptions;
-    pub fn openai_to_kiro_request(_model: &str, body: Json, _stream: bool, _credentials: Option<&mut Credentials>, _options: &TranslationOptions) -> Json {
-        // TODO: implement
-        body
-    }
-}
-
-pub mod claude_to_kiro {
-    use nr_core::{Credentials, Json};
-    use crate::TranslationOptions;
-    pub fn claude_to_kiro_request(_model: &str, body: Json, _stream: bool, _credentials: Option<&mut Credentials>, _options: &TranslationOptions) -> Json {
-        // TODO: implement direct route
-        body
-    }
-}
+pub(crate) mod kiro_shared;
+pub mod openai_to_kiro;
+pub mod claude_to_kiro;
 
 /// Register every request translator (JS side-effect imports in translator/index.js).
 pub fn register_all(reg: &mut Registry) {
