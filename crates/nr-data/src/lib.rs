@@ -550,7 +550,11 @@ pub fn get_platform_enum() -> i32 {
 
 /// Get Gemini CLI user agent string
 pub fn gemini_cli_user_agent(model: Option<&str>) -> String {
-    const GEMINI_CLI_VERSION: &str = "0.1.0"; // TODO(dedupe): read from package version
+    // Same source as appConstants.js: PROVIDERS["gemini-cli"].cliVersion.
+    let version = crate::provider("gemini-cli")
+        .and_then(|p| p.get("cliVersion"))
+        .and_then(Json::as_str)
+        .unwrap_or("0.0.0");
     let model_str = model.unwrap_or("unknown");
     #[cfg(target_os = "macos")]
     let os = "Darwin";
@@ -568,7 +572,7 @@ pub fn gemini_cli_user_agent(model: Option<&str>) -> String {
 
     format!(
         "GeminiCLI/{}/{} ({}; {}; terminal)",
-        GEMINI_CLI_VERSION, model_str, os, arch
+        version, model_str, os, arch
     )
 }
 
@@ -603,8 +607,12 @@ pub fn build_kimi_headers(device_id: Option<&str>) -> JsonMap {
         "Unknown x64".to_string()
     };
 
-    // TODO(dedupe): Use gethostname crate for real hostname
-    let device_name = "unknown".to_string();
+    // Kimi Code OAuth headers (CLIProxyAPI parity): deviceName is the OS hostname.
+    let device_name = hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
 
     let resolved_id = if let Some(id) = device_id {
         let trimmed = id.trim();

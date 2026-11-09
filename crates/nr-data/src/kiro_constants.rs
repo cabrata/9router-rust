@@ -244,12 +244,41 @@ pub fn resolve_kiro_model(model: &str) -> serde_json::Value {
     })
 }
 
+/// Parse a trailing "model(level)" / "model(budget)" suffix.
+/// Mirrors thinkingUnified.js parseSuffix(): returns (cleanModel, override).
+/// TODO(dedupe): use nr_translator::concerns::thinking_unified::parse_suffix once
+/// a shared crate owns it (nr-data cannot depend on nr-translator).
+fn parse_suffix(model: &str) -> (String, Option<Json>) {
+    static SUFFIX_REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^(.*)\(([^()]+)\)\s*$").unwrap());
+    let Some(caps) = SUFFIX_REGEX.captures(model) else {
+        return (model.to_string(), None);
+    };
+    let clean_model = caps.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default();
+    let raw = caps.get(2).map(|m| m.as_str().trim().to_lowercase()).unwrap_or_default();
+
+    let override_cfg = match raw.as_str() {
+        "none" | "off" => serde_json::json!({"mode": "none"}),
+        "auto" => serde_json::json!({"mode": "auto"}),
+        "ultra" => serde_json::json!({"mode": "level", "level": raw}),
+        _ if raw.chars().all(|c| c.is_ascii_digit()) && !raw.is_empty() => {
+            serde_json::json!({"mode": "budget", "budget": raw.parse::<f64>().unwrap_or(0.0)})
+        }
+        // Known effort levels (LEVEL_TO_BUDGET keys).
+        _ if matches!(
+            raw.as_str(),
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        ) => serde_json::json!({"mode": "level", "level": raw}),
+        _ => return (clean_model, None),
+    };
+    (clean_model, Some(override_cfg))
+}
+
 /// Resolve a Kiro model after consuming the generic model(level) suffix.
 pub fn resolve_kiro_model_intent(model: &str) -> serde_json::Value {
-    // TODO(dedupe): use thinkingUnified::parse_suffix once ported
-    let clean_model = model.to_string(); // placeholder - needs proper suffix parsing
+    let (clean_model, thinking_override) = parse_suffix(model);
     let mut result = resolve_kiro_model(&clean_model);
-    result["thinkingOverride"] = serde_json::Value::Null;
+    result["thinkingOverride"] = thinking_override.unwrap_or(Json::Null);
     result
 }
 
@@ -299,15 +328,196 @@ pub fn apply_kiro_thinking_override(
     next
 }
 
+/// Extract the unified thinking intent from a request body (mixed wire shapes).
+/// Mirrors thinkingUnified.js extractThinking(): { mode, budget?, level? } or None.
+/// TODO(dedupe): use nr_translator::concerns::thinking_unified::extract_thinking
+/// once a shared crate owns it (nr-data cannot depend on nr-translator).
+fn extract_thinking(body: Option<&Json>) -> Option<Json> {
+    let body = body?;
+
+    // Claude output_config.effort (explicit) - priority over adaptive thinking
+    if let Some(oc) = body.get("output_config").and_then(|o| o.get("effort")).and_then(Json::as_str) {
+        if !oc.is_empty() {
+            let e = oc.to_lowercase();
+            return Some(match e.as_str() {
+                "none" | "off" => serde_json::json!({"mode": "none"}),
+                "auto" => serde_json::json!({"mode": "auto"}),
+                _ => serde_json::json!({"mode": "level", "level": e}),
+            });
+        }
+    }
+
+    // OpenAI chat / Responses shape - effort first (zai sends both thinking object
+    // and reasoning.effort)
+    let effort = body
+        .get("reasoning_effort")
+        .and_then(Json::as_str)
+        .or_else(|| {
+            body.get("reasoning")
+                .and_then(|r| r.as_object())
+                .and_then(|r| r.get("effort"))
+                .and_then(Json::as_str)
+        });
+    if let Some(effort) = effort.filter(|e| !e.is_empty()) {
+        let e = effort.to_lowercase();
+        return Some(match e.as_str() {
+            "none" | "off" => serde_json::json!({"mode": "none"}),
+            "auto" => serde_json::json!({"mode": "auto"}),
+            _ => serde_json::json!({"mode": "level", "level": e}),
+        });
+    }
+
+    // Claude shape
+    if let Some(t) = body.get("thinking").filter(|t| t.is_object()) {
+        match t.get("type").and_then(Json::as_str) {
+            Some("disabled") => return Some(serde_json::json!({"mode": "none"})),
+            Some("adaptive") | Some("enabled") => {
+                let budget = t.get("budget_tokens").and_then(Json::as_f64).unwrap_or(0.0);
+                if budget > 0.0 {
+                    return Some(serde_json::json!({"mode": "budget", "budget": budget}));
+                }
+                return Some(serde_json::json!({"mode": "auto"}));
+            }
+            _ => {}
+        }
+    }
+
+    // Gemini shape (top-level, generationConfig, or request envelope)
+    if let Some(tc) = body
+        .get("thinkingConfig")
+        .or_else(|| body.get("generationConfig").and_then(|g| g.get("thinkingConfig")))
+        .or_else(|| {
+            body.get("request")
+                .and_then(|r| r.get("generationConfig"))
+                .and_then(|g| g.get("thinkingConfig"))
+        })
+    {
+        if let Some(level) = tc.get("thinkingLevel").and_then(Json::as_str) {
+            return Some(serde_json::json!({"mode": "level", "level": level.to_lowercase()}));
+        }
+        if let Some(tb) = tc.get("thinkingBudget").and_then(Json::as_f64) {
+            if tb == 0.0 {
+                return Some(serde_json::json!({"mode": "none"}));
+            }
+            if tb < 0.0 {
+                return Some(serde_json::json!({"mode": "auto"}));
+            }
+            return Some(serde_json::json!({"mode": "budget", "budget": tb}));
+        }
+    }
+
+    None
+}
+
+/// effort level -> budget_tokens (thinking.js LEVEL_TO_BUDGET).
+/// TODO(dedupe): use nr_translator::concerns::thinking::effort_to_budget once
+/// a shared crate owns it.
+fn effort_to_budget(effort: &str) -> Option<u32> {
+    Some(match effort.to_lowercase().as_str() {
+        "none" => 0,
+        "minimal" => 512,
+        "low" => 1024,
+        "medium" => 8192,
+        "high" => 24576,
+        "xhigh" => 32768,
+        "max" => 128000,
+        _ => return None,
+    })
+}
+
+/// Read a header case-insensitively from a plain JSON header map.
+fn pick_header<'a>(headers: &'a Json, name: &str) -> Option<&'a str> {
+    let lower = name.to_lowercase();
+    headers
+        .as_object()?
+        .iter()
+        .find(|(key, _)| key.to_lowercase() == lower)
+        .and_then(|(_, value)| value.as_str())
+}
+
+/// True when the body already carries an enabled/interleaved thinking_mode tag.
+fn contains_thinking_mode_tag(body: &Json) -> bool {
+    fn tag_in_text(text: &str) -> bool {
+        text.contains("<thinking_mode>")
+            && (text.contains("<thinking_mode>enabled</thinking_mode>")
+                || text.contains("<thinking_mode>interleaved</thinking_mode>"))
+    }
+
+    let messages = body.get("messages").and_then(Json::as_array);
+    for msg in messages.into_iter().flatten() {
+        let role = msg.get("role").and_then(Json::as_str);
+        if role != Some("system") && role != Some("user") {
+            continue;
+        }
+        match msg.get("content") {
+            Some(Json::String(text)) if tag_in_text(text) => return true,
+            Some(Json::Array(parts)) => {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(Json::as_str) {
+                        if tag_in_text(text) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    body.get("system")
+        .and_then(Json::as_str)
+        .map(tag_in_text)
+        .unwrap_or(false)
+}
+
 /// Resolve the Kiro thinking budget requested by a client.
+/// Returns None when thinking is disabled (JS resolveKiroThinkingBudget).
 pub fn resolve_kiro_thinking_budget(
     body: Option<&Json>,
     headers: Option<&Json>,
     model: Option<&str>,
 ) -> Option<u32> {
-    // TODO(dedupe): use extractThinking/effortToBudget from thinkingUnified once ported
-    // Placeholder: return default budget if thinking appears enabled
-    Some(16000)
+    const DEFAULT_BUDGET: u32 = 16000;
+
+    if let Some(cfg) = extract_thinking(body) {
+        match cfg.get("mode").and_then(Json::as_str) {
+            Some("none") => return None,
+            Some("level") => {
+                let level = cfg.get("level").and_then(Json::as_str).unwrap_or("");
+                if level == "disabled" {
+                    return None;
+                }
+                return Some(effort_to_budget(level).unwrap_or(DEFAULT_BUDGET));
+            }
+            Some("budget") => {
+                let budget = cfg.get("budget").and_then(Json::as_f64).unwrap_or(0.0);
+                return Some(budget.max(0.0) as u32);
+            }
+            _ => return Some(DEFAULT_BUDGET),
+        }
+    }
+
+    if let Some(headers) = headers {
+        if let Some(beta) = pick_header(headers, "anthropic-beta") {
+            if beta.to_lowercase().contains("interleaved-thinking") {
+                return Some(DEFAULT_BUDGET);
+            }
+        }
+    }
+
+    if let Some(body) = body {
+        if contains_thinking_mode_tag(body) {
+            return Some(DEFAULT_BUDGET);
+        }
+    }
+
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        let m = m.to_lowercase();
+        if m.contains("thinking") || m.contains("-reason") {
+            return Some(DEFAULT_BUDGET);
+        }
+    }
+
+    None
 }
 
 /// Build the magic system-prompt prefix that turns Kiro reasoning on.
@@ -357,11 +567,10 @@ pub fn supports_kiro_additional_model_request_fields(model: Option<&str>) -> boo
 
 /// Check if model uses Kiro native GPT effort
 pub fn uses_kiro_native_gpt_effort(body: Option<&Json>, model: Option<&str>) -> bool {
-    if resolve_kiro_effort_path(model) != Some("reasoning".to_string()) {
+    if resolve_kiro_effort_path(model).as_deref() != Some("reasoning") {
         return false;
     }
-    // TODO(dedupe): extract_kiro_gpt_effort_level once ported
-    false
+    extract_kiro_gpt_effort_level(body).is_some()
 }
 
 /// Build Kiro additional model request fields for a model
