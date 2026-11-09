@@ -546,10 +546,11 @@ pub async fn refresh_kiro_token(
             if let (Some(cid), Some(csec)) = (client_id, client_secret) {
                 // AWS Builder ID / IDC path: JSON body, camelCase keys.
                 let is_idc = auth_method == Some("idc");
-                let endpoint = match (is_idc, region) {
+                let fallback = match (is_idc, region) {
                     (true, Some(r)) => format!("https://oidc.{r}.amazonaws.com/token"),
                     _ => "https://oidc.us-east-1.amazonaws.com/token".to_string(),
                 };
+                let endpoint = endpoint_for("kiro", "oidcTokenUrl", &fallback);
                 let response = match post_json(
                     &endpoint,
                     accept_json(HeaderList::new()),
@@ -690,8 +691,13 @@ async fn fetch_kiro_profile_arn(access_token: &str, log: &Logger) -> Option<Stri
     }
     let mut headers = accept_json(HeaderList::new());
     headers.insert("Authorization".into(), format!("Bearer {access_token}"));
-    let response = match post_json(
+    let url = endpoint_for(
+        "kiro",
+        "profileArnUrl",
         "https://codewhisperer.us-east-1.amazonaws.com/ListAvailableProfiles",
+    );
+    let response = match post_json(
+        &url,
         headers,
         &json!({ "maxResults": 10 }),
         None,
@@ -2355,6 +2361,94 @@ mod provider_tests {
             let out = refresh_cline_token("c2-old", &log()).await.unwrap();
             assert_eq!(out["expiresIn"], json!(3600));
             assert_eq!(out["refreshToken"], json!("c2-old"));
+        });
+    }
+
+    // ── kiro ────────────────────────────────────────────────────────────────
+    #[test]
+    fn kiro_social_refresh_honors_endpoint_overrides() {
+        run(|| async {
+            // One server, two paths: the social refresh, then the profile lookup.
+            use axum::{routing::any, Router};
+            let seen: Log = Arc::new(Mutex::new(Vec::new()));
+            async fn handler(State(log): State<Log>, req: axum::extract::Request) -> impl axum::response::IntoResponse {
+                use axum::body::to_bytes;
+                let path = req.uri().path().to_string();
+                let method = req.method().to_string();
+                let headers = req
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_str().to_ascii_lowercase(), v.to_str().unwrap_or("").to_string()))
+                    .collect();
+                let bytes = to_bytes(req.into_body(), 1 << 20).await.unwrap_or_default();
+                log.lock().unwrap().push(Seen {
+                    method,
+                    path: path.clone(),
+                    headers,
+                    body: String::from_utf8_lossy(&bytes).into_owned(),
+                });
+                let body = if path.to_ascii_lowercase().ends_with("profiles") {
+                    r#"{"profiles":[{"arn":"arn:aws:codewhisperer:us-east-1:1:profile/P1"}]}"#
+                } else {
+                    r#"{"accessToken":"kiro-acc","refreshToken":"kiro-rot","expiresIn":1800}"#
+                };
+                ([(axum::http::header::CONTENT_TYPE, "application/json")], body)
+            }
+            let app = Router::new().fallback(any(handler)).with_state(seen.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let base = format!("http://{addr}");
+            endpoints(&[
+                ("kiro:tokenUrl", &format!("{base}/refreshToken")),
+                ("kiro:profileArnUrl", &format!("{base}/ListAvailableProfiles")),
+            ]);
+
+            let mut psd = JsonMap::new();
+            psd.insert("authMethod".to_string(), json!("social"));
+            let out = refresh_kiro_token("kiro-old", Some(&psd), &log(), None)
+                .await
+                .expect("kiro social refresh");
+            assert_eq!(out["accessToken"], json!("kiro-acc"));
+            assert_eq!(
+                out["providerSpecificData"]["profileArn"],
+                json!("arn:aws:codewhisperer:us-east-1:1:profile/P1")
+            );
+
+            let entries = seen.lock().unwrap().clone();
+            assert_eq!(entries.len(), 2, "refresh + profile lookup");
+            assert_eq!(entries[0].path, "/refreshToken");
+            assert_eq!(entries[0].headers["user-agent"], "kiro-cli/1.0.0");
+            assert_eq!(entries[0].json(), json!({"refreshToken": "kiro-old"}));
+            assert_eq!(entries[1].path, "/ListAvailableProfiles");
+            assert_eq!(entries[1].headers["authorization"], "Bearer kiro-acc");
+        });
+    }
+
+    #[test]
+    fn kiro_idc_refresh_honors_endpoint_overrides() {
+        run(|| async {
+            let (url, seen) = mock(200, r#"{"accessToken":"idc-acc","refreshToken":"idc-rot","expiresIn":900}"#).await;
+            endpoints(&[("kiro:oidcTokenUrl", &url)]);
+
+            let mut psd = JsonMap::new();
+            psd.insert("authMethod".to_string(), json!("idc"));
+            psd.insert("clientId".to_string(), json!("cid"));
+            psd.insert("clientSecret".to_string(), json!("csec"));
+            psd.insert("region".to_string(), json!("eu-west-1"));
+            psd.insert("profileArn".to_string(), json!("arn:saved"));
+            let out = refresh_kiro_token("idc-old", Some(&psd), &log(), None)
+                .await
+                .expect("kiro idc refresh");
+            assert_eq!(out["accessToken"], json!("idc-acc"));
+            assert_eq!(out["refreshToken"], json!("idc-rot"));
+            assert_eq!(out["expiresIn"], json!(900));
+
+            let req = only(&seen);
+            assert_eq!(
+                req.json(),
+                json!({"clientId":"cid","clientSecret":"csec","refreshToken":"idc-old","grantType":"refresh_token"})
+            );
         });
     }
 
