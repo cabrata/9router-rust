@@ -34,3 +34,4 @@ tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+sha3 = "0.10"

@@ -2,35 +2,10 @@
 
 use crate::Registry;
 
+pub mod claude_to_openai;
 pub mod cursor_to_openai;
-
-// Stub modules for remaining response translators
-pub mod claude_to_openai {
-    use nr_core::Json;
-    use crate::StreamState;
-    pub fn claude_to_openai_response(_chunk: Option<&Json>, _state: &mut StreamState) -> Vec<Json> {
-        // TODO: implement
-        if let Some(chunk) = _chunk { vec![chunk.clone()] } else { Vec::new() }
-    }
-}
-
-pub mod openai_to_claude {
-    use nr_core::Json;
-    use crate::StreamState;
-    pub fn openai_to_claude_response(_chunk: Option<&Json>, _state: &mut StreamState) -> Vec<Json> {
-        // TODO: implement
-        if let Some(chunk) = _chunk { vec![chunk.clone()] } else { Vec::new() }
-    }
-}
-
-pub mod gemini_to_openai {
-    use nr_core::Json;
-    use crate::StreamState;
-    pub fn gemini_to_openai_response(_chunk: Option<&Json>, _state: &mut StreamState) -> Vec<Json> {
-        // TODO: implement
-        if let Some(chunk) = _chunk { vec![chunk.clone()] } else { Vec::new() }
-    }
-}
+pub mod openai_to_claude;
+pub mod gemini_to_openai;
 
 pub mod openai_to_antigravity {
     use nr_core::Json;
@@ -89,13 +64,16 @@ pub mod kiro_to_claude {
 /// Register every response translator (JS side-effect imports in translator/index.js).
 pub fn register_all(reg: &mut Registry) {
     // claude-to-openai
-    reg.register("claude", "openai", None, Some(claude_to_openai::claude_to_openai_response));
+    reg.register("claude", "openai", None, Some(|chunk, state| claude_to_openai::claude_to_openai_response(chunk, state)));
 
     // openai-to-claude
-    reg.register("openai", "claude", None, Some(openai_to_claude::openai_to_claude_response));
+    reg.register("openai", "claude", None, Some(|chunk, state| openai_to_claude::openai_to_claude_response(chunk, state)));
 
     // gemini-to-openai
-    reg.register("gemini", "openai", None, Some(gemini_to_openai::gemini_to_openai_response));
+    reg.register("gemini", "openai", None, Some(|chunk, state| gemini_to_openai::gemini_to_openai_response(chunk, state)));
+    reg.register("gemini-cli", "openai", None, Some(|chunk, state| gemini_to_openai::gemini_to_openai_response(chunk, state)));
+    reg.register("antigravity", "openai", None, Some(|chunk, state| gemini_to_openai::gemini_to_openai_response(chunk, state)));
+    reg.register("vertex", "openai", None, Some(|chunk, state| gemini_to_openai::gemini_to_openai_response(chunk, state)));
 
     // openai-to-antigravity
     reg.register("openai", "antigravity", None, Some(openai_to_antigravity::openai_to_antigravity_response));

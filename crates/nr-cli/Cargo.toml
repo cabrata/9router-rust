@@ -19,11 +19,15 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde_json.workspace = true
+serde = { version = "1", features = ["derive"] }
 inquire = "0.7"
 open = "5"
 libc = "0.2"  # for signal handling and process management
 regex.workspace = true
 chrono.workspace = true
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+toml_edit = "0.22"
+dirs = "5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = { version = "0.3", features = ["winsock2", "winnt", "psapi"] }

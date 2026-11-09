@@ -3,30 +3,14 @@
 use crate::Registry;
 
 pub mod openai_to_ollama;
+pub mod gemini_to_openai;
+pub mod openai_to_claude;
 
 // Stub modules for remaining translators
 pub mod claude_to_openai {
     use nr_core::{Credentials, Json};
     use crate::TranslationOptions;
     pub fn claude_to_openai_request(_model: &str, body: Json, _stream: bool, _credentials: Option<&mut Credentials>, _options: &TranslationOptions) -> Json {
-        // TODO: implement
-        body
-    }
-}
-
-pub mod openai_to_claude {
-    use nr_core::{Credentials, Json};
-    use crate::TranslationOptions;
-    pub fn openai_to_claude_request(_model: &str, body: Json, _stream: bool, _credentials: Option<&mut Credentials>, _options: &TranslationOptions) -> Json {
-        // TODO: implement
-        body
-    }
-}
-
-pub mod gemini_to_openai {
-    use nr_core::{Credentials, Json};
-    use crate::TranslationOptions;
-    pub fn gemini_to_openai_request(_model: &str, body: Json, _stream: bool, _credentials: Option<&mut Credentials>, _options: &TranslationOptions) -> Json {
         // TODO: implement
         body
     }
@@ -115,6 +99,7 @@ pub fn register_all(reg: &mut Registry) {
 
     // gemini-to-openai
     reg.register("gemini", "openai", Some(gemini_to_openai::gemini_to_openai_request), None);
+    reg.register("gemini-cli", "openai", Some(gemini_to_openai::gemini_to_openai_request), None);
 
     // openai-to-gemini
     reg.register("openai", "gemini", Some(openai_to_gemini::openai_to_gemini_request), None);

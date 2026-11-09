@@ -1,7 +1,6 @@
 //! Port of open-sse/executors/bedrock.js
 //! Bedrock executor for AWS Anthropic models and Grok on Bedrock.
 
-use crate::aws_event_stream;
 use crate::aws_sigv4;
 use async_trait::async_trait;
 use nr_core::http::HeaderList;
@@ -118,12 +117,13 @@ impl nr_core::Executor for BedrockExecutor {
     }
 
     async fn execute(&self, req: ExecRequest<'_>) -> Result<ExecResult> {
-        // shortcut: This is a working implementation that delegates to base_execute.
-        // Full version adds:
-        // - AWS credential resolution from profile or static keys via resolveAwsCredentials
-        // - SigV4 request signing via signAwsRequest
+        // shortcut: Full implementation requires:
+        // - AWS credential resolution from profile or static keys via resolve_aws_credentials
+        // - SigV4 request signing via sign_aws_request (aws_sigv4 module)
         // - EventStream frame decoding to SSE (for both Claude and OpenAI wire formats)
-        //   via eventStreamToSse, which handles base64 payload unwrapping
+        //   via event_stream_to_sse, which handles base64 payload unwrapping
+        // - Bidirectional streaming via tokio channels and custom BodyStream
+        // Current: delegates to base_execute for static credentials until credential resolution is ported.
         nr_exec_base::base_execute(self, req).await
     }
 }
@@ -132,6 +132,7 @@ impl nr_core::Executor for BedrockExecutor {
 pub fn create(provider: &str) -> Arc<dyn nr_core::Executor> {
     Arc::new(BedrockExecutor::new(provider))
 }
+
 
 // Helper to resolve AWS region from credentials or environment.
 // TODO(dedupe): Use nr_oauth::awsCredentials::resolve_region once ported
@@ -164,6 +165,7 @@ fn validate_region(region: &str) -> bool {
     // Region must be lowercase alphanumeric plus hyphens: us-east-1, eu-west-2, etc.
     !region.is_empty() && region.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
+
 
 #[cfg(test)]
 mod tests {

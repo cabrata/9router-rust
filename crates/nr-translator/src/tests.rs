@@ -107,4 +107,45 @@ mod tests {
 
         assert_eq!(results.len(), 0);
     }
+
+    #[test]
+    fn test_translate_request_with_tool_calls() {
+        init_registry();
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "function": {"name": "search", "arguments": "{}"}
+                        }
+                    ]
+                }
+            ]
+        });
+
+        let result = translate_request(
+            formats::OPENAI,
+            formats::OPENAI,
+            "gpt-4",
+            body.clone(),
+            true,
+            None,
+            &Default::default()
+        );
+
+        // Tool call should have an ID
+        let tool_call = &result["messages"][0]["tool_calls"][0];
+        assert!(tool_call.get("id").is_some());
+        assert!(tool_call.get("type").is_some());
+    }
+
+    #[test]
+    fn test_init_state_openai_responses() {
+        let state = init_state(formats::OPENAI_RESPONSES);
+        // Should initialize with openai-responses specific fields if enabled
+        assert_eq!(state.message_id, None);
+        assert_eq!(state.content_block_index, 0);
+    }
 }

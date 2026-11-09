@@ -33,6 +33,8 @@ async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 base64 = "0.22"
+serde_urlencoded = "0.7"
+urlencoding = "2"
 bcrypt = ">=0.15, <0.20"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }

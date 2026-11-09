@@ -14,6 +14,15 @@ use nr_core::{Json, JsonMap};
 
 include!(concat!(env!("OUT_DIR"), "/files.rs"));
 
+pub mod tts_models;
+pub mod models;
+pub mod vision_patterns;
+pub mod schema;
+pub mod pricing;
+pub mod kiro_constants;
+pub mod thinking_levels;
+pub mod capabilities;
+
 static MODULES: LazyLock<HashMap<&'static str, Json>> = LazyLock::new(|| {
     FILES
         .iter()
@@ -88,6 +97,41 @@ pub fn runtime_u64(name: &str) -> u64 {
 
 // === providers/shared.js functions ===
 
+/// Map the current OS to Stainless SDK format
+pub fn map_stainless_os() -> &'static str {
+    #[cfg(target_os = "macos")]
+    { "MacOS" }
+    #[cfg(target_os = "windows")]
+    { "Windows" }
+    #[cfg(target_os = "linux")]
+    { "Linux" }
+    #[cfg(target_os = "freebsd")]
+    { "FreeBSD" }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux", target_os = "freebsd")))]
+    { "Other" }
+}
+
+/// Map the current architecture to Stainless SDK format
+pub fn map_stainless_arch() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    { "x64" }
+    #[cfg(target_arch = "aarch64")]
+    { "arm64" }
+    #[cfg(target_arch = "x86")]
+    { "x86" }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86")))]
+    { "other" }
+}
+
+/// Check if body wants thinking summaries (not redacted)
+pub fn wants_thinking_summaries(body: Option<&Json>) -> bool {
+    body.and_then(|b| b.get("thinking"))
+        .and_then(|t| t.get("display"))
+        .and_then(Json::as_str)
+        .map(|d| d == "summarized")
+        .unwrap_or(false)
+}
+
 /// Normalize version separators: hyphen between digits becomes dot
 pub fn normalize_model_id(model_id: &str) -> String {
     regex::Regex::new(r"(\d)-(\d)").unwrap().replace_all(model_id, "$1.$2").to_string()
@@ -158,6 +202,275 @@ pub fn get_default_model(alias_or_id: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// Find a model by id in the provider's model list, with DOT_VERSION_PROVIDERS normalization.
+/// Kiro (kr) and older Kiro clients (kr) accept dash/dot separators interchangeably.
+fn find_model(models: &[Json], model_id: &str, alias_or_id: &str) -> Option<Json> {
+    // Strip trailing (notation) before lookup
+    let base_model_id = if let Some(idx) = model_id.rfind('(') {
+        model_id[..idx].trim()
+    } else {
+        model_id
+    };
+
+    // Exact match first
+    if let Some(m) = models.iter().find(|m| {
+        m.get("id").and_then(Json::as_str).map(|id| id == model_id || id == base_model_id).unwrap_or(false)
+    }) {
+        return Some(m.clone());
+    }
+
+    // For kiro (kr) provider, normalize dashes to dots and retry
+    const DOT_VERSION_PROVIDERS: &[&str] = &["kr", "kiro"];
+    if !DOT_VERSION_PROVIDERS.contains(&alias_or_id) {
+        return None;
+    }
+
+    let normalized = normalize_model_id(base_model_id);
+    if normalized == base_model_id {
+        return None;
+    }
+
+    models.iter().find(|m| {
+        m.get("id").and_then(Json::as_str).map(|id| id == normalized).unwrap_or(false)
+    }).cloned()
+}
+
+/// Check if a model is valid for a provider
+pub fn is_valid_model(alias_or_id: &str, model_id: &str, passthrough_providers: &[&str]) -> bool {
+    if passthrough_providers.contains(&alias_or_id) {
+        return true;
+    }
+    let models = get_provider_models(alias_or_id);
+    find_model(&models, model_id, alias_or_id).is_some()
+}
+
+/// Get the display name for a model
+pub fn find_model_name(alias_or_id: &str, model_id: &str) -> String {
+    let models = get_provider_models(alias_or_id);
+    if let Some(model) = find_model(&models, model_id, alias_or_id) {
+        if let Some(name) = model.get("name").and_then(|j| j.as_str().map(String::from)) {
+            return name;
+        }
+    }
+    String::from(model_id)
+}
+
+/// Get the type/kind of a model
+pub fn get_model_type(alias_or_id: &str, model_id: &str) -> Option<String> {
+    let models = get_provider_models(alias_or_id);
+    find_model(&models, model_id, alias_or_id)
+        .and_then(|m| {
+            m.get("kind").or_else(|| m.get("type"))
+                .and_then(Json::as_str)
+                .map(String::from)
+        })
+}
+
+/// Get the raw registry entry for a model
+pub fn get_model_meta(alias_or_id: &str, model_id: &str) -> Option<Json> {
+    let models = get_provider_models(alias_or_id);
+    find_model(&models, model_id, alias_or_id)
+}
+
+/// Get the quota family for a model
+pub fn get_model_quota_family(alias_or_id: &str, model_id: &str) -> String {
+    let models = get_provider_models(alias_or_id);
+    find_model(&models, model_id, alias_or_id)
+        .as_ref()
+        .and_then(|m| m.get("quotaFamily").and_then(Json::as_str))
+        .unwrap_or("normal")
+        .to_string()
+}
+
+/// Get the strip list for a model
+pub fn get_model_strip(alias_or_id: &str, model_id: &str) -> Vec<String> {
+    let models = get_provider_models(alias_or_id);
+    find_model(&models, model_id, alias_or_id)
+        .as_ref()
+        .and_then(|m| m.get("strip").and_then(Json::as_array))
+        .map(|arr| arr.iter().filter_map(Json::as_str).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// Get target format for a model
+pub fn get_model_target_format(alias_or_id: &str, model_id: &str) -> Option<String> {
+    let models = get_provider_models(alias_or_id);
+    find_model(&models, model_id, alias_or_id)
+        .as_ref()
+        .and_then(|m| m.get("targetFormat").and_then(Json::as_str))
+        .map(String::from)
+}
+
+/// Get supported formats for a model
+pub fn get_model_supported_formats(alias_or_id: &str, model_id: &str) -> Option<Vec<String>> {
+    let models = get_provider_models(alias_or_id);
+    find_model(&models, model_id, alias_or_id)
+        .as_ref()
+        .and_then(|m| m.get("supportedFormats").and_then(Json::as_array))
+        .map(|arr| arr.iter().filter_map(Json::as_str).map(String::from).collect())
+}
+
+/// Get upstream model ID with thinking suffix resolution
+pub fn get_model_upstream_id(alias_or_id: &str, model_id: &str, client_body: Option<&Json>) -> String {
+    // Strip thinking suffix "(level)" from model id
+    let (base_id, suffix) = if let Some(idx) = model_id.rfind('(') {
+        let (base, suf) = model_id.split_at(idx);
+        (base.trim(), Some(suf))
+    } else {
+        (model_id, None)
+    };
+
+    let models = get_provider_models(alias_or_id);
+
+    // Resolve thinking tier from suffix or body
+    let mut tier = String::new();
+    if let Some(suf) = suffix {
+        let raw_suffix = suf.trim_matches(|c| c == '(' || c == ')').to_lowercase();
+        tier = match raw_suffix.as_str() {
+            "xhigh" | "max" => "high".to_string(),
+            "minimal" => "low".to_string(),
+            t => t.to_string(),
+        };
+    }
+
+    if tier.is_empty() && client_body.is_some() {
+        if let Some(body) = client_body {
+            // Try reasoning_effort, output_config.effort, or reasoning.effort
+            if let Some(effort) = body.get("reasoning_effort")
+                .or_else(|| body.get("output_config").and_then(|o| o.get("effort")))
+                .or_else(|| body.get("reasoning").and_then(|r| r.get("effort")))
+            {
+                if let Some(s) = effort.as_str() {
+                    let v = s.to_lowercase().trim().to_string();
+                    tier = match v.as_str() {
+                        "xhigh" | "max" => "high".to_string(),
+                        "minimal" => "low".to_string(),
+                        _ => v,
+                    };
+                }
+            } else if let Some(thinking) = body.get("thinking") {
+                // Try budget_tokens
+                if let Some(budget) = thinking.get("budget_tokens").and_then(Json::as_u64) {
+                    if budget > 16384 {
+                        tier = "high".to_string();
+                    } else if budget <= 4096 {
+                        tier = "low".to_string();
+                    } else {
+                        tier = "medium".to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // Look for tiered variant first
+    let tiered_id = if !tier.is_empty() {
+        format!("{}-{}", base_id, tier)
+    } else {
+        String::new()
+    };
+
+    let found = if !tiered_id.is_empty() {
+        find_model(&models, &tiered_id, alias_or_id)
+    } else {
+        None
+    }.or_else(|| find_model(&models, base_id, alias_or_id));
+
+    if let Some(model) = found {
+        let resolved_id = model
+            .get("upstreamModelId")
+            .or_else(|| model.get("id"))
+            .and_then(Json::as_str)
+            .unwrap_or(base_id);
+
+        // Check for preset suffix in resolved id
+        let (resolved_base, preset_suffix) = if let Some(idx) = resolved_id.rfind('(') {
+            let (base, suf) = resolved_id.split_at(idx);
+            (base.trim().to_string(), Some(suf))
+        } else {
+            (resolved_id.to_string(), None)
+        };
+
+        let suffix_str = suffix.map(|s| s.to_string()).unwrap_or_else(|| {
+            preset_suffix.map(|ps| if !tier.is_empty() { format!("({})", tier) } else { ps.to_string() }).unwrap_or_default()
+        });
+        format!("{}{}", resolved_base, suffix_str)
+    } else {
+        format!("{}{}", base_id, suffix.unwrap_or(""))
+    }
+}
+
+/// Get models by provider id (with alias resolution)
+pub fn get_models_by_provider_id(provider_id: &str) -> Vec<Json> {
+    // TODO(dedupe): Use proper alias resolution once provider/index is ported
+    provider_models()
+        .get(provider_id)
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+// === runtimeConfig.js functions ===
+
+/// Check if fresh socket replay is enabled (env FETCH_FRESH_RETRY)
+pub fn is_fresh_socket_replay_enabled() -> bool {
+    match std::env::var("FETCH_FRESH_RETRY") {
+        Ok(val) => {
+            let trimmed = val.trim().to_lowercase();
+            !(trimmed == "off" || trimmed == "0" || trimmed == "false" || trimmed == "no")
+        }
+        Err(_) => true, // default is enabled
+    }
+}
+
+/// Resolve keep-alive timeouts from environment or defaults
+pub fn resolve_keep_alive_timeouts() -> JsonMap {
+    let timeout = std::env::var("FETCH_KEEPALIVE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(4000); // DEFAULT_KEEPALIVE_TIMEOUT_MS
+
+    let mut result = JsonMap::new();
+    result.insert("keepAliveTimeout".to_string(), Json::from(timeout));
+    result.insert("keepAliveMaxTimeout".to_string(), Json::from(timeout));
+    result
+}
+
+/// Normalize a retry entry to { attempts, delayMs }
+pub fn resolve_retry_entry(entry: Option<&Json>) -> JsonMap {
+    let mut result = JsonMap::new();
+
+    match entry {
+        None => {
+            result.insert("attempts".to_string(), Json::from(0));
+            result.insert("delayMs".to_string(), Json::from(2000)); // RETRY_CONFIG.delayMs
+        }
+        Some(Json::Number(n)) if n.is_u64() => {
+            result.insert("attempts".to_string(), Json::from(n.as_u64().unwrap_or(0)));
+            result.insert("delayMs".to_string(), Json::from(2000));
+        }
+        Some(Json::Object(obj)) => {
+            if let Some(attempts) = obj.get("attempts").and_then(Json::as_u64) {
+                result.insert("attempts".to_string(), Json::from(attempts));
+            } else {
+                result.insert("attempts".to_string(), Json::from(0));
+            }
+            if let Some(delay) = obj.get("delayMs").and_then(Json::as_u64) {
+                result.insert("delayMs".to_string(), Json::from(delay));
+            } else {
+                result.insert("delayMs".to_string(), Json::from(2000));
+            }
+        }
+        _ => {
+            result.insert("attempts".to_string(), Json::from(0));
+            result.insert("delayMs".to_string(), Json::from(2000));
+        }
+    }
+
+    result
+}
+
 /// Select Anthropic beta headers based on model
 pub fn select_anthropic_beta(model: &str, body: Option<&Json>) -> String {
     let wants_summaries = body
@@ -203,6 +516,168 @@ pub fn merge_anthropic_beta(values: &[&str]) -> String {
     flags.join(",")
 }
 
+// === appConstants.js functions ===
+
+/// Get platform enum for Antigravity
+pub fn get_platform_enum() -> i32 {
+    const UNSPECIFIED: i32 = 0;
+    const DARWIN_AMD64: i32 = 1;
+    const DARWIN_ARM64: i32 = 2;
+    const LINUX_AMD64: i32 = 3;
+    const LINUX_ARM64: i32 = 4;
+    const WINDOWS_AMD64: i32 = 5;
+
+    #[cfg(target_os = "macos")]
+    {
+        #[cfg(target_arch = "aarch64")]
+        return DARWIN_ARM64;
+        #[cfg(not(target_arch = "aarch64"))]
+        return DARWIN_AMD64;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        #[cfg(target_arch = "aarch64")]
+        return LINUX_ARM64;
+        #[cfg(not(target_arch = "aarch64"))]
+        return LINUX_AMD64;
+    }
+    #[cfg(target_os = "windows")]
+    return WINDOWS_AMD64;
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    UNSPECIFIED
+}
+
+/// Get Gemini CLI user agent string
+pub fn gemini_cli_user_agent(model: Option<&str>) -> String {
+    const GEMINI_CLI_VERSION: &str = "0.1.0"; // TODO(dedupe): read from package version
+    let model_str = model.unwrap_or("unknown");
+    #[cfg(target_os = "macos")]
+    let os = "Darwin";
+    #[cfg(target_os = "linux")]
+    let os = "Linux";
+    #[cfg(target_os = "windows")]
+    let os = "Windows";
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let os = "Unknown";
+
+    #[cfg(target_arch = "aarch64")]
+    let arch = "arm64";
+    #[cfg(not(target_arch = "aarch64"))]
+    let arch = "x64";
+
+    format!(
+        "GeminiCLI/{}/{} ({}; {}; terminal)",
+        GEMINI_CLI_VERSION, model_str, os, arch
+    )
+}
+
+/// Build Kimi provider headers with device info
+pub fn build_kimi_headers(device_id: Option<&str>) -> JsonMap {
+    let device_model = {
+        #[cfg(target_os = "macos")]
+        {
+            #[cfg(target_arch = "aarch64")]
+            let arch = "arm64";
+            #[cfg(not(target_arch = "aarch64"))]
+            let arch = "x64";
+            format!("macOS {}", arch)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            #[cfg(target_arch = "aarch64")]
+            let arch = "arm64";
+            #[cfg(not(target_arch = "aarch64"))]
+            let arch = "x64";
+            format!("Windows {}", arch)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            #[cfg(target_arch = "aarch64")]
+            let arch = "arm64";
+            #[cfg(not(target_arch = "aarch64"))]
+            let arch = "x64";
+            format!("Linux {}", arch)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        "Unknown x64".to_string()
+    };
+
+    // TODO(dedupe): Use gethostname crate for real hostname
+    let device_name = "unknown".to_string();
+
+    let resolved_id = if let Some(id) = device_id {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            trimmed.to_string()
+        } else {
+            format!("kimi-{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0))
+        }
+    } else {
+        format!("kimi-{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0))
+    };
+
+    let mut headers = JsonMap::new();
+    headers.insert("X-Msh-Platform".to_string(), Json::String("9router".to_string()));
+    headers.insert("X-Msh-Version".to_string(), Json::String("0.1.0".to_string()));
+    headers.insert("X-Msh-Device-Name".to_string(), Json::String(device_name));
+    headers.insert("X-Msh-Device-Model".to_string(), Json::String(device_model));
+    headers.insert("X-Msh-Device-Id".to_string(), Json::String(resolved_id));
+    headers
+}
+
+// === providers.js functions ===
+
+/// Get platform user agent string (Antigravity)
+pub fn get_platform_user_agent() -> &'static str {
+    export("open-sse/providers/shared", "ANTIGRAVITY_IDE_USER_AGENT")
+        .and_then(|v| v.as_str())
+        .unwrap_or("antigravity/hub/2.24.0 darwin/arm64")
+}
+
+/// Resolve Ollama local host from credentials
+pub fn resolve_ollama_local_host(credentials: Option<&Json>) -> String {
+    const OLLAMA_LOCAL_DEFAULT_HOST: &str = "http://localhost:11434";
+
+    credentials
+        .and_then(|cred| cred.get("providerSpecificData"))
+        .and_then(|psd| psd.get("baseUrl"))
+        .and_then(|bu| bu.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(OLLAMA_LOCAL_DEFAULT_HOST)
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Resolve Xiaomi Tokenplan base URL from credentials
+pub fn resolve_xiaomi_tokenplan_base_url(credentials: Option<&Json>) -> Option<String> {
+    let providers = export("open-sse/providers/index", "PROVIDERS")?
+        .get("xiaomi-tokenplan")?;
+
+    let regions = providers.get("regions")
+        .and_then(Json::as_object)
+        .unwrap_or(&EMPTY_MAP);
+
+    let default_region = providers.get("defaultRegion")
+        .and_then(Json::as_str);
+
+    let region = credentials
+        .and_then(|c| c.get("providerSpecificData"))
+        .and_then(|psd| psd.get("region"))
+        .and_then(Json::as_str);
+
+    let key = region.or(default_region)?;
+    regions.get(key)
+        .and_then(Json::as_str)
+        .map(String::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +689,35 @@ mod tests {
         assert_eq!(runtime_u64("FETCH_CONNECT_TIMEOUT_MS"), 60_000);
         assert!(export("open-sse/translator/schema/roles", "ROLE").is_some());
         assert!(registry_entry("zed").is_some());
+    }
+
+    #[test]
+    fn test_normalize_model_id() {
+        // Only digit-hyphen-digit gets normalized to digit-dot-digit
+        assert_eq!(normalize_model_id("claude-sonnet-4-5"), "claude-sonnet-4.5");
+        assert_eq!(normalize_model_id("claude-sonnet-4.5"), "claude-sonnet-4.5");
+        assert_eq!(normalize_model_id("gpt-4-turbo"), "gpt-4-turbo"); // turbo doesn't start with digit
+        assert_eq!(normalize_model_id("gpt-4-1"), "gpt-4.1"); // digit-digit gets normalized
+    }
+
+    #[test]
+    fn test_get_provider_models() {
+        let models = get_provider_models("openai");
+        assert!(!models.is_empty(), "openai should have models");
+    }
+
+    #[test]
+    fn test_select_anthropic_beta() {
+        let beta = select_anthropic_beta("claude-opus-4", None);
+        assert!(beta.contains("claude-code-20250219"));
+        assert!(beta.contains("advanced-tool-use-2025-11-20"));
+    }
+
+    #[test]
+    fn test_merge_anthropic_beta() {
+        let result = merge_anthropic_beta(&["flag1,flag2", "flag2,flag3"]);
+        assert!(result.contains("flag1"));
+        assert!(result.contains("flag2"));
+        assert!(result.contains("flag3"));
     }
 }

@@ -500,8 +500,8 @@ impl BaseHooks for DefaultExecutor {
             }
         }
 
-        // TODO(dedupe): stripUnsupportedParams from translator/concerns/paramSupport.js
-        // TODO(dedupe): inject_reasoning_content from nr_common once nr-common builds
+        strip_unsupported_params(&self.provider, model, &mut transformed);
+        transformed = inject_reasoning_content(&self.provider, model, transformed);
 
         Ok(transformed)
     }
@@ -599,7 +599,7 @@ fn build_kimi_headers(device_id: Option<&str>) -> Option<HashMap<String, String>
         .unwrap_or_else(|| "unknown".to_string());
     headers.insert("X-Msh-Device-Name".to_string(), device_name);
 
-    let device_model = format!("Linux x86_64"); // TODO(dedupe): detect arch properly
+    let device_model = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
     headers.insert("X-Msh-Device-Model".to_string(), device_model);
 
     let resolved_id = if let Some(id) = device_id {
@@ -715,6 +715,179 @@ fn resolve_openai_compatible_api_type(provider: &str, api_type: Option<&str>) ->
         _ if provider.contains("responses") => "responses",
         _ => "chat",
     }
+}
+
+/// Strip request params a given provider/model rejects (HTTP 400).
+/// Port of translator/concerns/paramSupport.js::stripUnsupportedParams.
+fn strip_unsupported_params(provider: &str, model: &str, body: &mut Json) {
+    if !matches!(body, Json::Object(_)) {
+        return;
+    }
+
+    // All Claude models: temperature deprecated/rejected upstream
+    if model.to_lowercase().contains("claude") {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("temperature");
+        }
+    }
+
+    // GitHub Copilot gpt-5.4: temperature unsupported
+    if provider == "github" && model.to_lowercase().contains("gpt-5.4") {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("temperature");
+        }
+    }
+
+    // GitHub Copilot Claude (except opus/sonnet 4.6): thinking + reasoning_effort rejected
+    if provider == "github" && model.to_lowercase().contains("claude")
+        && !model.to_lowercase().contains("opus") && !model.to_lowercase().contains("sonnet")
+        || (model.to_lowercase().contains("opus") || model.to_lowercase().contains("sonnet"))
+            && !model.contains("4.6")
+    {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("thinking");
+            obj.remove("reasoning_effort");
+        }
+    }
+
+    // Cloudflare Workers AI: flatten content array to plain string
+    if provider == "cloudflare-ai" {
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(Json::Array(messages)) = obj.get_mut("messages") {
+                for msg in messages {
+                    if let Some(obj) = msg.as_object_mut() {
+                        if let Some(Json::Array(content)) = obj.get_mut("content") {
+                            let text: String = content.iter()
+                                .filter_map(|c| {
+                                    c.as_object().and_then(|co| {
+                                        if co.get("type").and_then(Json::as_str) == Some("text") {
+                                            co.get("text").and_then(Json::as_str).map(|s| s.to_string())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                                .join("");
+                            obj.insert("content".to_string(), Json::String(text));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Groq, Mistral, Cerebras: drop reasoning fields from assistant messages
+    if ["groq", "mistral", "cerebras"].contains(&provider) {
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(Json::Array(messages)) = obj.get_mut("messages") {
+                for msg in messages {
+                    if let Some(obj) = msg.as_object_mut() {
+                        if obj.get("role").and_then(Json::as_str) == Some("assistant") {
+                            obj.remove("reasoning_content");
+                            obj.remove("reasoning");
+                            obj.remove("reasoning_details");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // NVIDIA NIM: rename reasoning → reasoning_content
+    if provider == "nvidia" {
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(Json::Array(messages)) = obj.get_mut("messages") {
+                for msg in messages {
+                    if let Some(obj) = msg.as_object_mut() {
+                        if obj.get("role").and_then(Json::as_str) == Some("assistant") {
+                            if let Some(val) = obj.remove("reasoning") {
+                                if obj.get("reasoning_content").is_none() || obj.get("reasoning_content") == Some(&Json::Null) {
+                                    obj.insert("reasoning_content".to_string(), val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // OpenCode Go deepseek: drop response_format
+    if provider == "opencode-go" && model.to_lowercase().contains("deepseek") {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("response_format");
+        }
+    }
+
+    // OpenAI: rename max_tokens → max_completion_tokens
+    if provider == "openai" {
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(val) = obj.remove("max_tokens") {
+                if obj.get("max_completion_tokens").is_none() {
+                    obj.insert("max_completion_tokens".to_string(), val);
+                }
+            }
+        }
+    }
+}
+
+/// Inject reasoning_content placeholder for providers that require it.
+/// Port of open-sse/utils/reasoningContentInjector.js::injectReasoningContent.
+fn inject_reasoning_content(provider: &str, model: &str, mut body: Json) -> Json {
+    if !matches!(body, Json::Object(_)) {
+        return body;
+    }
+
+    const PLACEHOLDER: &str = " ";
+
+    let should_inject = |provider: &str, model: &str| -> bool {
+        // Kimi models: inject in tool calls only
+        if model.to_lowercase().starts_with("kimi-") {
+            return true;
+        }
+        // DeepSeek models: inject in all assistant messages
+        if model.to_lowercase().contains("deepseek") {
+            return true;
+        }
+        // Check provider-level rules from registry
+        ["deepseek", "kimi"].contains(&provider)
+    };
+
+    if !should_inject(provider, model) {
+        return body;
+    }
+
+    // Inject reasoning_content on assistant messages
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(Json::Array(messages)) = obj.get_mut("messages") {
+            for msg in messages {
+                if let Some(msg_obj) = msg.as_object_mut() {
+                    if msg_obj.get("role").and_then(Json::as_str) == Some("assistant") {
+                        let rc = msg_obj.get("reasoning_content");
+                        let should_add = match rc {
+                            Some(Json::String(s)) if s.is_empty() => true,
+                            Some(Json::Null) => true,
+                            None => {
+                                // For kimi: only inject if there are tool_calls
+                                if model.to_lowercase().starts_with("kimi-") {
+                                    msg_obj.get("tool_calls").and_then(Json::as_array).map(|a| !a.is_empty()).unwrap_or(false)
+                                } else {
+                                    true
+                                }
+                            }
+                            _ => false,
+                        };
+                        if should_add {
+                            msg_obj.insert("reasoning_content".to_string(), Json::String(PLACEHOLDER.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    body
 }
 
 /// Shared constructor used by `nr-executors::get_executor` and by stubs.

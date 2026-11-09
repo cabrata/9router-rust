@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 use async_trait::async_trait;
-use nr_core::{Credentials, ExecRequest, ExecResult, Executor, Result};
+use nr_core::{ExecRequest, ExecResult, Executor, Result};
 
 /// ChatGPT web executor — handles chatgpt.com web API (browser session auth)
 pub struct ChatGptWebExecutor;
@@ -31,7 +31,7 @@ impl Executor for ChatGptWebExecutor {
 }
 
 /// Create the executor instance
-pub fn create(provider: &str) -> Arc<dyn Executor> {
+pub fn create(_provider: &str) -> Arc<dyn Executor> {
     Arc::new(ChatGptWebExecutor)
 }
 

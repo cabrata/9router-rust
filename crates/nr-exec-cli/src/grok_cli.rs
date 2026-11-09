@@ -1,4 +1,11 @@
-//! Port of open-sse/executors/grok-cli.js.
+//! Port of open-sse/executors/grok-cli.js + services/grokCliModels.js + config/grokCli.js.
+//!
+//! OpenAI Responses API on cli-chat-proxy.grok.com.
+//! Auth: OAuth device-code access token (xai-grok-cli).
+//!
+//! shortcut: TLS fingerprinting (wreq-js) not implemented — uses standard reqwest.
+//! This means Cloudflare challenges without a cf_clearance cookie may fail.
+//! When to upgrade: wrap HTTP client with TLS adapter for Chrome/Safari fingerprint.
 
 use async_trait::async_trait;
 use nr_core::http::HeaderList;
@@ -7,47 +14,10 @@ use nr_exec_base::base::BaseHooks;
 use std::sync::Arc;
 use uuid::Uuid;
 
-// Server-generated item id prefixes that /responses cannot resolve when store=false
-const SERVER_ID_PATTERN: &str = r"^(rs|fc|resp|msg)_";
-
-// Hosted tool types executed server-side by Grok CLI backend
-const HOSTED_TOOL_TYPES: &[&str] = &[
-    "web_search",
-    "x_search",
-    "web_search_preview",
-    "file_search",
-    "image_generation",
-    "code_interpreter",
-    "mcp",
-    "local_shell",
-];
-
-// Fields accepted by cli-chat-proxy Responses API (mirrors Codex allowlist + Grok extras)
-const RESPONSES_API_ALLOWLIST: &[&str] = &[
-    "model",
-    "input",
-    "instructions",
-    "tools",
-    "tool_choice",
-    "stream",
-    "store",
-    "reasoning",
-    "include",
-    "temperature",
-    "top_p",
-    "max_output_tokens",
-    "parallel_tool_calls",
-    "text",
-    "metadata",
-    "prompt_cache_key",
-];
-
 const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh"];
-const GROK_CLI_TURN_STORE_MAX: usize = 5000;
 
-/// Count user turns in a Responses `input` array.
-/// Official CLI sets x-grok-turn-idx to the 1-based conversation turn (≈ user messages).
-pub fn count_grok_cli_user_turns(input: Option<&Json>) -> usize {
+/// Count user turns in a Responses `input` array (≈ user messages).
+fn count_user_turns(input: Option<&Json>) -> usize {
     let Some(arr) = input.and_then(Json::as_array) else {
         return 1;
     };
@@ -66,15 +36,17 @@ pub fn count_grok_cli_user_turns(input: Option<&Json>) -> usize {
 }
 
 /// Normalize reasoning effort value.
-pub fn normalize_grok_cli_effort(value: Option<&Json>) -> &'static str {
+fn normalize_effort(value: Option<&Json>) -> &'static str {
     match value {
         Some(Json::String(s)) => {
             let effort = s.trim().to_lowercase();
             match effort.as_str() {
                 "max" => "xhigh",
-                "low" | "medium" | "high" | "xhigh" => {
-                    EFFORT_LEVELS.iter().find(|&&e| e == &effort).copied().unwrap_or("high")
-                }
+                _ if EFFORT_LEVELS.contains(&effort.as_str()) => EFFORT_LEVELS
+                    .iter()
+                    .find(|&&e| e == &effort)
+                    .copied()
+                    .unwrap_or("high"),
                 _ => "high",
             }
         }
@@ -82,15 +54,9 @@ pub fn normalize_grok_cli_effort(value: Option<&Json>) -> &'static str {
     }
 }
 
-/// Test helper — check if model supports grok CLI reasoning effort.
-pub fn supports_grok_cli_reasoning_effort(model: Option<&str>) -> bool {
-    match model {
-        Some(m) => regex::Regex::new(r"^grok-4\.5(?:$|-)")
-            .ok()
-            .and_then(|re| re.is_match(m).then_some(true))
-            .unwrap_or(false),
-        None => false,
-    }
+/// Check if model supports grok CLI reasoning effort (grok-4.5+).
+fn supports_reasoning_effort(model: &str) -> bool {
+    model.starts_with("grok-4.5") && (model.len() == 8 || model.as_bytes()[8] == b'-')
 }
 
 /// Grok CLI Executor — OpenAI Responses API on cli-chat-proxy.grok.com
@@ -126,8 +92,8 @@ impl BaseHooks for GrokCliExecutor {
         &self.config
     }
 
-    fn build_url(&self, _model: &str, _stream: bool, url_index: usize, _creds: &Credentials) -> Result<String> {
-        Ok(nr_exec_base::base::default_build_url(self, url_index, _creds))
+    fn build_url(&self, _model: &str, _stream: bool, url_index: usize, creds: &Credentials) -> Result<String> {
+        Ok(nr_exec_base::base::default_build_url(self, url_index, creds))
     }
 
     fn build_headers(
@@ -135,21 +101,10 @@ impl BaseHooks for GrokCliExecutor {
         creds: &Credentials,
         stream: bool,
         _url: &str,
-        _model: &str,
-        _body: &Json,
+        model: &str,
+        body: &Json,
     ) -> Result<HeaderList> {
         let mut headers = nr_exec_base::base::default_build_headers(self, creds, stream);
-
-        // Static fingerprint from registry
-        if let Some(static_headers) = self.config.get("headers").and_then(Json::as_object) {
-            for (k, v) in static_headers {
-                if let Some(v_str) = v.as_str() {
-                    if !headers.contains_key(k) {
-                        headers.insert(k.clone(), v_str.to_string());
-                    }
-                }
-            }
-        }
 
         let client_id = nr_data::export("open-sse/config/grokCli", "GROK_CLI_CLIENT_IDENTIFIER")
             .and_then(Json::as_str)
@@ -161,30 +116,230 @@ impl BaseHooks for GrokCliExecutor {
         headers.insert("x-grok-client-identifier".into(), client_id.to_string());
         headers.insert("x-grok-client-version".into(), version.to_string());
 
-        // Session IDs would be set in transformRequest, but for now set defaults
-        let session_id = Uuid::new_v4().to_string();
+        // Session ID: derive from credentials.connectionId or body.session_id, else random
+        let session_id = creds
+            .connection_id()
+            .or_else(|| body.get("session_id").and_then(Json::as_str))
+            .unwrap_or("")
+            .to_string();
+        let session_id = if session_id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            session_id
+        };
+
         let req_id = Uuid::new_v4().to_string();
+        let turn_idx = count_user_turns(body.get("input"));
+
         headers.insert("x-grok-session-id".into(), session_id.clone());
         headers.insert("x-grok-conv-id".into(), session_id);
         headers.insert("x-grok-req-id".into(), req_id);
-        headers.insert("x-grok-turn-idx".into(), "1".to_string());
+        headers.insert("x-grok-turn-idx".into(), turn_idx.to_string());
 
-        // Identity: mapTokens stores email top-level AND in providerSpecificData
-        let email = creds.psd_str("email").or_else(|| creds.str("email"));
-        let user_id = creds.psd_str("userId").or_else(|| creds.psd_str("providerUserId"));
-
-        if let Some(e) = email {
-            headers.insert("x-email".into(), e.to_string());
+        // Agent/model overrides (optional)
+        if let Some(agent_id) = creds.psd_str("agentId").or_else(|| creds.psd_str("deviceId")) {
+            headers.insert("x-grok-agent-id".into(), agent_id.to_string());
         }
-        if let Some(u) = user_id {
-            headers.insert("x-userid".into(), u.to_string());
+        if !model.is_empty() {
+            headers.insert("x-grok-model-override".into(), model.to_string());
+        }
+
+        // Identity: email and userId from providerSpecificData or top-level
+        if let Some(email) = creds.psd_str("email").or_else(|| creds.str("email")) {
+            headers.insert("x-email".into(), email.to_string());
+        }
+        if let Some(user_id) = creds
+            .psd_str("userId")
+            .or_else(|| creds.psd_str("providerUserId"))
+            .or_else(|| creds.str("userId"))
+        {
+            headers.insert("x-userid".into(), user_id.to_string());
         }
 
         Ok(headers)
     }
 
-    fn transform_request(&self, _model: &str, body: &Json, _stream: bool, _creds: &Credentials) -> Result<Json> {
-        Ok(body.clone())
+    fn transform_request(&self, model: &str, body: &Json, _stream: bool, _creds: &Credentials) -> Result<Json> {
+        let mut b = body.clone();
+
+        // Ensure input array exists (soft fallback from messages)
+        if !b.get("input").and_then(Json::as_array).is_some() {
+            if let Some(messages) = b.get("messages").and_then(Json::as_array) {
+                if !messages.is_empty() {
+                    let input: Vec<Json> = messages
+                        .iter()
+                        .filter_map(|m| {
+                            m.as_object().map(|obj| {
+                                let mut item = serde_json::Map::new();
+                                item.insert("type".into(), Json::String("message".into()));
+                                if let Some(role) = obj.get("role").and_then(Json::as_str) {
+                                    item.insert("role".into(), Json::String(role.into()));
+                                }
+                                if let Some(content) = obj.get("content") {
+                                    let content_str = match content {
+                                        Json::String(s) => s.clone(),
+                                        _ => serde_json::to_string(content).unwrap_or_default(),
+                                    };
+                                    item.insert("content".into(), Json::String(content_str));
+                                }
+                                Json::Object(item)
+                            })
+                        })
+                        .collect();
+                    if !input.is_empty() {
+                        b["input"] = Json::Array(input);
+                        b.as_object_mut().map(|o| o.shift_remove("messages"));
+                    }
+                } else {
+                    b["input"] = Json::Array(vec![Json::Object({
+                        let mut m = serde_json::Map::new();
+                        m.insert("type".into(), Json::String("message".into()));
+                        m.insert("role".into(), Json::String("user".into()));
+                        m.insert("content".into(), Json::String("...".into()));
+                        m
+                    })]);
+                }
+            } else {
+                b["input"] = Json::Array(vec![Json::Object({
+                    let mut m = serde_json::Map::new();
+                    m.insert("type".into(), Json::String("message".into()));
+                    m.insert("role".into(), Json::String("user".into()));
+                    m.insert("content".into(), Json::String("...".into()));
+                    m
+                })]);
+            }
+        }
+
+        // Normalize tools: flatten function shape and keep hosted tools
+        if let Some(tools_arr) = b.get_mut("tools").and_then(|t| t.as_array_mut()) {
+            let mut normalized = Vec::new();
+            for tool in tools_arr.iter() {
+                if let Some(obj) = tool.as_object() {
+                    let tool_type = obj.get("type").and_then(Json::as_str).unwrap_or("");
+
+                    // Keep hosted tools as-is
+                    if matches!(
+                        tool_type,
+                        "web_search" | "x_search" | "web_search_preview" | "file_search"
+                            | "image_generation" | "code_interpreter" | "mcp" | "local_shell"
+                    ) {
+                        normalized.push(tool.clone());
+                        continue;
+                    }
+
+                    // Extract function schema
+                    let fn_obj = if tool_type == "function" || tool_type.is_empty() {
+                        obj.get("function").and_then(Json::as_object)
+                    } else {
+                        Some(obj)
+                    };
+
+                    if let Some(fn_obj) = fn_obj {
+                        let name = fn_obj
+                            .get("name")
+                            .and_then(Json::as_str)
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty());
+
+                        if let Some(name) = name {
+                            let mut flat = serde_json::Map::new();
+                            flat.insert("type".into(), Json::String("function".into()));
+                            flat.insert(
+                                "name".into(),
+                                Json::String(name.chars().take(128).collect()),
+                            );
+                            if let Some(desc) = fn_obj.get("description").and_then(Json::as_str) {
+                                flat.insert("description".into(), Json::String(desc.into()));
+                            }
+                            if let Some(params) = fn_obj.get("parameters") {
+                                flat.insert("parameters".into(), params.clone());
+                            } else {
+                                let mut empty_params = serde_json::Map::new();
+                                empty_params.insert("type".into(), Json::String("object".into()));
+                                empty_params.insert("properties".into(), Json::Object(serde_json::Map::new()));
+                                flat.insert("parameters".into(), Json::Object(empty_params));
+                            }
+                            normalized.push(Json::Object(flat));
+                        }
+                    }
+                }
+            }
+            if normalized.is_empty() {
+                b.as_object_mut().map(|o| o.shift_remove("tools"));
+                b.as_object_mut().map(|o| o.shift_remove("tool_choice"));
+            } else {
+                *tools_arr = normalized;
+            }
+        }
+
+        // Set streaming and store flags
+        b["stream"] = Json::Bool(true);
+        b["store"] = Json::Bool(false);
+
+        // Resolve model ID (strip effort suffix if present)
+        let mut resolved_model = model.to_string();
+        for level in EFFORT_LEVELS {
+            if let Some(base) = model.strip_suffix(&format!("-{}", level)) {
+                resolved_model = base.to_string();
+                break;
+            }
+        }
+        if !resolved_model.is_empty() {
+            b["model"] = Json::String(resolved_model.clone());
+        }
+
+        // Normalize reasoning effort
+        let supports_effort = supports_reasoning_effort(&resolved_model);
+        if !b.get("reasoning").and_then(Json::as_object).is_some() {
+            let mut reasoning = serde_json::Map::new();
+            reasoning.insert("summary".into(), Json::String("concise".into()));
+            if supports_effort {
+                reasoning.insert(
+                    "effort".into(),
+                    Json::String(normalize_effort(b.get("reasoning_effort")).into()),
+                );
+            }
+            b["reasoning"] = Json::Object(reasoning);
+        } else {
+            // Collect effort value before mutable borrow
+            let effort_val = b
+                .get("reasoning_effort")
+                .cloned()
+                .or_else(|| b.get("reasoning").and_then(|r| r.get("effort")).cloned());
+
+            if let Some(obj) = b.get_mut("reasoning").and_then(|r| r.as_object_mut()) {
+                if supports_effort {
+                    obj.insert(
+                        "effort".into(),
+                        Json::String(normalize_effort(effort_val.as_ref()).into()),
+                    );
+                } else {
+                    obj.shift_remove("effort");
+                }
+                if !obj.contains_key("summary") {
+                    obj.insert("summary".into(), Json::String("concise".into()));
+                }
+            }
+        }
+        b.as_object_mut().map(|o| o.shift_remove("reasoning_effort"));
+
+        // Include encrypted reasoning in response
+        if let Some(reasoning) = b.get("reasoning").and_then(Json::as_object) {
+            if reasoning.get("effort").and_then(Json::as_str).unwrap_or("") != "none" {
+                let include = b
+                    .get_mut("include")
+                    .and_then(|i| i.as_array_mut())
+                    .unwrap_or_else(|| {
+                        b["include"] = Json::Array(Vec::new());
+                        b.get_mut("include").unwrap().as_array_mut().unwrap()
+                    });
+                if !include.iter().any(|i| i.as_str() == Some("reasoning.encrypted_content")) {
+                    include.push(Json::String("reasoning.encrypted_content".into()));
+                }
+            }
+        }
+
+        Ok(b)
     }
 }
 

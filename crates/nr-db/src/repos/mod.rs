@@ -1,3 +1,4 @@
+pub mod aliases;
 pub mod api_keys;
 pub mod combos;
 pub mod connections;
@@ -10,6 +11,7 @@ pub mod request_logs;
 pub mod settings;
 pub mod usage;
 
+pub use aliases::*;
 pub use api_keys::*;
 pub use combos::*;
 pub use connections::*;

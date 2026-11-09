@@ -129,6 +129,8 @@ pub fn translate_request(
     mut credentials: Option<&mut Credentials>,
     options: &TranslationOptions,
 ) -> Json {
+    use crate::concerns::tool_call;
+
     // Pre-translation setup (happens even if formats are the same)
     // TODO(dedupe): normalizeThinkingConfig - needs nr-common provider.js
     // TODO(dedupe): captureThinking - extract thinking from original body for later application
@@ -138,11 +140,13 @@ pub fn translate_request(
     // TODO: implement stripContentTypes(body, stripList) using provider capabilities
 
     // Ensure tool calls have IDs
-    // TODO(dedupe): ensureToolCallIds - add IDs to any tool_calls without them
+    tool_call::ensure_tool_call_ids(&mut body);
 
     // Fix missing tool responses
-    // TODO(dedupe): fixMissingToolResponses - handle missing tool role messages
     // (but skip for Kiro format which has its own reconciliation)
+    if target_format != formats::KIRO {
+        tool_call::fix_missing_tool_responses(&mut body);
+    }
 
     // Same format: apply normalization only
     if source_format == target_format {

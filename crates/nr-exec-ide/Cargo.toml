@@ -34,3 +34,5 @@ tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+rsa = "0.9"
+pkcs8 = "0.10"

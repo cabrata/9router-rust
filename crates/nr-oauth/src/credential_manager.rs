@@ -3,7 +3,12 @@
 //! FROZEN signature below (executors call it).
 
 use chrono::Utc;
+use lazy_static::lazy_static;
+use parking_lot::RwLock;
 use serde_json::json;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
 
 use nr_core::{Credentials, Json, JsonMap, Logger};
 use crate::token_refresh::{get_refresh_lead_ms, is_unrecoverable_refresh_error};
@@ -185,29 +190,72 @@ pub fn merge_refreshed_credentials(
     Some(next)
 }
 
+// Per-provider+stableId refresh lock: ensures only one refresh runs at a time for a given credential
+lazy_static! {
+    static ref CREDENTIAL_REFRESH_LOCKS: RwLock<HashMap<String, Arc<TokioMutex<()>>>> =
+        RwLock::new(HashMap::new());
+}
+
+fn get_refresh_lock_key(provider: &str, creds: &Credentials) -> String {
+    // Build a stable identifier from the credentials
+    let stable_id = creds.get("connectionId")
+        .or_else(|| creds.get("id"))
+        .and_then(|v| v.as_str())
+        .or_else(|| creds.get("email").and_then(|v| v.as_str()))
+        .or_else(|| creds.get("name").and_then(|v| v.as_str()))
+        .or_else(|| {
+            creds.refresh_token().map(|rt| {
+                // Use last 16 chars of refresh token as fallback
+                let chars: String = rt.chars().rev().take(16).collect();
+                chars
+            })
+        })
+        .unwrap_or_else(|| "default".to_string());
+
+    format!("{}:{}", provider, stable_id)
+}
+
 pub async fn with_credential_refresh_lock<F, Fut, T>(
-    _provider: &str,
-    _creds: &Credentials,
+    provider: &str,
+    creds: &Credentials,
     f: F,
 ) -> Option<T>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
 {
-    // TODO(wave2): implement actual lock mechanism to prevent concurrent refreshes
-    // For now, just call the function directly
-    f().await
+    let key = get_refresh_lock_key(provider, creds);
+
+    // Get or create lock for this key
+    let lock = {
+        let mut locks = CREDENTIAL_REFRESH_LOCKS.write();
+        locks.entry(key.clone())
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    };
+
+    // Acquire lock and execute refresh
+    let _guard = lock.lock().await;
+    let result = f().await;
+
+    // Clean up lock if no longer needed (optional optimization)
+    // For now, keep locks cached for performance
+
+    result
 }
 
 pub async fn refresh_provider_credentials(
-    _provider: &str,
-    _creds: &Credentials,
+    provider: &str,
+    creds: &Credentials,
     log: &Logger,
 ) -> Option<JsonMap> {
-    // TODO(wave2): dispatch to refresh_token_by_provider once available
-    // For now, return None
-    log.warn("TOKEN_REFRESH", "Credential refresh not yet implemented");
-    None
+    if creds.0.is_empty() {
+        return None;
+    }
+
+    // Dispatch to refresh_token_by_provider and merge result
+    let refreshed = crate::token_refresh::refresh_token_by_provider(provider, creds, log).await;
+    merge_refreshed_credentials(provider, creds, &refreshed, Utc::now().timestamp_millis())
 }
 
 #[cfg(test)]
@@ -255,5 +303,49 @@ mod tests {
             .timestamp_millis();
         creds.set("expiresAt", json!(far_future));
         assert!(!should_refresh_credentials("test", &creds, now_ms));
+    }
+
+    #[test]
+    fn test_merge_provider_specific_data() {
+        let existing = Some(serde_json::json!({"key1": "value1"}).as_object().unwrap().clone());
+        let next = Some(serde_json::json!({"key2": "value2"}).as_object().unwrap().clone());
+
+        let merged = merge_provider_specific_data(existing.as_ref(), next.as_ref());
+        assert!(merged.is_some());
+
+        let result = merged.unwrap();
+        assert_eq!(result.get("key1").and_then(|v| v.as_str()), Some("value1"));
+        assert_eq!(result.get("key2").and_then(|v| v.as_str()), Some("value2"));
+    }
+
+    #[test]
+    fn test_merge_refreshed_credentials() {
+        let mut refreshed = JsonMap::new();
+        refreshed.insert("accessToken".to_string(), json!("new-token"));
+        refreshed.insert("expiresIn".to_string(), json!(3600));
+
+        let current = Credentials::new();
+        let now_ms = Utc::now().timestamp_millis();
+
+        let merged = merge_refreshed_credentials("test", &current, &Some(refreshed), now_ms);
+        assert!(merged.is_some());
+
+        let result = merged.unwrap();
+        assert_eq!(result.get("accessToken").and_then(|v| v.as_str()), Some("new-token"));
+        assert!(result.get("expiresIn").is_some());
+        assert!(result.get("expiresAt").is_some());
+    }
+
+    #[test]
+    fn test_merge_refreshed_credentials_error() {
+        let mut refreshed = JsonMap::new();
+        refreshed.insert("error".to_string(), json!("invalid_grant"));
+
+        let current = Credentials::new();
+        let merged = merge_refreshed_credentials("test", &current, &Some(refreshed.clone()), Utc::now().timestamp_millis());
+
+        // Should return the error
+        assert!(merged.is_some());
+        assert_eq!(merged.unwrap().get("error").and_then(|v| v.as_str()), Some("invalid_grant"));
     }
 }
