@@ -15,12 +15,16 @@ fn make_try(
 ) -> (TryMemberFn<'static>, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = calls.clone();
-    let mut it = plan.into_iter();
+    // `UpstreamResponse` holds a `Box<dyn Stream + Send>` (not `Sync`), so the
+    // script lives behind a Mutex to keep this closure `Sync`.
+    let it = std::sync::Arc::new(std::sync::Mutex::new(plan.into_iter()));
     let f: TryMemberFn<'static> = Box::new(move |model: &str| {
         let seen = seen.clone();
+        let it = it.clone();
+        let model = model.to_string();
         Box::pin(async move {
-            seen.lock().unwrap().push(model.to_string());
-            it.next().unwrap_or_else(|| Ok(ok_response()))
+            seen.lock().unwrap().push(model);
+            it.lock().unwrap().next().unwrap_or_else(|| Ok(ok_response()))
         })
     });
     (f, calls)
@@ -95,10 +99,10 @@ async fn transport_error_advances() {
     let mut first = true;
     let try_fn: TryMemberFn<'static> = Box::new(move |m: &str| {
         let seen = seen.clone();
+        let m = m.to_string();
         Box::pin(async move {
-            seen.lock().unwrap().push(m.to_string());
-            if first {
-                first = false;
+            seen.lock().unwrap().push(m);
+            if std::mem::replace(&mut first, false) {
                 Err(nr_core::Error::Network("conn refused".into()))
             } else {
                 Ok(ok_response())

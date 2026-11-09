@@ -13,7 +13,7 @@ use nr_core::http::UpstreamResponse;
 use nr_core::{json, ExecRequest, ExecResult, Executor, Json, Result};
 use nr_db::repos::{create_combo, create_provider_connection};
 use nr_db::Db;
-use nr_engine::{ChatRequest, RealChatEngine};
+use nr_engine::{ChatEngine, ChatRequest, RealChatEngine};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -402,4 +402,3 @@ async fn executor_network_failure_rotates_then_reports() {
     let err = engine.handle_chat(chat_req("openai/gpt-4o", false)).await.unwrap_err();
     assert!(err.status() >= 500, "transport failure maps to 5xx, got {}", err.status());
 }
-

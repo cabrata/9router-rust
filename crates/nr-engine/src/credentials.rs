@@ -285,12 +285,11 @@ mod tests {
     #[test]
     fn no_credentials_when_provider_has_no_connections() {
         let (_dir, db) = setup_db();
-        let mut exclude = HashSet::new();
+        let exclude = HashSet::new();
         match get_provider_credentials(&db, "openai", &exclude, None, Strategy::FillFirst) {
             CredentialLookup::None => {}
             _ => panic!("expected None"),
         }
-        let _ = exclude;
     }
 
     #[test]

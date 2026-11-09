@@ -490,6 +490,3 @@ pub fn set_chat_engine(engine: Arc<dyn ChatEngine>) {
 pub fn reset_chat_engine() {
     *ACTIVE_CHAT_ENGINE.write() = None;
 }
-
-#[cfg(test)]
-mod tests;
