@@ -4,11 +4,12 @@
 //! Method: Browser automation
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{stream, StreamExt};
-use nr_core::http::{BodyStream, HeaderList, UpstreamResponse};
+
+use nr_core::http::{HeaderList, UpstreamResponse};
 use nr_core::{Credentials, ExecRequest, ExecResult, Executor, Json, Result};
 use serde_json::json;
 
@@ -89,6 +90,147 @@ pub fn resolve_gemini_web_cookie(creds: &Credentials) -> String {
         parts.push(nr_common::gemini_cookies::normalize_gemini_cookie_input(psidts, "__Secure-1PSIDTS"));
     }
     parts.join("; ")
+}
+
+/// Composer selector: the readiness check and the input target.
+pub const COMPOSER_SELECTOR: &str = ".ql-editor, [contenteditable='true']";
+/// Assistant bubbles. `model-response` is the current contract; `message-content`
+/// is the older wrapper Google still renders on some accounts.
+const ASSISTANT_SELECTOR: &str = "model-response, message-content";
+
+const POLL_INTERVAL_MS: u64 = 400;
+// Unchanged text for this many polls (with the thinking overlay gone) means the
+// turn finished.
+const STABLE_POLLS_DONE: u32 = 5;
+// Safety valve: finish even if the overlay never clears (UI change).
+const STABLE_POLLS_FORCE: u32 = 20;
+const FIRST_TOKEN_TIMEOUT_MS: u64 = 30_000;
+
+const READ_REPLY_STATE: &str = r#"(() => {
+  const msgs = [...document.querySelectorAll("model-response, message-content")];
+  const last = msgs.length ? (msgs[msgs.length - 1].innerText || '').trim() : '';
+  return {
+    count: msgs.length,
+    lastText: last,
+    generating: !!document.querySelector('[data-test-id="thinking-overlay-content"], button[aria-label*="Stop" i]'),
+  };
+})()"#;
+
+/// What the assistant bubbles currently show.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReplyState {
+    pub count: usize,
+    pub last_text: String,
+    /// The "thinking"/stop button is visible, so the turn is still streaming.
+    pub generating: bool,
+}
+
+/// `readReplyState(page)` — a navigating page reads as "no change yet".
+pub async fn read_reply_state(page: &Arc<dyn crate::cdp::Page>) -> ReplyState {
+    let Ok(value) = page.evaluate(READ_REPLY_STATE, None).await else {
+        return ReplyState::default();
+    };
+    ReplyState {
+        count: value.get("count").and_then(Json::as_u64).unwrap_or(0) as usize,
+        last_text: value
+            .get("lastText")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        generating: value.get("generating").and_then(Json::as_bool).unwrap_or(false),
+    }
+}
+
+/// `waitForGeminiReply` — poll the assistant bubbles for the reply that follows
+/// the just-sent message and return its full text.
+///
+/// Interim bubble texts ("Searching the web" …) are replaced wholesale by the
+/// real answer while the thinking overlay is up, so `on_delta` is only called
+/// once the overlay is gone: a client must never receive an interim status as
+/// content.
+pub async fn poll_reply<F: FnMut(&str)>(
+    page: &Arc<dyn crate::cdp::Page>,
+    base: &ReplyState,
+    timeout_ms: u64,
+    mut on_delta: F,
+) -> Result<String, String> {
+    let started = tokio::time::Instant::now();
+    let mut emitted = String::new();
+    let mut last: Option<String> = None;
+    let mut stable = 0u32;
+    let mut got_first = false;
+
+    loop {
+        let elapsed = started.elapsed().as_millis() as u64;
+        if elapsed > timeout_ms {
+            return Err("Gemini reply timed out".into());
+        }
+        if !got_first && elapsed > FIRST_TOKEN_TIMEOUT_MS {
+            return Err("no first token from Gemini".into());
+        }
+        tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+
+        let state = read_reply_state(page).await;
+        let text = state.last_text.clone();
+        let is_new = state.count > base.count || (!text.is_empty() && text != base.last_text);
+        if !is_new || text.is_empty() {
+            continue;
+        }
+
+        got_first = true;
+        if last.as_deref() != Some(text.as_str()) {
+            last = Some(text.clone());
+            stable = 0;
+        } else {
+            stable += 1;
+        }
+
+        if !state.generating && text != emitted {
+            let delta = match text.strip_prefix(emitted.as_str()) {
+                Some(rest) => rest.to_string(),
+                // A rewrite (not an append) replaces the visible text.
+                None => text.clone(),
+            };
+            if !delta.is_empty() {
+                emitted = text.clone();
+                on_delta(&delta);
+            }
+        }
+
+        if stable >= STABLE_POLLS_FORCE {
+            return Ok(if emitted.is_empty() { text } else { emitted });
+        }
+        if !state.generating && stable >= STABLE_POLLS_DONE && text == emitted {
+            return Ok(emitted);
+        }
+    }
+}
+
+/// SSE headers with proxy buffering disabled (the JS `SSE_HEADERS_NO_BUFFER`).
+fn sse_headers() -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    for (k, v) in nr_common::sse_constants::SSE_HEADERS_NO_BUFFER {
+        if let (Ok(name), Ok(value)) = (
+            http::header::HeaderName::try_from(*k),
+            http::header::HeaderValue::try_from(*v),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+    headers
+}
+
+/// One OpenAI SSE chunk carrying a content delta (or the terminal frame).
+pub fn format_stream_chunk(content: &str, model: &str) -> String {
+    json!({
+        "id": "chatcmpl-gwe",
+        "object": "chat.completion.chunk",
+        "created": chrono::Utc::now().timestamp(),
+        "model": model,
+        "choices": [{ "index": 0, "delta": { "content": content }, "finish_reason": Json::Null }]
+    })
+    .to_string()
 }
 
 /// Build Gemini prompt from OpenAI messages (flatten multi-turn to single prompt)
@@ -279,59 +421,29 @@ impl Executor for GeminiWebExecutor {
             locale: Some("en-US".to_string()),
             timezone_id: Some("America/New_York".to_string()),
             headless: Some(true),
+            // The Google session cookies go on the context, not the page, so
+            // every navigation (including the login redirect) carries them.
+            cookie_string: Some(cookie.clone()),
+            cookie_domain: Some(".google.com".to_string()),
+            ..Default::default()
         };
 
         match crate::services::acquire_browser_context(&key, context_opts).await {
             Ok(context) => {
                 match context.new_page().await {
                     Ok(page) => {
+                        // Open the app, wait for the composer, send, then poll
+                        // the assistant bubbles for the reply.
                         let goto_opts = crate::cdp::GotoOptions {
                             wait_until: "domcontentloaded".to_string(),
-                            timeout_ms: 20000,
+                            timeout_ms: 20_000,
                         };
-                        let _ = page.goto(GEMINI_URL, goto_opts).await;
-                        let _ = page.insert_text(&prompt).await;
-                        let _ = page.press_key("Enter").await;
-
-                        let response_text = "Response from Gemini Web";
-
-                        if req.stream {
-                            let cid = format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis());
-                            let created = chrono::Utc::now().timestamp();
-                            let mut sse = String::new();
-
-                            let init_chunk = json!({
-                                "id": cid,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_id,
-                                "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }]
-                            });
-                            sse.push_str(&format!("data: {init_chunk}\n\n"));
-
-                            let delta_chunk = json!({
-                                "id": cid,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_id,
-                                "choices": [{ "index": 0, "delta": { "content": response_text }, "finish_reason": null }]
-                            });
-                            sse.push_str(&format!("data: {delta_chunk}\n\n"));
-
-                            let stop_chunk = json!({
-                                "id": cid,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_id,
-                                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
-                            });
-                            sse.push_str(&format!("data: {stop_chunk}\n\n"));
-                            sse.push_str("data: [DONE]\n\n");
-
-                            let bytes = Bytes::from(sse);
-                            let body_stream: BodyStream = Box::pin(stream::once(async move { Ok(bytes) }));
+                        if let Err(e) = page.goto(GEMINI_URL, goto_opts).await {
                             return Ok(ExecResult {
-                                response: UpstreamResponse::sse(body_stream),
+                                response: UpstreamResponse::json(
+                                    502,
+                                    &json!({ "error": { "message": format!("gemini-web navigation failed: {e}"), "type": "browser_error" } }),
+                                ),
                                 url: GEMINI_URL.to_string(),
                                 headers: HeaderList::new(),
                                 transformed_body: req.body,
@@ -339,14 +451,148 @@ impl Executor for GeminiWebExecutor {
                             });
                         }
 
-                        let completion = format_chat_completion(response_text, model_id);
-                        return Ok(ExecResult {
-                            response: UpstreamResponse::json(200, &completion),
-                            url: GEMINI_URL.to_string(),
-                            headers: HeaderList::new(),
-                            transformed_body: req.body,
-                            response_format: None,
-                        });
+                        // The composer selector is the readiness check; a
+                        // bounced session lands on the marketing splash instead.
+                        if let Err(e) = page.wait_for_selector(COMPOSER_SELECTOR, 10_000).await {
+                            return Ok(ExecResult {
+                                response: UpstreamResponse::json(
+                                    502,
+                                    &json!({
+                                        "error": {
+                                            "message": format!(
+                                                "Gemini did not open a chat session ({e}) — sign in to Google again via the dashboard, and make sure Gemini Apps Activity is enabled"
+                                            ),
+                                            "type": "browser_error",
+                                        }
+                                    }),
+                                ),
+                                url: GEMINI_URL.to_string(),
+                                headers: HeaderList::new(),
+                                transformed_body: req.body,
+                                response_format: None,
+                            });
+                        }
+
+                        let base = read_reply_state(&page).await;
+                        if let Err(e) = page.click(COMPOSER_SELECTOR).await {
+                            return Ok(ExecResult {
+                                response: UpstreamResponse::json(
+                                    502,
+                                    &json!({ "error": { "message": format!("gemini-web composer click failed: {e}"), "type": "browser_error" } }),
+                                ),
+                                url: GEMINI_URL.to_string(),
+                                headers: HeaderList::new(),
+                                transformed_body: req.body,
+                                response_format: None,
+                            });
+                        }
+                        if let Err(e) = page.insert_text(&prompt).await {
+                            return Ok(ExecResult {
+                                response: UpstreamResponse::json(
+                                    502,
+                                    &json!({ "error": { "message": format!("gemini-web prompt entry failed: {e}"), "type": "browser_error" } }),
+                                ),
+                                url: GEMINI_URL.to_string(),
+                                headers: HeaderList::new(),
+                                transformed_body: req.body,
+                                response_format: None,
+                            });
+                        }
+                        if let Err(e) = page.press_key("Enter").await {
+                            return Ok(ExecResult {
+                                response: UpstreamResponse::json(
+                                    502,
+                                    &json!({ "error": { "message": format!("gemini-web send failed: {e}"), "type": "browser_error" } }),
+                                ),
+                                url: GEMINI_URL.to_string(),
+                                headers: HeaderList::new(),
+                                transformed_body: req.body,
+                                response_format: None,
+                            });
+                        }
+
+                        if req.stream {
+                            // Move the page into the poll loop so deltas reach
+                            // the client while the bubble is still growing.
+                            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+                            let model_owned = model_id.to_string();
+                            tokio::spawn(async move {
+                                let cid = format!("chatcmpl-gwe-{}", &uuid::Uuid::new_v4().to_string()[..12]);
+                                let created = chrono::Utc::now().timestamp();
+                                let mut emitted = String::new();
+                                let mut failed = false;
+
+                                let outcome = poll_reply(&page, &base, 60_000, |delta| {
+                                    let chunk = format_stream_chunk(delta, &model_owned);
+                                    let _ = tx.try_send(Ok(Bytes::from(format!("data: {chunk}\n\n"))));
+                                })
+                                .await;
+
+                                match outcome {
+                                    Ok(text) => emitted.push_str(&text),
+                                    Err(e) => {
+                                        failed = true;
+                                        let err = json!({ "error": { "message": e } });
+                                        let _ = tx.send(Ok(Bytes::from(format!("data: {err}\n\ndata: [DONE]\n\n")))).await;
+                                    }
+                                }
+
+                                if !failed {
+                                    let stop = json!({
+                                        "id": cid,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": model_owned,
+                                        "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+                                    });
+                                    let _ = tx.send(Ok(Bytes::from(format!("data: {stop}\n\ndata: [DONE]\n\n")))).await;
+                                }
+                                let _ = emitted;
+                                let _ = page.close().await;
+                            });
+
+                            return Ok(ExecResult {
+                                response: UpstreamResponse::from_stream(
+                                    200,
+                                    sse_headers(),
+                                    Box::pin(futures::stream::poll_fn({
+                                        let mut rx = rx;
+                                        move |cx| rx.poll_recv(cx)
+                                    })),
+                                ),
+                                url: GEMINI_URL.to_string(),
+                                headers: HeaderList::new(),
+                                transformed_body: req.body,
+                                response_format: None,
+                            });
+                        }
+
+                        match poll_reply(&page, &base, 60_000, |_| {}).await {
+                            Ok(text) => {
+                                let completion = format_chat_completion(&text, model_id);
+                                let _ = page.close().await;
+                                return Ok(ExecResult {
+                                    response: UpstreamResponse::json(200, &completion),
+                                    url: GEMINI_URL.to_string(),
+                                    headers: HeaderList::new(),
+                                    transformed_body: req.body,
+                                    response_format: None,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = page.close().await;
+                                return Ok(ExecResult {
+                                    response: UpstreamResponse::json(
+                                        502,
+                                        &json!({ "error": { "message": e, "type": "browser_error" } }),
+                                    ),
+                                    url: GEMINI_URL.to_string(),
+                                    headers: HeaderList::new(),
+                                    transformed_body: req.body,
+                                    response_format: None,
+                                });
+                            }
+                        }
                     }
                     Err(e) => {
                         let err = json!({

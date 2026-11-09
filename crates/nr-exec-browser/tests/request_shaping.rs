@@ -175,6 +175,32 @@ fn veoaifree_blocks_private_artifact_hosts() {
 // ─── provider identity ─────────────────────────────────────────────────────
 
 #[test]
+fn gemini_web_never_fabricates_a_reply() {
+    // Regression: this executor used to answer with a hardcoded
+    // "Response from Gemini Web" string no matter what the user asked. That is
+    // worse than an error, so the flow must go through the DOM instead.
+    let source = include_str!("../src/gemini_web.rs");
+    assert!(
+        !source.contains("Response from Gemini Web"),
+        "gemini-web must read the reply from the page, never invent one"
+    );
+    // The DOM contract the JS client relies on.
+    assert!(source.contains("model-response, message-content"));
+    assert!(source.contains("thinking-overlay-content"));
+    assert!(source.contains(".ql-editor, [contenteditable='true']"));
+}
+
+#[test]
+fn gemini_web_stream_chunk_is_openai_shaped() {
+    let chunk = nr_exec_browser::gemini_web::format_stream_chunk("hello", "gemini-2.5-pro");
+    let parsed: Json = serde_json::from_str(&chunk).expect("valid SSE payload");
+    assert_eq!(parsed["object"], json!("chat.completion.chunk"));
+    assert_eq!(parsed["model"], json!("gemini-2.5-pro"));
+    assert_eq!(parsed["choices"][0]["delta"]["content"], json!("hello"));
+    assert_eq!(parsed["choices"][0]["finish_reason"], Json::Null);
+}
+
+#[test]
 fn browser_executors_report_their_provider() {
     assert_eq!(nr_exec_browser::gemini_web::create("gemini-web").provider(), "gemini-web");
     assert_eq!(nr_exec_browser::grok_web::create("grok-web").provider(), "grok-web");

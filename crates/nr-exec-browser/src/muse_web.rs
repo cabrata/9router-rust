@@ -369,6 +369,10 @@ impl Executor for MuseWebExecutor {
             locale: Some("en-US".to_string()),
             timezone_id: Some("America/New_York".to_string()),
             headless: Some(true),
+            // The muse.ai session cookie authenticates the whole context.
+            cookie_string: Some(cookie.clone()),
+            cookie_domain: Some(".muse.ai".to_string()),
+            ..Default::default()
         };
 
         // Try to acquire pooled browser context
