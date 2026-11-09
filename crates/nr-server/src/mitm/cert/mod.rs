@@ -329,8 +329,9 @@ mod tests {
     fn resolver_refuses_empty_and_nul_sni() {
         let ca = RootCa::generate().unwrap();
         let r = CertResolver::new(ca);
-        assert_eq!(r.certified_key("").unwrap(), None);
-        assert_eq!(r.certified_key("evil\0.example").unwrap(), None);
+        // `CertifiedKey` is not PartialEq; assert absence instead.
+        assert!(r.certified_key("").unwrap().is_none());
+        assert!(r.certified_key("evil\0.example").unwrap().is_none());
         assert!(r.certified_key("api2.cursor.sh").unwrap().is_some());
     }
 }

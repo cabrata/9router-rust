@@ -757,9 +757,10 @@ fn requested_extras(body: Option<Json<Value>>) -> Vec<String> {
 
 /// `rewriteDashboardHtml`: prefix the bundled dashboard's root-absolute fetches.
 fn rewrite_dashboard_html(html: &str) -> String {
-    let re = regex::Regex::new(r"fetch\('(?=/(?:stats|health|stats-history|transformations/feed))")
+    // No look-ahead in the `regex` crate: match the path and re-emit it.
+    let re = regex::Regex::new(r"fetch\('(/(?:stats|health|stats-history|transformations/feed))")
         .expect("static regex");
-    re.replace_all(html, format!("fetch('{DASHBOARD_PREFIX}")).into_owned()
+    re.replace_all(html, format!("fetch('{DASHBOARD_PREFIX}$1")).into_owned()
 }
 
 /// `forwardedHeaders`: drop hop-by-hop + `host`; drop credentials for

@@ -412,13 +412,23 @@ mod tests {
     }
 
     #[test]
-    fn filters_noise_and_preserves_small_text() {
+    fn small_text_passes_through_untouched() {
+        // `smartFilterText` bails out below 2000 chars.
         assert_eq!(smart_filter_text("short"), "short");
+        let small = "  - generic:\n  - button \"Go\" [ref=e12]\n";
+        assert_eq!(smart_filter_text(small), small);
+    }
 
-        let noisy = "  - generic:\n  - text: \"\"\n  - button \"Go\" [ref=e12]\n";
-        let out = smart_filter_text(noisy);
-        assert!(!out.contains("generic"));
-        assert!(out.contains("[ref=e12]"), "{out}");
+    #[test]
+    fn noise_lines_are_dropped_in_large_text() {
+        let mut text = String::from("  - generic:\n  - text: \"\"\n  - button \"Go\" [ref=e12]\n");
+        while text.len() < 2100 {
+            text.push_str("  - link \"filler\"\n");
+        }
+        let out = smart_filter_text(&text);
+        assert!(!out.contains("generic"), "noise node must be dropped");
+        assert!(!out.contains("text: \"\""), "empty text node must be dropped");
+        assert!(out.contains("[ref=e12]"), "refs must survive");
     }
 
     #[test]
