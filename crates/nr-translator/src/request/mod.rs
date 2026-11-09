@@ -5,35 +5,10 @@ use crate::Registry;
 pub mod openai_to_ollama;
 pub mod gemini_to_openai;
 pub mod openai_to_claude;
+pub mod claude_to_openai;
 
-// Stub modules for remaining translators
-pub mod claude_to_openai {
-    use nr_core::{Credentials, Json};
-    use crate::TranslationOptions;
-    pub fn claude_to_openai_request(_model: &str, body: Json, _stream: bool, _credentials: Option<&mut Credentials>, _options: &TranslationOptions) -> Json {
-        // TODO: implement
-        body
-    }
-}
-
-pub mod openai_to_gemini {
-    use nr_core::{Credentials, Json};
-    use crate::TranslationOptions;
-    pub fn openai_to_gemini_request(_model: &str, body: Json, _stream: bool, _credentials: Option<&mut Credentials>, _options: &TranslationOptions) -> Json {
-        // TODO: implement
-        body
-    }
-}
-
-pub mod openai_to_vertex {
-    use nr_core::{Credentials, Json};
-    use crate::TranslationOptions;
-    use super::openai_to_gemini::openai_to_gemini_request;
-    pub fn openai_to_vertex_request(model: &str, body: Json, stream: bool, credentials: Option<&mut Credentials>, options: &TranslationOptions) -> Json {
-        // Vertex wraps Gemini, then post-processes
-        openai_to_gemini_request(model, body, stream, credentials, options)
-    }
-}
+pub mod openai_to_gemini;
+pub mod openai_to_vertex;
 
 pub mod antigravity_to_openai {
     use nr_core::{Credentials, Json};

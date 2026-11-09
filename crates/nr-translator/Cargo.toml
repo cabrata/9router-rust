@@ -9,6 +9,8 @@ license.workspace = true
 [dependencies]
 nr-core.workspace = true
 nr-data.workspace = true
+nr-common.workspace = true
+reqwest.workspace = true
 base64.workspace = true
 bytes.workspace = true
 chrono.workspace = true

@@ -1,5 +1,6 @@
 //! Pre-fetch remote image URLs into base64. Port of open-sse/translator/concerns/prefetch.js.
 
+use once_cell::sync::Lazy;
 use std::collections::HashSet;
 
 use nr_core::Json;

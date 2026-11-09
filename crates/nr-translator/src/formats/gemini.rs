@@ -191,9 +191,9 @@ pub fn generate_session_id() -> String {
 pub fn generate_project_id() -> String {
     let adjectives = ["useful", "bright", "swift", "calm", "bold"];
     let nouns = ["fuze", "wave", "spark", "flow", "core"];
-    let mut rng = rand::rng();
-    let adj = adjectives[rng.random_range(0..adjectives.len())];
-    let noun = nouns[rng.random_range(0..nouns.len())];
+    let mut rng = rand::thread_rng();
+    let adj = adjectives[rng.gen_range(0..adjectives.len())];
+    let noun = nouns[rng.gen_range(0..nouns.len())];
     let uuid_str = Uuid::new_v4().to_string();
     format!("{adj}-{noun}-{}", &uuid_str[..5])
 }
@@ -266,7 +266,7 @@ fn convert_enum_values_to_strings(val: &mut Json) {
         if let Some(arr) = map.get_mut("enum").and_then(|v| v.as_array_mut()) {
             for elem in arr.iter_mut() {
                 if !elem.is_string() {
-                    let s = match elem {
+                    let s = match &*elem {
                         Json::Bool(b) => b.to_string(),
                         Json::Number(n) => n.to_string(),
                         other => other.to_string(),
