@@ -43,7 +43,9 @@ fn empty_exe_name_never_matches_a_live_process() {
 }
 
 #[test]
-fn is_pid_alive_rejects_nonsense_and_reports_self() {
-    assert!(!is_pid_alive(0), "pid 0 is not a real process");
+fn is_pid_alive_reports_own_process() {
+    // `kill(pid, 0)` is the liveness probe; it must succeed for ourselves.
+    // (`pid 0` is deliberately not asserted: it targets the whole process
+    // group, so it is not a meaningful "dead pid" sample.)
     assert!(is_pid_alive(std::process::id()), "own pid is alive");
 }

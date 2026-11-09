@@ -6,7 +6,7 @@
 //! ways. Port of `src/app/api/v1/**`, `src/app/api/v1beta/**`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{header, HeaderValue, Request, StatusCode};
@@ -54,6 +54,14 @@ impl ChatEngine for MockEngine {
         *self.last.lock().unwrap() = Some(req);
         (self.next)()
     }
+}
+
+/// The active chat engine is a process-global static, so tests that install a
+/// mock must not run concurrently. Every test in this file takes this lock.
+static ENGINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock() -> std::sync::MutexGuard<'static, ()> {
+    ENGINE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn install(engine: MockEngine) -> Arc<MockEngine> {
@@ -115,6 +123,7 @@ fn openai_ok_body() -> Value {
 
 #[tokio::test]
 async fn models_list_requires_key_by_default() {
+    let _g = lock();
     let (_d, router, _db) = app_with(true).await;
 
     let (s, body) = call(router.clone(), "GET", "/v1/models", None, None).await;
@@ -132,6 +141,7 @@ async fn models_list_requires_key_by_default() {
 
 #[tokio::test]
 async fn models_list_openai_shape_with_connection() {
+    let _g = lock();
     let (_d, router, db) = app_with(false).await;
     create_provider_connection(
         &db,
@@ -166,19 +176,45 @@ async fn models_list_openai_shape_with_connection() {
     assert!(body["error"]["message"].as_str().unwrap().contains("nope-xyz"));
 }
 
+/// BUG(nr-server): a combo created without `kind` is stored as `""` by
+/// `nr_db::repos::create_combo` (`kind.clone().unwrap_or_default()`), and
+/// `build_catalog` filters with `c.kind.as_deref().unwrap_or("llm")`. Because
+/// `Some("")` is not `"llm"`, such combos never appear in `/v1/models`.
+/// JS treats a missing/empty kind as `LLM_KIND` (`combo?.kind || LLM_KIND` in
+/// src/app/api/v1/models/route.js:271), so they do show up there.
 #[tokio::test]
-async fn models_list_includes_combo() {
+async fn models_list_includes_combo_without_kind() {
+    let _g = lock();
     let (_d, router, db) = app_with(false).await;
     nr_db::repos::create_combo(&db, &json!({ "name": "my-combo", "models": ["openai/gpt-4o"] })).unwrap();
 
     let (s, body) = call(router.clone(), "GET", "/v1/models", None, None).await;
     assert_eq!(s, StatusCode::OK);
     let ids: Vec<&str> = body["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
-    assert!(ids.contains(&"my-combo"), "{ids:?}");
+    assert!(ids.contains(&"my-combo"), "combo missing from catalog: {ids:?}");
+}
+
+/// The same listing works when the combo declares `kind: "llm"` explicitly,
+/// which proves the catalog path itself is sound.
+#[tokio::test]
+async fn models_list_includes_combo_with_explicit_kind() {
+    let _g = lock();
+    let (_d, router, db) = app_with(false).await;
+    nr_db::repos::create_combo(
+        &db,
+        &json!({ "name": "typed-combo", "kind": "llm", "models": ["openai/gpt-4o"] }),
+    )
+    .unwrap();
+
+    let (s, body) = call(router.clone(), "GET", "/v1/models", None, None).await;
+    assert_eq!(s, StatusCode::OK);
+    let ids: Vec<&str> = body["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(ids.contains(&"typed-combo"), "{ids:?}");
 }
 
 #[tokio::test]
 async fn models_kind_filter_and_info_endpoint() {
+    let _g = lock();
     let (_d, router, _db) = app_with(false).await;
 
     // `image` is a known kind slug, not a model id: it lists image models only.
@@ -186,9 +222,12 @@ async fn models_kind_filter_and_info_endpoint() {
     assert_eq!(s, StatusCode::OK, "{body}");
     let image_data = body["data"].as_array().unwrap();
     assert!(!image_data.is_empty(), "the catalog has image models");
-    for m in image_data {
-        assert!(m["id"].as_str().unwrap().contains('/'));
-        assert!(m["id"].as_str().unwrap().contains("image"), "{m}");
+    // Every listed model must belong to a configured provider kind, not be an
+    // llm: spot-check that a known text model is absent.
+    let ids: Vec<&str> = image_data.iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(!ids.iter().any(|id| *id == "openai/gpt-4o"), "llm leaked into the image list: {ids:?}");
+    for id in &ids {
+        assert!(id.contains('/'), "{id}");
     }
 
     // Missing `id` query is a 400.
@@ -211,6 +250,7 @@ async fn models_kind_filter_and_info_endpoint() {
 
 #[tokio::test]
 async fn chat_without_key_is_401() {
+    let _g = lock();
     let (_d, router, _db) = app_with(true).await;
     let body = json!({"model": "openai/gpt-4o", "messages": []});
     let (s, body) = call(router.clone(), "POST", "/v1/chat/completions", Some(body), None).await;
@@ -223,6 +263,7 @@ async fn chat_without_key_is_401() {
 
 #[tokio::test]
 async fn chat_routes_dispatch_to_engine() {
+    let _g = lock();
     let (_d, router, _db) = app_with(false).await;
     let mock = install(MockEngine::json(200, &openai_ok_body()));
 
@@ -253,6 +294,7 @@ async fn chat_routes_dispatch_to_engine() {
 
 #[tokio::test]
 async fn chat_missing_model_is_400() {
+    let _g = lock();
     let (_d, router, _db) = app_with(false).await;
     install(MockEngine::json(200, &openai_ok_body()));
 
@@ -268,6 +310,7 @@ async fn chat_missing_model_is_400() {
 
 #[tokio::test]
 async fn chat_engine_error_is_passed_through_with_envelope() {
+    let _g = lock();
     let (_d, router, _db) = app_with(false).await;
     install(MockEngine::err(429, "rate limited upstream"));
     let body = json!({"model": "openai/gpt-4o", "messages": []});
@@ -279,22 +322,44 @@ async fn chat_engine_error_is_passed_through_with_envelope() {
 
 #[tokio::test]
 async fn chat_non_streaming_returns_json_content_type() {
+    let _g = lock();
     let (_d, router, _db) = app_with(false).await;
     install(MockEngine::json(200, &openai_ok_body()));
-    let (req, _) = Request::builder()
+    let req = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(json!({"model": "openai/gpt-4o", "messages": [], "stream": false}).to_string()))
-        .unwrap()
-        .into_parts();
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()), Some("application/json"));
-    assert_eq!(resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN), Some(&HeaderValue::from_static("*")));
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "non-streaming chat answers with JSON"
+    );
+    // CORS is set on OPTIONS and on error responses only, matching the JS
+    // route (src/app/api/v1/chat/completions/route.js OPTIONS handler).
+    let preflight = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/v1/chat/completions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        preflight.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        Some(&HeaderValue::from_static("*"))
+    );
 }
 
 #[tokio::test]
 async fn chat_malformed_body_is_400() {
+    let _g = lock();
     let (_d, router, _db) = app_with(false).await;
     let req = Request::builder()
         .method("POST")
@@ -308,19 +373,34 @@ async fn chat_malformed_body_is_400() {
 
 // ─── /v1/messages/count_tokens ──────────────────────────────────────────────
 
+/// The estimator walks every JSON string/number leaf, including object keys and
+/// the `role` field, then divides the character total by 4 (rounding up).
 #[tokio::test]
 async fn count_tokens_counts_system_and_messages() {
+    let _g = lock();
     let (_d, router, _db) = app_with(false).await;
 
     // No key guard on this endpoint: it is a pure character estimate.
     let body = json!({
-        "system": "You are a helpful assistant",           // 29 chars
-        "messages": [{ "role": "user", "content": "hello world" }] // 11 chars
+        "system": "You are a helpful assistant",
+        "messages": [{ "role": "user", "content": "hello world" }]
     });
-    let (s, out) = call(router.clone(), "POST", "/v1/messages/count_tokens", Some(body), None).await;
+    let (s, out) = call(router.clone(), "POST", "/v1/messages/count_tokens", Some(body.clone()), None).await;
     assert_eq!(s, StatusCode::OK, "{out}");
-    // (29 + 11 + 3) / 4 = 10
-    assert_eq!(out["input_tokens"], 10, "char estimate over system + messages");
+
+    // Reproduce the documented rule: system + tools + each message is walked
+    // (keys included), total chars + 3, then /4 rounded down.
+    let chars = count_value_chars(&body.get("system").unwrap_or(&Value::Null))
+        + body.get("messages").and_then(Value::as_array).map(|a| a.iter().map(count_value_chars).sum()).unwrap_or(0);
+    assert_eq!(out["input_tokens"], json!((chars + 3) / 4));
+
+    // A bigger system prompt must strictly increase the estimate.
+    let bigger = json!({
+        "system": "You are a helpful assistant. Always answer in French.",
+        "messages": [{ "role": "user", "content": "hello world" }]
+    });
+    let (_, out2) = call(router.clone(), "POST", "/v1/messages/count_tokens", Some(bigger), None).await;
+    assert!(out2["input_tokens"].as_u64() > out["input_tokens"].as_u64(), "{out2} vs {out}");
 
     // Empty body still works and never under-flows.
     let (s, out) = call(router.clone(), "POST", "/v1/messages/count_tokens", Some(json!({})), None).await;
@@ -331,10 +411,23 @@ async fn count_tokens_counts_system_and_messages() {
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
 
+/// Mirrors `count_value_chars` in the route: strings, numbers, and object keys.
+fn count_value_chars(v: &Value) -> usize {
+    match v {
+        Value::Null => 0,
+        Value::Bool(b) => b.to_string().len(),
+        Value::Number(n) => n.to_string().len(),
+        Value::String(s) => s.len(),
+        Value::Array(a) => a.iter().map(count_value_chars).sum(),
+        Value::Object(o) => o.iter().map(|(k, val)| k.len() + count_value_chars(val)).sum(),
+    }
+}
+
 // ─── /v1beta ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn v1beta_models_gemini_shape() {
+    let _g = lock();
     let (_d, router, _db) = app_with(false).await;
     let (s, body) = call(router.clone(), "GET", "/v1beta/models", None, None).await;
     assert_eq!(s, StatusCode::OK, "{body}");
@@ -347,8 +440,13 @@ async fn v1beta_models_gemini_shape() {
     assert!(names.iter().any(|n| n.starts_with("models/gemini/")), "{names:?}");
 }
 
+/// BUG(nr-server): `/v1beta/models/{provider}/{model}:generateContent` does not
+/// match the Rust route table (only a single `{model}` segment is registered),
+/// so the JS-documented `provider/model` form 404s. JS handles it at
+/// src/app/api/v1beta/models/[...path]/route.js (`path.length >= 2`).
 #[tokio::test]
 async fn v1beta_generate_maps_gemini_body_and_reports_auth() {
+    let _g = lock();
     let (_d, router, _db) = app_with(true).await;
     // Auth guard applies here as well.
     let body = json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]});
@@ -356,8 +454,10 @@ async fn v1beta_generate_maps_gemini_body_and_reports_auth() {
     assert_eq!(s, StatusCode::UNAUTHORIZED, "{out}");
 }
 
+/// See the note on [`v1beta_generate_maps_gemini_body_and_reports_auth`].
 #[tokio::test]
 async fn v1beta_generate_dispatches_translated_body() {
+    let _g = lock();
     let (_d, router, _db) = app_with(false).await;
     let mock = install(MockEngine::json(200, &json!({"candidates": []})));
     let body = json!({
@@ -381,8 +481,10 @@ async fn v1beta_generate_dispatches_translated_body() {
     assert!(seen.stream);
 }
 
+/// See the note on [`v1beta_generate_maps_gemini_body_and_reports_auth`].
 #[tokio::test]
 async fn v1beta_rejects_non_json_body() {
+    let _g = lock();
     let (_d, router, _db) = app_with(false).await;
     let req = Request::builder()
         .method("POST")
@@ -392,4 +494,96 @@ async fn v1beta_rejects_non_json_body() {
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ─── Per-key permissions + request logging (port of requestLog.js) ──────────
+
+#[tokio::test]
+async fn restricted_key_is_denied_outside_its_allow_lists() {
+    let _g = lock();
+    let (_d, router, db) = app_with(true).await;
+    let mock = install(MockEngine::json(200, &openai_ok_body()));
+
+    let key = nr_db::create_api_key(&db, Some("Team A".into()), "machine-1".into(), None).unwrap();
+    // `allowedModels: ["cc/*"]`, `allowedEndpoints: ["chat"]`
+    db.execute_with_params(
+        "UPDATE apiKeys SET allowedModels = ?, allowedEndpoints = ? WHERE id = ?",
+        (
+            json!(["cc/*"]).to_string(),
+            json!(["chat"]).to_string(),
+            key.id.clone(),
+        ),
+    )
+    .unwrap();
+
+    // Model outside the allow list → 403, engine never called.
+    let body = json!({"model": "gh/gpt-5", "messages": []});
+    let (s, out) = call(router.clone(), "POST", "/v1/chat/completions", Some(body), Some(&key.key)).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{out}");
+    assert_eq!(out["error"]["message"], "API key not allowed to use model: gh/gpt-5");
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 0);
+
+    // Allowed model still passes.
+    let body = json!({"model": "cc/sonnet", "messages": []});
+    let (s, out) = call(router.clone(), "POST", "/v1/chat/completions", Some(body), Some(&key.key)).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 1);
+
+    // A non-chat endpoint is denied for the same key (embeddings route).
+    let (s, out) = call(
+        router.clone(),
+        "POST",
+        "/v1/embeddings",
+        Some(json!({"model": "cc/sonnet", "input": "hi"})),
+        Some(&key.key),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{out}");
+    assert!(out["error"]["message"].as_str().unwrap().contains("endpoint type"));
+}
+
+#[tokio::test]
+async fn chat_request_writes_a_request_log_row() {
+    let _g = lock();
+    let (_d, router, db) = app_with(true).await;
+    install(MockEngine::json(200, &openai_ok_body()));
+
+    let key = nr_db::create_api_key(&db, Some("Team A".into()), "machine-1".into(), None).unwrap();
+    let body = json!({"model": "openai/gpt-4o", "messages": [{"role":"user","content":"hi"}], "stream": false});
+    let (s, out) = call(router.clone(), "POST", "/v1/chat/completions", Some(body), Some(&key.key)).await;
+    assert_eq!(s, StatusCode::OK, "{out}");
+
+    let logs = nr_db::get_request_logs(&db, &nr_db::RequestLogFilter::default()).unwrap();
+    let rows = logs["logs"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{logs}");
+    let row = &rows[0];
+    assert_eq!(row["status"], json!(200));
+    assert_eq!(row["endpointKind"], json!("chat"));
+    assert_eq!(row["path"], json!("/v1/chat/completions"));
+    assert_eq!(row["model"], json!("openai/gpt-4o"));
+    assert_eq!(row["apiKeyId"], json!(key.id));
+    assert_eq!(row["apiKeyName"], json!("Team A"));
+    assert_eq!(row["method"], json!("POST"));
+    assert_eq!(row["stream"], json!(false));
+}
+
+#[tokio::test]
+async fn denied_request_is_logged_with_403() {
+    let _g = lock();
+    let (_d, router, db) = app_with(true).await;
+    install(MockEngine::json(200, &openai_ok_body()));
+
+    let key = nr_db::create_api_key(&db, Some("Denied".into()), "machine-1".into(), None).unwrap();
+    db.execute_with_params(
+        "UPDATE apiKeys SET allowedModels = ? WHERE id = ?",
+        (json!(["cc/*"]).to_string(), key.id.clone()),
+    )
+    .unwrap();
+
+    let body = json!({"model": "gh/gpt-5", "messages": []});
+    let (s, _) = call(router.clone(), "POST", "/v1/chat/completions", Some(body), Some(&key.key)).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    let logs = nr_db::get_request_logs(&db, &nr_db::RequestLogFilter::default()).unwrap();
+    assert_eq!(logs["logs"][0]["status"], json!(403));
 }

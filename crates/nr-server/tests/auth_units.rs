@@ -20,7 +20,7 @@ fn loopback_addr() -> std::net::SocketAddr {
     "127.0.0.1:54321".parse().unwrap()
 }
 
-fn headers_with(name: &str, value: &str) -> HeaderMap {
+fn headers_with(name: axum::http::HeaderName, value: &str) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert(name, HeaderValue::from_str(value).unwrap());
     h
@@ -45,7 +45,7 @@ fn missing_headers_and_addr_fall_back_to_unknown() {
 fn proxy_trust_rules() {
     // Without TRUST_PROXY a client-supplied XFF must not change the resolved
     // IP: spoofing it would let an attacker dodge the per-IP lockout.
-    let mut h = headers_with("x-forwarded-for", "203.0.113.7");
+    let mut h = headers_with(axum::http::header::HeaderName::from_static("x-forwarded-for"), "203.0.113.7");
     assert_eq!(get_client_ip(&h, Some(loopback_addr())), "127.0.0.1");
 
     // TRUST_PROXY=false keeps the same behaviour.

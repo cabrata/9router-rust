@@ -162,7 +162,7 @@ async fn provider_overrides_round_trip_and_return_builtins() {
         app.clone(),
         "PUT",
         "/api/providers/openai/overrides",
-        Some(json!({ "headers": { "X-Custom": "yes", "Authorization": "" } })),
+        Some(json!({ "headers": { "X-Custom": "yes" } })),
     )
     .await;
     assert_eq!(s, axum::http::StatusCode::OK, "{j}");
@@ -170,8 +170,23 @@ async fn provider_overrides_round_trip_and_return_builtins() {
     let (s, j) = call(app.clone(), "GET", "/api/providers/openai/overrides", None).await;
     assert_eq!(s, axum::http::StatusCode::OK);
     assert_eq!(j["headers"]["X-Custom"], "yes", "override persisted: {j}");
-    // An empty header value is not a real override.
-    assert!(j["headers"].get("Authorization").is_none(), "empty values dropped: {j}");
+
+    // Auth headers are protected: overriding Authorization is a 400 so a user
+    // cannot silently point a provider at another account's token.
+    let (s, j) = call(
+        app.clone(),
+        "PUT",
+        "/api/providers/openai/overrides",
+        Some(json!({ "headers": { "Authorization": "Bearer stolen" } })),
+    )
+    .await;
+    assert_eq!(s, axum::http::StatusCode::BAD_REQUEST, "{j}");
+    assert!(j["error"].as_str().unwrap().to_lowercase().contains("authorization"), "{j}");
+
+    // The rejected write must not have clobbered the stored override.
+    let (s, j) = call(app.clone(), "GET", "/api/providers/openai/overrides", None).await;
+    assert_eq!(s, axum::http::StatusCode::OK);
+    assert_eq!(j["headers"]["X-Custom"], "yes", "{j}");
 }
 
 #[tokio::test]
