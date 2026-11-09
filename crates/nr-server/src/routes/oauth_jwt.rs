@@ -52,6 +52,10 @@ pub fn extract_email_from_access_token(access_token: &str) -> Option<String> {
 
 /// `extractCodexAccountInfo(idToken)` → `{ email, chatgptAccountId, chatgptPlanType }`.
 ///
+/// Email is the bare `payload.email` only. The profile /
+/// `preferred_username` fallbacks belong to the `codex/import-token` route's own
+/// inline decode, not to this helper.
+///
 /// Claims live under the OpenAI auth namespace, with bare fallbacks:
 /// `chatgpt_account_id` / `account_id`, `chatgpt_plan_type` / `plan_type`.
 pub fn extract_codex_account_info(token: &str) -> Value {
@@ -63,27 +67,11 @@ pub fn extract_codex_account_info(token: &str) -> Value {
         .get("https://api.openai.com/auth")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let profile = payload
-        .get("https://api.openai.com/profile")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
 
     let email = payload
         .get("email")
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            profile
-                .get("email")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            payload
-                .get("preferred_username")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-        });
+        .filter(|s| !s.is_empty());
 
     let account_id = chatgpt
         .get("chatgpt_account_id")
@@ -174,10 +162,21 @@ mod tests {
             "email": "bare@x",
             "exp": 1234
         })));
-        assert_eq!(info["email"], json!("p@x"));
+        // JS reads the bare `payload.email`; the profile object is ignored here.
+        assert_eq!(info["email"], json!("bare@x"));
         assert_eq!(info["chatgptAccountId"], json!("acct-1"));
         assert_eq!(info["chatgptPlanType"], json!("plus"));
         assert_eq!(info["jwtExp"], json!(1234));
+    }
+
+    #[test]
+    fn codex_email_ignores_profile_and_username() {
+        // Only `payload.email` feeds this helper in the JS build.
+        let info = extract_codex_account_info(&make_jwt(json!({
+            "https://api.openai.com/profile": { "email": "p@x" },
+            "preferred_username": "user"
+        })));
+        assert!(info.get("email").is_none(), "got {info}");
     }
 
     #[test]

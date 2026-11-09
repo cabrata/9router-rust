@@ -100,6 +100,12 @@ pub fn capture_line(line: &str) {
     schedule_flush();
 }
 
+/// Arm the one-shot 100 ms flush timer.
+///
+/// Uses a plain thread, not `tokio::spawn`: `capture_line` is also called from
+/// synchronous code (and from tests without a runtime), where spawning a tokio
+/// task would panic and leave `flush_scheduled` stuck at `true` forever.
+/// `broadcast::Sender::send` does not need a reactor, so a thread is enough.
 fn schedule_flush() {
     let first = {
         let mut st = state().lock().unwrap();
@@ -113,8 +119,8 @@ fn schedule_flush() {
     if !first {
         return;
     }
-    tokio::spawn(async {
-        tokio::time::sleep(Duration::from_millis(FLUSH_INTERVAL_MS)).await;
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(FLUSH_INTERVAL_MS));
         flush_pending();
     });
 }
@@ -162,6 +168,14 @@ pub fn logs_payload() -> Value {
 mod tests {
     use super::*;
 
+    /// The buffer is process-global, so tests that touch it must not overlap.
+    /// `cargo test` runs them on parallel threads by default.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn strips_sgr_sequences() {
         assert_eq!(strip_ansi("\x1b[31mred\x1b[0m plain"), "red plain");
@@ -172,6 +186,7 @@ mod tests {
 
     #[test]
     fn ring_buffer_is_bounded() {
+        let _guard = serial();
         clear_logs();
         for i in 0..(MAX_LINES + 25) {
             capture_line(&format!("line {i}"));
@@ -183,29 +198,40 @@ mod tests {
 
     #[test]
     fn clear_empties_buffer() {
+        let _guard = serial();
         capture_line("x");
         assert!(!get_logs().is_empty());
         clear_logs();
         assert!(get_logs().is_empty());
     }
 
+    /// Subscribe before capturing so only this test's lines can arrive, and
+    /// accept either batching outcome: a single frame, or one frame per line.
     #[tokio::test]
     async fn subscribers_receive_batches() {
+        let _guard = serial();
         clear_logs();
         let mut rx = subscribe();
-        capture_line("hello");
-        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("flush within 2s")
-            .expect("broadcast recv");
-        match msg {
-            Broadcast::Lines(lines) => assert_eq!(lines, vec!["hello".to_string()]),
-            Broadcast::Clear => panic!("expected lines, got clear"),
+        capture_line("hello-1");
+        capture_line("hello-2");
+
+        let mut seen: Vec<String> = Vec::new();
+        while seen.len() < 2 {
+            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("flush within 2s")
+                .expect("broadcast recv");
+            match msg {
+                Broadcast::Lines(lines) => seen.extend(lines),
+                Broadcast::Clear => panic!("unexpected clear"),
+            }
         }
+        assert_eq!(seen, vec!["hello-1".to_string(), "hello-2".to_string()]);
     }
 
     #[tokio::test]
     async fn clear_notifies_subscribers() {
+        let _guard = serial();
         let mut rx = subscribe();
         clear_logs();
         let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())

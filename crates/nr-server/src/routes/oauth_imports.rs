@@ -116,7 +116,29 @@ pub async fn codex_import_token(
         }
     }
 
-    let email = info.get("email").and_then(|v| v.as_str()).map(str::to_string);
+    // The route decodes the token a second time in JS to pick up the profile
+    // email and `preferred_username`, which `extractCodexAccountInfo` ignores.
+    let payload_email = decode_jwt_payload(token).and_then(|payload| {
+        payload
+            .get("https://api.openai.com/profile")
+            .and_then(|profile| profile.get("email"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| payload.get("email").and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+            .or_else(|| {
+                payload
+                    .get("preferred_username")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+            })
+            .map(str::to_string)
+    });
+
+    let email = info
+        .get("email")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or(payload_email);
     let name = trimmed(&body, "name")
         .map(str::to_string)
         .or_else(|| email.clone())
