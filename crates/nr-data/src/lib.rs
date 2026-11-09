@@ -22,6 +22,7 @@ pub mod pricing;
 pub mod kiro_constants;
 pub mod thinking_levels;
 pub mod capabilities;
+pub mod model_helpers;
 
 static MODULES: LazyLock<HashMap<&'static str, Json>> = LazyLock::new(|| {
     FILES
