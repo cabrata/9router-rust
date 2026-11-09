@@ -26,17 +26,6 @@ fn err_json(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
 }
 
-fn not_ported(feature: &str) -> Response {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": format!("{feature} needs a helper that is not ported to the Rust build yet"),
-            "code": "NOT_IMPLEMENTED",
-        })),
-    )
-        .into_response()
-}
-
 fn db_of(ext: Option<Extension<Db>>) -> Result<Db, Response> {
     match ext {
         Some(Extension(db)) => Ok(db),
