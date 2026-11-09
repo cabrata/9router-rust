@@ -277,6 +277,38 @@ fn generate_pkce() -> (String, String) {
     (verifier, challenge)
 }
 
+/// `decodeJwtPayload(jwt)` from src/lib/oauth/providerHelpers.js.
+pub(crate) fn decode_jwt_payload(jwt: &str) -> Option<Json> {
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .or_else(|_| {
+            let normalized = payload.replace('-', "+").replace('_', "/");
+            let padding = (4 - normalized.len() % 4) % 4;
+            base64::engine::general_purpose::STANDARD.decode(format!("{normalized}{}", "=".repeat(padding)))
+        })
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// `decodeXaiIdTokenEmail(idToken)`.
+pub(crate) fn decode_xai_id_token_email(id_token: Option<&str>) -> Option<String> {
+    let payload = decode_jwt_payload(id_token?)?;
+    ["email", "preferred_username", "sub"]
+        .iter()
+        .find_map(|k| payload.get(*k).and_then(Json::as_str))
+        .map(str::to_string)
+}
+
+/// `extractEmailFromAccessToken(accessToken)`.
+pub(crate) fn extract_email_from_access_token(access_token: &str) -> Option<String> {
+    let payload = decode_jwt_payload(access_token)?;
+    ["email", "preferred_username", "sub"]
+        .iter()
+        .find_map(|k| payload.get(*k).and_then(Json::as_str))
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +326,31 @@ mod tests {
         assert!(get_provider("claude").is_some());
         assert!(get_provider("github").is_some());
         assert!(get_provider("unknown").is_none());
+    }
+
+    #[test]
+    fn jwt_email_extraction_prefers_email_then_username_then_sub() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let jwt_with = |claims: Json| {
+            format!(
+                "h.{}.s",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            )
+        };
+
+        let with_email = jwt_with(serde_json::json!({"email": "a@b.c", "sub": "u1"}));
+        assert_eq!(decode_xai_id_token_email(Some(&with_email)), Some("a@b.c".into()));
+        assert_eq!(extract_email_from_access_token(&with_email), Some("a@b.c".into()));
+
+        let with_username = jwt_with(serde_json::json!({"preferred_username": "dev"}));
+        assert_eq!(decode_xai_id_token_email(Some(&with_username)), Some("dev".into()));
+
+        let sub_only = jwt_with(serde_json::json!({"sub": "user-42"}));
+        assert_eq!(decode_xai_id_token_email(Some(&sub_only)), Some("user-42".into()));
+
+        // Malformed tokens never panic.
+        assert_eq!(decode_xai_id_token_email(Some("not-a-jwt")), None);
+        assert_eq!(decode_xai_id_token_email(None), None);
+        assert_eq!(extract_email_from_access_token("a.b.c"), None);
     }
 }

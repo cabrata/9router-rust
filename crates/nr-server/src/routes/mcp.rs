@@ -201,6 +201,8 @@ struct Bridge {
     tx: broadcast::Sender<String>,
     /// Open SSE sessions; the last one to leave kills the child.
     sessions: std::sync::atomic::AtomicUsize,
+    /// Child pid, for `proc.kill()` when the last session leaves.
+    pid: Option<u32>,
 }
 
 impl Bridge {
@@ -220,12 +222,49 @@ impl Drop for SessionGuard {
     fn drop(&mut self) {
         let remaining = self.bridge.sessions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1;
         if remaining == 0 {
+            // `unregisterSession`: no sessions left → kill child, drop the entry.
+            if let Some(pid) = self.bridge.pid {
+                terminate(pid);
+            }
+            if let Ok(mut pids) = BRIDGE_PIDS.lock() {
+                pids.retain(|(n, _)| n != &self.name);
+            }
             let name = self.name.clone();
             tokio::spawn(async move {
-                // `unregisterSession`: no sessions left → kill the child.
                 BRIDGES.lock().await.remove(&name);
             });
         }
+    }
+}
+
+/// `proc.kill()`: SIGTERM (default `kill` signal), best effort.
+fn terminate(pid: u32) {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        unsafe {
+            kill(pid as i32, 15);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        // shortcut: Windows has no SIGTERM; `Child::kill` is the only handle and
+        // it is owned by the reaper task. Upgrade with a Job Object if needed.
+    }
+}
+
+/// Pids of live children, so shutdown can `killAllBridges()`.
+static BRIDGE_PIDS: LazyLock<std::sync::Mutex<Vec<(String, u32)>>> =
+    LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// `killAllBridges()` — called on shutdown so no child outlives the server.
+pub fn kill_all_bridges() {
+    let pids: Vec<(String, u32)> = BRIDGE_PIDS.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+    for (_, pid) in pids {
+        terminate(pid);
     }
 }
 
@@ -246,8 +285,18 @@ async fn get_or_spawn(name: &str) -> Option<Arc<Bridge>> {
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
 
-    let mut child: Child = Command::new(&command)
-        .args(&args)
+    let bridge = spawn_bridge(name, &command, &args).await?;
+    store.insert(name.to_string(), bridge.clone());
+    Some(bridge)
+}
+
+/// Spawn one stdio MCP child and wire its pipes into a [`Bridge`].
+///
+/// Split out of [`get_or_spawn`] so tests can drive a stub child without a
+/// preset plugin entry.
+async fn spawn_bridge(name: &str, command: &str, args: &[String]) -> Option<Arc<Bridge>> {
+    let mut child: Child = Command::new(command)
+        .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -258,12 +307,17 @@ async fn get_or_spawn(name: &str) -> Option<Arc<Bridge>> {
     let stdin = child.stdin.take()?;
     let stdout = child.stdout.take()?;
     let stderr = child.stderr.take();
+    let pid = child.id();
     let (tx, _rx) = broadcast::channel::<String>(256);
     let bridge = Arc::new(Bridge {
         stdin: tokio::sync::Mutex::new(stdin),
         tx: tx.clone(),
         sessions: std::sync::atomic::AtomicUsize::new(0),
+        pid,
     });
+    if let (Some(pid), Ok(mut pids)) = (pid, BRIDGE_PIDS.lock()) {
+        pids.push((name.to_string(), pid));
+    }
 
     // Newline-delimited JSON-RPC from the child → every session.
     let name_owned = name.to_string();
@@ -294,12 +348,12 @@ async fn get_or_spawn(name: &str) -> Option<Arc<Bridge>> {
         });
     }
 
-    // Reap the child so it cannot linger as a zombie.
+    // Reap the child so it cannot linger as a zombie. The last SSE session to
+    // leave asks for a SIGTERM (JS `proc.kill()`), which ends this wait.
     tokio::spawn(async move {
         let _ = child.wait().await;
     });
 
-    store.insert(name.to_string(), bridge.clone());
     Some(bridge)
 }
 
@@ -457,5 +511,65 @@ mod tests {
         .to_string();
         // Below the 50k hard cap nothing changes, so the raw line is returned.
         assert_eq!(filter_frame(&frame), frame);
+    }
+
+    /// A stub MCP server: echoes each JSON-RPC request back as a response.
+    /// Written as a one-liner so the test needs no fixture file.
+    const ECHO_SERVER: &str = r#"import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    msg["result"] = {"echo": msg.get("method")}
+    print(json.dumps(msg), flush=True)
+"#;
+
+    /// Full bridge roundtrip: stdin JSON-RPC in, stdout frame out over the
+    /// broadcast channel that the SSE handler subscribes to.
+    #[tokio::test]
+    async fn message_roundtrip_through_stub_child() {
+        let Ok(python) = which_python() else {
+            eprintln!("skipping: no python3 available for the stub MCP child");
+            return;
+        };
+        let args = vec!["-c".to_string(), ECHO_SERVER.to_string()];
+        let Some(bridge) = spawn_bridge("test-echo", &python, &args).await else {
+            panic!("stub child failed to spawn");
+        };
+        let mut rx = bridge.tx.subscribe();
+
+        // `sendToChild`: one JSON-RPC line on the child's stdin.
+        let request = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/list" });
+        {
+            let mut stdin = bridge.stdin.lock().await;
+            stdin.write_all(format!("{request}\n").as_bytes()).await.expect("write stdin");
+            stdin.flush().await.expect("flush stdin");
+        }
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("stub child answered in time")
+            .expect("frame broadcast");
+        let value: Value = serde_json::from_str(&frame).expect("frame is JSON");
+        assert_eq!(value["jsonrpc"], "2.0");
+        assert_eq!(value["id"], 7, "JSON-RPC id must be relayed verbatim");
+        assert_eq!(value["result"]["echo"], "tools/list");
+    }
+
+    fn which_python() -> Result<String, ()> {
+        for candidate in ["python3", "python"] {
+            if std::process::Command::new(candidate)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                return Ok(candidate.to_string());
+            }
+        }
+        Err(())
     }
 }

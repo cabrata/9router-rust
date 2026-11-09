@@ -11,9 +11,11 @@ pub mod account_fallback;
 pub mod chat;
 pub mod combo;
 pub mod credentials;
+pub mod empty_failover;
 pub mod media;
 pub mod model;
 pub mod rtk;
+pub mod thought_signatures;
 pub mod ssrf;
 pub mod stream;
 pub mod translate;
@@ -23,7 +25,11 @@ pub use chat::{
     clear_executor_resolver, handle_chat, reset_chat_engine, set_chat_engine,
     set_executor_resolver, ChatEngine, ChatRequest, RealChatEngine,
 };
-pub use combo::{handle_combo_chat, ComboOutcome};
+pub use combo::{get_combo_models_from_data, handle_combo_chat, ComboOutcome};
+pub use empty_failover::{
+    classify_body, delta_has_client_content, inspect_sse_line, is_no_retry_finish, scan_sse_buffer,
+    should_fail_over, PeekOutcome, ScanState,
+};
 
 // ─── Media Requests & Handlers ──────────────────────────────────────────────
 
@@ -379,6 +385,9 @@ pub async fn handle_video(req: VideoRequest) -> Result<UpstreamResponse> {
 /// images and web search/fetch. Call once from the server after the database
 /// is open; the free `handle_*` functions then serve real traffic.
 pub fn install_real_engines(db: nr_db::Db) {
+    // Gemini thought signatures persist across turns through the `kv` table; the
+    // store lives in nr-common, which cannot reach nr-db, so the tier is wired here.
+    thought_signatures::install(db.clone());
     set_chat_engine(Arc::new(RealChatEngine::new(db.clone())));
     set_embeddings_engine(Arc::new(RealEmbeddingsEngine { db: db.clone() }));
     set_images_engine(Arc::new(RealImagesEngine { db: db.clone() }));

@@ -1,7 +1,8 @@
-//! Port of `src/app/api/translator/{console-logs,console-logs/stream,load,save}/route.js`.
+//! Port of `src/app/api/translator/{console-logs,console-logs/stream,load,save,translate,send}/route.js`.
 //!
-//! `translate` and `send` are deliberately absent: they need the executor and
-//! translator registries owned by other agents.
+//! `translate` drives the real `nr-translator` pipeline (step 2 = source→OpenAI,
+//! step 3 = OpenAI→target plus executor URL/headers/body); `send` streams the
+//! step-4 body to the provider through `nr-executors`.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -397,20 +398,9 @@ pub async fn send_post(
 
     let mut credentials = connection_credentials(&connection);
     let stream = body.get("stream").and_then(Value::as_bool) != Some(false);
-    // The debug endpoint sends the body as-is; the caller already translated it.
-    let target_format = nr_common::provider::get_target_format(&provider, None);
-    let mut translated = nr_translator::translate_request(
-        target_format,
-        target_format,
-        &model,
-        body,
-        stream,
-        Some(&mut credentials),
-        &nr_translator::TranslationOptions::default(),
-    );
-    if let Some(obj) = translated.as_object_mut() {
-        obj["model"] = json!(model);
-    }
+    // The debug endpoint sends the body as-is: the caller already translated it
+    // in step 3 and the JS route never touches it again.
+    let translated = body;
 
     let executor = nr_executors::get_executor(&provider);
     let log = nr_core::Logger::new();

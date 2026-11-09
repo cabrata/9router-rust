@@ -805,10 +805,12 @@ pub async fn proxy(ext: Option<Extension<Db>>, req: Request) -> Response {
         parts.uri.query(),
         parts.headers,
         bytes,
+        None,
     )
     .await
 }
 
+/// `base_url` overrides the settings URL; production callers pass `None`.
 async fn proxy_to_headroom(
     ext: &Option<Extension<Db>>,
     method: Method,
@@ -816,9 +818,14 @@ async fn proxy_to_headroom(
     query: Option<&str>,
     headers: HeaderMap,
     body: axum::body::Bytes,
+    base_url: Option<&str>,
 ) -> Response {
     let settings = settings_of(ext);
-    let mut target = match url::Url::parse(&headroom_url(&settings)) {
+    let base = match base_url {
+        Some(url) => url.to_string(),
+        None => headroom_url(&settings),
+    };
+    let mut target = match url::Url::parse(&base) {
         Ok(u) if u.scheme() == "http" || u.scheme() == "https" => u,
         Ok(_) => {
             return (
@@ -949,5 +956,82 @@ mod tests {
         let kept = forwarded_headers(&headers, &local);
         assert!(kept.contains_key("cookie"));
         assert!(kept.contains_key("authorization"));
+    }
+
+    /// Stand up a throwaway upstream that answers like the headroom proxy.
+    async fn stub_upstream() -> String {
+        use axum::routing::get;
+        let app = Router::new()
+            .route("/stats", get(|| async { Json(json!({ "requests": 3, "savedPct": 12.5 })) }))
+            .route(
+                "/dashboard",
+                get(|| async {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/html")],
+                        "<html><script>fetch('/stats')</script></html>",
+                    )
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind stub");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn proxy_passes_through_and_rewrites_dashboard() {
+        let base = stub_upstream().await;
+        let body = proxy_to_headroom(
+            &None,
+            Method::GET,
+            "/stats",
+            None,
+            HeaderMap::new(),
+            axum::body::Bytes::new(),
+            Some(&base),
+        )
+        .await;
+        assert_eq!(body.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(body.into_body(), 64 * 1024).await.expect("body");
+        let value: Value = serde_json::from_slice(&bytes).expect("json passthrough");
+        assert_eq!(value["requests"], 3);
+        assert_eq!(value["savedPct"], 12.5);
+
+        // `dashboard` keeps the HTML content type but gets its fetches prefixed.
+        let dash = proxy_to_headroom(
+            &None,
+            Method::GET,
+            "/dashboard",
+            None,
+            HeaderMap::new(),
+            axum::body::Bytes::new(),
+            Some(&base),
+        )
+        .await;
+        assert_eq!(dash.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(dash.into_body(), 64 * 1024).await.expect("body");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("/api/headroom/proxy/stats"), "{text}");
+    }
+
+    /// Unreachable sidecar: the route reports it, it never fakes success.
+    #[tokio::test]
+    async fn proxy_reports_an_unreachable_sidecar() {
+        let body = proxy_to_headroom(
+            &None,
+            Method::GET,
+            "/stats",
+            None,
+            HeaderMap::new(),
+            axum::body::Bytes::new(),
+            Some("http://127.0.0.1:1"),
+        )
+        .await;
+        assert_eq!(body.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(body.into_body(), 64 * 1024).await.expect("body");
+        let value: Value = serde_json::from_slice(&bytes).expect("json error");
+        assert!(value.get("error").is_some(), "{value}");
     }
 }

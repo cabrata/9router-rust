@@ -238,6 +238,37 @@ async fn translator_translate_step_3_needs_a_connection() {
 }
 
 #[tokio::test]
+async fn translator_translate_step_2_runs_the_real_translator() {
+    // claude source → openai intermediate, the first half of the real pipeline.
+    let (status, body) = call(
+        "POST",
+        "/api/translator/translate",
+        Some(json!({
+            "step": 2,
+            "body": {
+                "body": {
+                    "model": "anthropic/claude-3-5-sonnet",
+                    "max_tokens": 32,
+                    "system": "be brief",
+                    "messages": [{ "role": "user", "content": "hi" }],
+                }
+            },
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["success"], true);
+    let translated = &body["result"]["body"];
+    // The translator emits OpenAI shape: messages plus a hoisted system turn.
+    let messages = translated["messages"].as_array().expect("messages array");
+    assert!(messages.iter().any(|m| m["role"] == "system"), "{translated}");
+    assert!(messages.iter().any(|m| m["role"] == "user"), "{translated}");
+    // `_toolNameMap` is stripped from the response (JS `delete result._toolNameMap`).
+    assert!(translated.get("_toolNameMap").is_none(), "{translated}");
+    assert_eq!(translated["max_tokens"], 32);
+}
+
+#[tokio::test]
 async fn translator_send_requires_provider_model_body() {
     let (status, body) = call("POST", "/api/translator/send", Some(json!({}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

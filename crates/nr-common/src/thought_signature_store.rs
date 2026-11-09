@@ -6,9 +6,8 @@
 //! a 7 day TTL that is written asynchronously and read back on a RAM miss.
 //!
 //! `nr-common` sits below `nr-db` in the crate graph, so the persistent tier is a
-//! pluggable [`SignatureKv`] installed at startup by the db/server crate:
-//! `shortcut: kv persistence is installed via install_persistence(); until a crate
-//! below nr-db wires it, only the RAM tier is active — upgrade when nr-server boots`.
+//! pluggable [`SignatureKv`] that `nr_engine::thought_signatures::install` wires at
+//! startup (`install_real_engines`).
 
 use indexmap::IndexMap;
 use nr_core::{json::now_ms, Json};

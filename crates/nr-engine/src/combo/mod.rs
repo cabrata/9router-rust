@@ -14,6 +14,35 @@ use nr_core::{Json, Result};
 
 use crate::account_fallback::check_fallback_error;
 
+/// `getComboModelsFromData` (open-sse/services/compact.js): resolve a combo's
+/// member models, or `None` when `model_str` is not a combo.
+///
+/// A `provider/model` string is never a combo name. `combos_data` may be the
+/// bare array or an object wrapping it under `combos`.
+pub fn get_combo_models_from_data(model_str: &str, combos_data: &Json) -> Option<Vec<String>> {
+    if model_str.contains('/') {
+        return None;
+    }
+    let combos = match combos_data {
+        Json::Array(items) => items.as_slice(),
+        other => other.get("combos").and_then(Json::as_array).map(Vec::as_slice).unwrap_or(&[]),
+    };
+    let combo = combos
+        .iter()
+        .find(|c| c.get("name").and_then(Json::as_str) == Some(model_str))?;
+    let models = combo.get("models").and_then(Json::as_array)?;
+    if models.is_empty() {
+        return None;
+    }
+    Some(
+        models
+            .iter()
+            .filter_map(Json::as_str)
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 /// Result of rotating through a combo.
 pub enum ComboOutcome {
     /// A member served the request.

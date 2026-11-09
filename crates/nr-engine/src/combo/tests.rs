@@ -141,3 +141,30 @@ fn single_model_combo_never_rotates() {
     let r = rotate_for_round_robin(&models, "rr-3", "round-robin");
     assert_eq!(r, vec!["only/m"]);
 }
+
+#[test]
+fn combo_models_lookup_accepts_array_and_wrapper() {
+    let combos = serde_json::json!([
+        { "name": "fast", "models": ["a/m1", "b/m2"] },
+        { "name": "empty", "models": [] }
+    ]);
+    assert_eq!(
+        get_combo_models_from_data("fast", &combos),
+        Some(vec!["a/m1".to_string(), "b/m2".to_string()])
+    );
+    // Object wrapper (`{ combos: [...] }`) is the API shape.
+    let wrapped = serde_json::json!({ "combos": combos });
+    assert_eq!(
+        get_combo_models_from_data("fast", &wrapped),
+        Some(vec!["a/m1".to_string(), "b/m2".to_string()])
+    );
+    assert_eq!(get_combo_models_from_data("empty", &combos), None);
+    assert_eq!(get_combo_models_from_data("missing", &combos), None);
+    assert_eq!(get_combo_models_from_data("fast", &serde_json::json!({})), None);
+}
+
+#[test]
+fn combo_models_lookup_ignores_provider_model_strings() {
+    let combos = serde_json::json!([{ "name": "plexus/fast", "models": ["a/m1"] }]);
+    assert_eq!(get_combo_models_from_data("plexus/fast", &combos), None);
+}

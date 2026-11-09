@@ -57,7 +57,7 @@ impl OAuthProvider for XaiProvider {
         &self,
         config: &Json,
         code: &str,
-        _redirect_uri: &str,
+        redirect_uri: &str,
         code_verifier: Option<&str>,
         _state: Option<&str>,
         _meta: Option<&Json>,
@@ -67,17 +67,36 @@ impl OAuthProvider for XaiProvider {
             .unwrap_or("https://auth.x.ai/token");
         let client_id = config.get("clientId").and_then(|v| v.as_str()).unwrap_or("");
 
-        // TODO: POST to tokenUrl with code, client_id, code_verifier, redirect_uri
-        // Returns { access_token, refresh_token, expires_in, id_token, scope }
-
-        let mut result = serde_json::Map::new();
-        result.insert("access_token".to_string(), json!(code)); // Placeholder
-        result.insert("_exchange_url".to_string(), json!(token_url));
-        result.insert("_client_id".to_string(), json!(client_id));
+        let mut pairs: Vec<(&str, &str)> = vec![
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+        ];
         if let Some(verifier) = code_verifier {
-            result.insert("_code_verifier".to_string(), json!(verifier));
+            pairs.push(("code_verifier", verifier));
         }
-        Ok(Json::Object(result))
+        let body = pairs
+            .iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let response = reqwest::Client::new()
+            .post(token_url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .body(body)
+            .send()
+            .await?;
+
+        let ok = response.status().is_success();
+        let text = response.text().await.unwrap_or_default();
+        if !ok {
+            return Err(nr_core::Error::new(&format!("xAI token exchange failed: {text}")));
+        }
+        serde_json::from_str(&text)
+            .map_err(|e| nr_core::Error::new(&format!("xAI token exchange returned invalid JSON: {e}")))
     }
 
     async fn request_device_code(
@@ -104,18 +123,28 @@ impl OAuthProvider for XaiProvider {
             return Err(nr_core::Error::new("xAI: missing access_token"));
         }
 
+        // JS mirrors the id_token into providerSpecificData so downstream can
+        // decode the email without another round trip.
+        let id_token = tokens.get("id_token").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let mut psd = serde_json::Map::new();
+        if let Some(id_token) = &id_token {
+            psd.insert("idToken".into(), json!(id_token));
+        }
+        let email = crate::flows::providers::decode_xai_id_token_email(id_token.as_deref())
+            .or_else(|| crate::flows::providers::extract_email_from_access_token(&access_token));
+
         Ok(MappedTokens {
             access_token,
             refresh_token: tokens.get("refresh_token").and_then(|v| v.as_str()).map(|s| s.to_string()),
             expires_in: tokens.get("expires_in").and_then(|v| v.as_i64()),
             expires_at: None,
-            scope: None,
+            scope: tokens.get("scope").and_then(|v| v.as_str()).map(|s| s.to_string()),
             project_id: None,
-            id_token: None,
-            email: None,
+            id_token,
+            email,
             display_name: None,
             name: None,
-            provider_specific_data: None,
+            provider_specific_data: (!psd.is_empty()).then_some(psd),
         })
     }
 }

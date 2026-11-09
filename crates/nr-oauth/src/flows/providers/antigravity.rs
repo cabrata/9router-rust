@@ -117,9 +117,14 @@ impl OAuthProvider for AntigravityProvider {
         let access_token = str_of(tokens, "access_token")
             .ok_or_else(|| nr_core::Error::BadRequest("Antigravity: missing access_token".into()))?;
 
+        // The transport config carries the endpoints; the provider row has none.
+        let config = nr_data::provider_oauth("antigravity").cloned().unwrap_or_else(|| json!({}));
+        let user_info_url = str_of(&config, "userInfoUrl")
+            .unwrap_or("https://www.googleapis.com/oauth2/v1/userinfo");
+
         // Fetch user info
         let user_res = reqwest::Client::new()
-            .get("https://www.googleapis.com/oauth2/v1/userinfo?alt=json")
+            .get(format!("{user_info_url}?alt=json"))
             .header("Authorization", format!("Bearer {}", access_token))
             .header("x-request-source", "local")
             .send()
@@ -131,11 +136,52 @@ impl OAuthProvider for AntigravityProvider {
             None
         };
 
-        // TODO: Load Code Assist endpoint for projectId (requires actual implementation)
-        // For now, return user info only
+        // Load Code Assist for the project id and default tier. A failure only
+        // leaves projectId empty, exactly like the JS try/catch.
+        let mut project_id = String::new();
+        let mut tier_id = "legacy-tier".to_string();
+        if let Some(load_url) = str_of(&config, "loadCodeAssistEndpoint") {
+            let ua = str_of(&config, "loadCodeAssistUserAgent")
+                .unwrap_or("antigravity/hub/2.24.0 darwin/arm64");
+            let metadata = crate::flows::constants::get_oauth_client_metadata();
+            let load = reqwest::Client::new()
+                .post(load_url)
+                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Content-Type", "application/json")
+                .header("User-Agent", ua)
+                .header("x-request-source", "local")
+                .json(&json!({ "metadata": Json::Object(metadata) }))
+                .send()
+                .await;
+
+            if let Ok(res) = load {
+                if res.status().is_success() {
+                    let data: Json = res.json().await.unwrap_or(Json::Null);
+                    project_id = data
+                        .get("cloudaicompanionProject")
+                        .and_then(|p| p.get("id").or(Some(p)))
+                        .and_then(Json::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    // The first tier marked default wins; JS trims the id.
+                    if let Some(tiers) = data.get("allowedTiers").and_then(Json::as_array) {
+                        if let Some(tier) = tiers
+                            .iter()
+                            .find(|t| t.get("isDefault") == Some(&Json::Bool(true)))
+                            .and_then(|t| t.get("id"))
+                            .and_then(Json::as_str)
+                        {
+                            tier_id = tier.trim().to_string();
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Some(json!({
             "userInfo": user_info,
-            "projectId": ""
+            "projectId": project_id,
+            "tierId": tier_id,
         })))
     }
 

@@ -36,6 +36,9 @@ pub async fn post_shutdown(headers: HeaderMap) -> Response {
     // Schedule exit
     tokio::spawn(async {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // `killAllBridges()` runs in the JS signal cleanup; without it a
+        // spawned stdio MCP child would outlive the server.
+        crate::routes::mcp::kill_all_bridges();
         std::process::exit(0);
     });
 

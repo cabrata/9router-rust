@@ -403,9 +403,15 @@ pub fn get_model_upstream_id(alias_or_id: &str, model_id: &str, client_body: Opt
 
 /// Get models by provider id (with alias resolution)
 pub fn get_models_by_provider_id(provider_id: &str) -> Vec<Json> {
-    // TODO(dedupe): Use proper alias resolution once provider/index is ported
+    // `PROVIDER_ID_TO_ALIAS[providerId] || providerId` — the registry carries the
+    // alias for every provider id, and PROVIDER_MODELS is keyed by alias.
+    let alias = registry_entry(provider_id)
+        .and_then(|e| e.get("alias"))
+        .and_then(Json::as_str)
+        .filter(|a| !a.is_empty())
+        .unwrap_or(provider_id);
     provider_models()
-        .get(provider_id)
+        .get(alias)
         .and_then(Json::as_array)
         .cloned()
         .unwrap_or_default()
@@ -481,7 +487,9 @@ pub fn select_anthropic_beta(model: &str, body: Option<&Json>) -> String {
         .map(|d| d == "summarized")
         .unwrap_or(false);
 
-    let mut flags = vec![
+    // ANTHROPIC_BETA_BASE, in JS order; `redact-thinking` drops out in place when
+    // the client asked for thinking summaries (only signature blocks otherwise).
+    let mut flags: Vec<&str> = vec![
         "claude-code-20250219",
         "oauth-2025-04-20",
         "interleaved-thinking-2025-05-14",
@@ -489,11 +497,11 @@ pub fn select_anthropic_beta(model: &str, body: Option<&Json>) -> String {
         "prompt-caching-scope-2026-01-05",
         "structured-outputs-2025-12-15",
         "fast-mode-2026-02-01",
+        "redact-thinking-2026-02-12",
         "token-efficient-tools-2026-03-28",
     ];
-
-    if !wants_summaries {
-        flags.push("redact-thinking-2026-02-12");
+    if wants_summaries {
+        flags.retain(|f| *f != "redact-thinking-2026-02-12");
     }
 
     if model.starts_with("claude-opus") || model.starts_with("claude-sonnet") {
@@ -506,15 +514,15 @@ pub fn select_anthropic_beta(model: &str, body: Option<&Json>) -> String {
 
 /// Merge Anthropic beta header flags, removing duplicates
 pub fn merge_anthropic_beta(values: &[&str]) -> String {
-    let mut flags: Vec<&str> = values
-        .iter()
-        .flat_map(|v| v.split(','))
-        .map(|f| f.trim())
-        .filter(|f| !f.is_empty())
-        .collect();
-    flags.sort();
-    flags.dedup();
-    flags.join(",")
+    // JS spreads the flags through a `Set`, so the first occurrence wins and the
+    // original order is preserved (no sort).
+    let mut seen: Vec<&str> = Vec::new();
+    for flag in values.iter().flat_map(|v| v.split(',')).map(str::trim).filter(|f| !f.is_empty()) {
+        if !seen.contains(&flag) {
+            seen.push(flag);
+        }
+    }
+    seen.join(",")
 }
 
 // === appConstants.js functions ===
@@ -720,6 +728,25 @@ mod tests {
         let beta = select_anthropic_beta("claude-opus-4", None);
         assert!(beta.contains("claude-code-20250219"));
         assert!(beta.contains("advanced-tool-use-2025-11-20"));
+        // Base flags keep their JS order and redact-thinking sits where it does there.
+        assert!(beta.starts_with("claude-code-20250219,oauth-2025-04-20"));
+        assert!(beta.contains("fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"));
+        // A client asking for thinking summaries must not receive redact-thinking.
+        let summarized = select_anthropic_beta("claude-opus-4", Some(&serde_json::json!({"thinking": {"display": "summarized"}})));
+        assert!(!summarized.contains("redact-thinking-2026-02-12"), "{summarized}");
+        // Cheap models keep the base set only.
+        let cheap = select_anthropic_beta("claude-haiku-4", None);
+        assert!(!cheap.contains("advanced-tool-use-2025-11-20"));
+    }
+
+    #[test]
+    fn test_get_models_by_provider_id_resolves_the_alias() {
+        // Registry ids map to PROVIDER_MODELS keys through their alias.
+        let resolved = get_models_by_provider_id("claude");
+        assert!(!resolved.is_empty(), "claude (alias cc) should resolve");
+        assert_eq!(resolved, get_provider_models("cc"));
+        // Unknown ids fall through to an empty list rather than panicking.
+        assert!(get_models_by_provider_id("no-such-provider").is_empty());
     }
 
     #[test]

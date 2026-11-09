@@ -1,27 +1,13 @@
 //! Kiro request helpers shared by the openai→kiro and claude→kiro translators.
-//!
-//! TODO(dedupe): drop this module once nr-data's `resolve_kiro_model_intent` and
-//! `resolve_kiro_thinking_budget` stop being placeholders (they currently ignore
-//! the `model(level)` suffix and always return a 16000 budget).
 
 use nr_core::Json;
 use serde_json::json;
-
-use crate::concerns::thinking::effort_to_budget;
-use crate::concerns::thinkingUnified::{extract_thinking, parse_suffix};
 
 /// Process-wide replay store, mirroring the module-level Map in kiroSessionReplay.js.
 pub fn replay_store() -> &'static std::sync::Mutex<crate::concerns::kiro_session_replay::KiroSessionReplayStore> {
     static STORE: once_cell::sync::Lazy<std::sync::Mutex<crate::concerns::kiro_session_replay::KiroSessionReplayStore>> =
         once_cell::sync::Lazy::new(|| std::sync::Mutex::new(crate::concerns::kiro_session_replay::KiroSessionReplayStore::new()));
     &STORE
-}
-
-/// KIRO_THINKING_BUDGET_DEFAULT from open-sse/config/kiroConstants.js.
-fn kiro_thinking_budget_default() -> i64 {
-    nr_data::export("open-sse/config/kiroConstants", "KIRO_THINKING_BUDGET_DEFAULT")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(16000)
 }
 
 /// `resolveKiroModelIntent(model)` from kiroConstants.js.
@@ -34,17 +20,20 @@ pub(crate) struct KiroModelIntent {
 }
 
 pub(crate) fn resolve_model_intent(model: &str) -> KiroModelIntent {
-    let (clean_model, override_suffix) = parse_suffix(model);
-    let resolved = nr_data::kiro_constants::resolve_kiro_model(&clean_model);
+    let resolved = nr_data::kiro_constants::resolve_kiro_model_intent(model);
     KiroModelIntent {
-        model: clean_model.clone(),
+        model: resolved
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(model)
+            .to_string(),
         upstream: resolved
             .get("upstream")
             .and_then(|v| v.as_str())
-            .unwrap_or(&clean_model)
+            .unwrap_or(model)
             .to_string(),
         agentic: resolved.get("agentic").and_then(|v| v.as_bool()).unwrap_or(false),
-        thinking_override: override_suffix,
+        thinking_override: resolved.get("thinkingOverride").filter(|v| !v.is_null()).cloned(),
     }
 }
 
@@ -59,75 +48,13 @@ pub(crate) fn resolve_thinking_budget(
     headers: Option<&serde_json::Map<String, Json>>,
     model: Option<&str>,
 ) -> Option<i64> {
-    let default = kiro_thinking_budget_default();
-    if let Some(cfg) = body.and_then(extract_thinking) {
-        match cfg.get("mode").and_then(|v| v.as_str()).unwrap_or("") {
-            "none" => return None,
-            "level" => {
-                let level = cfg.get("level").and_then(|v| v.as_str()).unwrap_or("");
-                if level == "disabled" {
-                    return None;
-                }
-                return Some(effort_to_budget(level).unwrap_or(default));
-            }
-            "budget" => return cfg.get("budget").and_then(|v| v.as_i64()),
-            _ => return Some(default),
-        }
-    }
-
-    // Anthropic beta header switching on interleaved thinking.
-    if let Some(headers) = headers {
-        let beta = headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("anthropic-beta"))
-            .and_then(|(_, v)| v.as_str());
-        if beta.map(|b| b.to_lowercase().contains("interleaved-thinking")).unwrap_or(false) {
-            return Some(default);
-        }
-    }
-
-    if body.map(contains_thinking_mode_tag).unwrap_or(false) {
-        return Some(default);
-    }
-
-    if let Some(model) = model.filter(|m| !m.is_empty()) {
-        let m = model.to_lowercase();
-        if m.contains("thinking") || m.contains("-reason") {
-            return Some(default);
-        }
-    }
-    None
-}
-
-fn contains_thinking_mode_tag(body: &Json) -> bool {
-    let messages = body.get("messages").and_then(|v| v.as_array());
-    if let Some(messages) = messages {
-        for msg in messages {
-            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            if role != "system" && role != "user" {
-                continue;
-            }
-            match msg.get("content") {
-                Some(Json::String(text)) if contains_tag_in_text(text) => return true,
-                Some(Json::Array(parts)) => {
-                    for part in parts {
-                        if part.get("text").and_then(|v| v.as_str()).map(contains_tag_in_text).unwrap_or(false) {
-                            return true;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    body.get("system").and_then(|v| v.as_str()).map(contains_tag_in_text).unwrap_or(false)
-}
-
-fn contains_tag_in_text(text: &str) -> bool {
-    if !text.contains("<thinking_mode>") {
-        return false;
-    }
-    text.contains("<thinking_mode>enabled</thinking_mode>") || text.contains("<thinking_mode>interleaved</thinking_mode>")
+    // `nr-data` owns the canonical implementation; the header map is reshaped into
+    // the JSON object it expects (keys keep their original case there).
+    let headers_json = headers
+        .map(|h| Json::Object(h.clone()))
+        .unwrap_or(Json::Null);
+    nr_data::kiro_constants::resolve_kiro_thinking_budget(body, Some(&headers_json), model)
+        .map(|budget| budget as i64)
 }
 
 /// `profileArn` resolution shared by both request translators.
@@ -159,6 +86,7 @@ pub(crate) fn restored_tool_names(name_map: &std::collections::HashMap<String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::concerns::thinking::effort_to_budget;
 
     #[test]
     fn test_resolve_model_intent_strips_agentic() {

@@ -658,56 +658,19 @@ fn get_cline_access_token(token: &str) -> String {
     }
 }
 
-/// Select anthropic-beta flags for a model.
-// TODO(dedupe): these constants should come from nr_data once the data agent exports them
-// Currently hardcoded from open-sse/providers/shared.js ANTHROPIC_BETA_BASE and ANTHROPIC_BETA_HEAVY_AGENT
-fn select_anthropic_beta(model: &str, _body: &Json) -> Option<String> {
-    let base_flags = vec![
-        "claude-code-20250219",
-        "oauth-2025-04-20",
-        "interleaved-thinking-2025-05-14",
-        "context-management-2025-06-27",
-        "prompt-caching-scope-2026-01-05",
-        "structured-outputs-2025-12-15",
-        "fast-mode-2026-02-01",
-        "redact-thinking-2026-02-12",
-        "token-efficient-tools-2026-03-28",
-    ];
-
-    let mut flags = base_flags.to_vec();
-
-    // Heavy-agent beta flags for opus/sonnet models
-    if model.contains("opus") || model.contains("sonnet") {
-        flags.push("advanced-tool-use-2025-11-20");
-        flags.push("effort-2025-11-24");
-    }
-
-    if flags.is_empty() {
-        None
-    } else {
-        Some(flags.join(","))
-    }
+/// Select anthropic-beta flags for a model (`shared.js::selectAnthropicBeta`).
+fn select_anthropic_beta(model: &str, body: &Json) -> Option<String> {
+    let beta = nr_data::select_anthropic_beta(model, Some(body));
+    (!beta.is_empty()).then_some(beta)
 }
 
-/// Merge client-provided anthropic-beta with provider defaults.
+/// Merge client-provided anthropic-beta with provider defaults
+/// (`shared.js::mergeAnthropicBeta` — first-seen order, deduped).
 fn merge_anthropic_beta(provider_beta: &str, client_beta: &str) -> String {
-    let mut flags: std::collections::HashSet<String> = provider_beta
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    for flag in client_beta.split(',').map(|s| s.trim()) {
-        if !flag.is_empty() {
-            flags.insert(flag.to_string());
-        }
-    }
-    let mut result: Vec<String> = flags.into_iter().collect();
-    result.sort();
-    result.join(",")
+    nr_data::merge_anthropic_beta(&[provider_beta, client_beta])
 }
 
 /// Resolve OpenAI-compatible API type (chat or responses endpoint).
-// TODO(dedupe): read from open-sse/services/provider.js once nr-common is fixed
 fn resolve_openai_compatible_api_type(provider: &str, api_type: Option<&str>) -> &'static str {
     match api_type {
         Some("chat") => "chat",

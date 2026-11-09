@@ -406,7 +406,30 @@ async fn handle_poll(
         let provider_for_map = if provider == "kimi-coding" { "kimi" } else { provider };
         let prov_obj = get_provider(provider_for_map)
             .ok_or_else(|| nr_core::Error::BadRequest(format!("Unknown provider: {}", provider_for_map)))?;
-        let mapped = prov_obj.map_tokens(&tokens, None)?;
+
+        // The grant succeeded, so the code is spent: run the post-login exchange
+        // now (Muse mints its API key, grok-cli/nous enrich the profile) and treat
+        // a failure as fatal rather than letting the client poll again.
+        let extra = if tokens.get("access_token").and_then(Value::as_str).is_some() {
+            match prov_obj.post_exchange(&tokens, None, log).await {
+                Ok(extra) => extra,
+                Err(err) => {
+                    return Ok((
+                        StatusCode::OK,
+                        Json(json!({
+                            "success": false,
+                            "error": "exchange_failed",
+                            "errorDescription": err.to_string(),
+                            "fatal": true,
+                        })),
+                    )
+                        .into_response())
+                }
+            }
+        } else {
+            None
+        };
+        let mapped = prov_obj.map_tokens(&tokens, extra.as_ref())?;
 
         let mut conn = mapped.to_map();
         let provider_id = if provider == "kimi-coding" { "kimi" } else { provider };

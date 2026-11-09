@@ -421,12 +421,17 @@ pub fn append_pxpipe_event(event: Value) {
             let _ = std::fs::rename(&file, rotated_file());
         }
     }
+    append_file(&file, &format!("{}\n", stamp_event(event, now_ms())));
+}
+
+/// `{ ts: Date.now(), ...event }` — the caller's `ts` wins (JS spread order).
+fn stamp_event(event: Value, now: i64) -> Value {
     let mut obj = match event {
         Value::Object(m) => m,
         other => Map::from_iter([("event".to_string(), other)]),
     };
-    obj.insert("ts".into(), json!(now_ms()));
-    append_file(&file, &format!("{}\n", Value::Object(obj)));
+    obj.entry("ts".to_string()).or_insert_with(|| json!(now));
+    Value::Object(obj)
 }
 
 fn empty_totals() -> Value {
@@ -709,5 +714,21 @@ mod tests {
         assert_eq!(totals["errors"], 1);
         assert_eq!(totals["savedPct"], 25.0);
         assert_eq!(totals["avgCompressionMs"], 40);
+    }
+
+    #[test]
+    fn stamp_event_keeps_a_caller_supplied_ts() {
+        // JS: `JSON.stringify({ ts: Date.now(), ...event })` — spread wins.
+        let stamped = stamp_event(json!({ "applied": true, "ts": 1000 }), 5000);
+        assert_eq!(stamped["ts"], 1000);
+
+        // No caller ts: the append time is filled in.
+        let stamped = stamp_event(json!({ "applied": true }), 5000);
+        assert_eq!(stamped["ts"], 5000);
+
+        // Non-object events keep the payload under `event`.
+        let stamped = stamp_event(json!("raw"), 5000);
+        assert_eq!(stamped["event"], "raw");
+        assert_eq!(stamped["ts"], 5000);
     }
 }
