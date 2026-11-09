@@ -10,38 +10,37 @@ use crate::schema::{roles, openai_blocks};
 pub fn openai_to_ollama_request(
     model: &str,
     body: Json,
-    _stream: bool,
+    stream: bool,
     _credentials: Option<&mut Credentials>,
     _options: &TranslationOptions,
 ) -> Json {
     let mut result = serde_json::json!({
         "model": model,
         "messages": normalize_messages(&body),
-        "stream": true  // TODO: use stream param
+        "stream": stream
     });
 
-    // Temperature
-    if let Some(temp) = body.get("temperature").and_then(|v| v.as_f64()) {
-        result["options"] = serde_json::json!({ "temperature": temp });
+    // options is shared by temperature/num_predict/top_p; create it once, keep keys.
+    let mut options = serde_json::Map::new();
+    if let Some(temp) = body.get("temperature").filter(|v| !v.is_null()) {
+        options.insert("temperature".into(), temp.clone());
+    }
+    // Ollama calls max_tokens `num_predict`.
+    if let Some(max_tokens) = body.get("max_tokens").filter(|v| !v.is_null()) {
+        options.insert("num_predict".into(), max_tokens.clone());
+    }
+    if let Some(top_p) = body.get("top_p").filter(|v| !v.is_null()) {
+        options.insert("top_p".into(), top_p.clone());
+    }
+    if !options.is_empty() {
+        result["options"] = Json::Object(options);
     }
 
-    // Max tokens (Ollama uses num_predict)
-    if let Some(max_tokens) = body.get("max_tokens").and_then(|v| v.as_u64()) {
-        result["options"]["num_predict"] = Json::from(max_tokens as i64);
-    }
-
-    // Top_p
-    if let Some(top_p) = body.get("top_p").and_then(|v| v.as_f64()) {
-        result["options"]["top_p"] = Json::from(top_p);
-    }
-
-    // Tools
-    if let Some(tools) = body.get("tools") {
+    // Ollama accepts tools/tool_choice in OpenAI shape.
+    if let Some(tools) = body.get("tools").filter(|v| v.is_array()) {
         result["tools"] = tools.clone();
     }
-
-    // Tool choice
-    if let Some(tool_choice) = body.get("tool_choice") {
+    if let Some(tool_choice) = body.get("tool_choice").filter(|v| !v.is_null()) {
         result["tool_choice"] = tool_choice.clone();
     }
 
@@ -79,7 +78,8 @@ fn normalize_messages(body: &Json) -> Json {
         if role == "tool" {
             let content_val = msg.get("content").unwrap_or(&Json::Null);
             let content = normalize_content(content_val);
-            if content.is_null() {
+            // Skip empty tool results (JS `if (!toolResult) continue`).
+            if content.as_str().map(|s| s.is_empty()).unwrap_or(true) {
                 continue;
             }
 
@@ -119,6 +119,7 @@ fn normalize_messages(body: &Json) -> Json {
                     tc_vec.push(serde_json::json!({
                         "type": "function",
                         "function": {
+                            "index": tc.get("index").cloned().unwrap_or(Json::from(0)),
                             "name": func.get("name").cloned().unwrap_or(Json::Null),
                             "arguments": parsed_args
                         }
@@ -135,7 +136,8 @@ fn normalize_messages(body: &Json) -> Json {
         let content = normalize_content(content_val);
         let images = extract_images(content_val);
 
-        if content.is_null() && role != roles::ASSISTANT {
+        let empty = content.as_str().map(|s| s.is_empty()).unwrap_or(true);
+        if empty && role != roles::ASSISTANT {
             continue;
         }
 
@@ -154,6 +156,7 @@ fn normalize_messages(body: &Json) -> Json {
     Json::Array(result)
 }
 
+/// Ollama only accepts string content; text blocks are joined with newlines.
 fn normalize_content(content: &Json) -> Json {
     if let Some(s) = content.as_str() {
         return Json::String(s.to_string());
@@ -171,9 +174,10 @@ fn normalize_content(content: &Json) -> Json {
         return Json::String(text_parts.join("\n"));
     }
 
-    Json::Null
+    Json::String(String::new())
 }
 
+/// Ollama wants raw base64 in `images[]`, not OpenAI data URIs.
 fn extract_images(content: &Json) -> Vec<String> {
     let mut images = Vec::new();
 
@@ -197,4 +201,84 @@ fn extract_images(content: &Json) -> Vec<String> {
     }
 
     images
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn req(body: Json, stream: bool) -> Json {
+        openai_to_ollama_request("llama3", body, stream, None, &Default::default())
+    }
+
+    #[test]
+    fn test_stream_flag_and_options() {
+        let body = json!({"messages": [{"role": "user", "content": "hi"}], "temperature": 0.5, "max_tokens": 42, "top_p": 0.9});
+        let result = req(body, false);
+        assert_eq!(result["stream"], false);
+        assert_eq!(result["options"]["temperature"], 0.5);
+        assert_eq!(result["options"]["num_predict"], 42);
+        assert_eq!(result["options"]["top_p"], 0.9);
+    }
+
+    #[test]
+    fn test_no_options_when_absent() {
+        let result = req(json!({"messages": [{"role": "user", "content": "hi"}]}), true);
+        assert!(result.get("options").is_none());
+        assert_eq!(result["stream"], true);
+    }
+
+    #[test]
+    fn test_content_array_flattened_to_string() {
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "a"}, {"type": "text", "text": "b"}
+        ]}]});
+        let result = req(body, false);
+        assert_eq!(result["messages"][0]["content"], "a\nb");
+    }
+
+    #[test]
+    fn test_tool_call_arguments_parsed_and_index_defaulted() {
+        let body = json!({"messages": [{"role": "assistant", "content": null, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{\"a\":1}"}}
+        ]}]});
+        let result = req(body, false);
+        assert_eq!(result["messages"][0]["tool_calls"][0]["function"]["arguments"]["a"], 1);
+        assert_eq!(result["messages"][0]["tool_calls"][0]["function"]["index"], 0);
+        assert_eq!(result["messages"][0]["content"], "");
+    }
+
+    #[test]
+    fn test_tool_message_maps_tool_name() {
+        let body = json!({"messages": [
+            {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "search", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "out"}
+        ]});
+        let result = req(body, false);
+        assert_eq!(result["messages"][1]["tool_name"], "search");
+        assert_eq!(result["messages"][1]["content"], "out");
+    }
+
+    #[test]
+    fn test_empty_messages_and_tool_results_dropped() {
+        let body = json!({"messages": [
+            {"role": "user", "content": "ok"},
+            {"role": "user", "content": ""},
+            {"role": "tool", "tool_call_id": "x", "content": ""}
+        ]});
+        let result = req(body, false);
+        assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_image_data_uri_becomes_raw_base64() {
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}
+        ]}]});
+        let result = req(body, false);
+        assert_eq!(result["messages"][0]["content"], "look");
+        assert_eq!(result["messages"][0]["images"][0], "QUJD");
+    }
 }
