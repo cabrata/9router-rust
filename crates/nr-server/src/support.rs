@@ -75,6 +75,21 @@ pub fn build_error_body(status: u16, message: &str) -> Value {
     })
 }
 
+/// `errorResponse(status, message, extraHeaders)`: non-streaming JSON error
+/// with CORS plus any extra headers the caller needs (e.g. `Retry-After`).
+pub fn error_response_with_headers(status: u16, message: &str, extra: &[(&str, String)]) -> Response {
+    let mut resp = error_response(status, message);
+    for (name, value) in extra {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::try_from(*name),
+            axum::http::HeaderValue::try_from(value.as_str()),
+        ) {
+            resp.headers_mut().insert(name, value);
+        }
+    }
+    resp
+}
+
 /// `errorResponse(status, message)`: non-streaming JSON error with CORS.
 pub fn error_response(status: u16, message: &str) -> Response {
     let body = build_error_body(status, message);

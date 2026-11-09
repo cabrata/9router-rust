@@ -142,6 +142,46 @@ async fn dispatch_chat(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Per-key RPM/concurrency (JS `acquireApiKeyRequest`). RPM fails fast with
+    // 429 + Retry-After; a saturated concurrency slot reports a busy 429.
+    let lease = match key_record.as_ref().map(|rec| {
+        nr_db::repos::acquire_api_key_request(&db, &json!({
+            "id": rec.id,
+            "rpm": rec.rpm,
+            "limitConcurrent": rec.limit_concurrent,
+        }))
+    }) {
+        None => None,
+        Some(Ok(lease)) if lease.get("ok").and_then(Value::as_bool) == Some(true) => {
+            Some(key_record.as_ref().map(|r| r.id.clone()).unwrap_or_default())
+        }
+        Some(Ok(lease)) => {
+            let ctx = request_log_context(&db, &headers, &uri, "chat", &body, key_record.as_ref());
+            if lease.get("reason").and_then(Value::as_str) == Some("rpm") {
+                let retry_after = lease.get("retryAfter").and_then(Value::as_i64).unwrap_or(1);
+                let rpm = key_record.as_ref().map(|r| r.rpm).unwrap_or(0);
+                let message = format!("API key requests-per-minute limit exceeded ({rpm} RPM)");
+                let mut ctx = ctx;
+                ctx.error = Some(message.clone());
+                ctx.finish(&db, 429);
+                return support::error_response_with_headers(
+                    429,
+                    &message,
+                    &[("Retry-After", retry_after.to_string())],
+                );
+            }
+            let message = "API key concurrent request limit reached";
+            let mut ctx = ctx;
+            ctx.error = Some(message.to_string());
+            ctx.finish(&db, 429);
+            return support::error_response(429, message);
+        }
+        Some(Err(e)) => {
+            tracing::warn!("[requestLogs] rpm gate failed (fail-open): {e}");
+            Some(key_record.as_ref().map(|r| r.id.clone()).unwrap_or_default())
+        }
+    };
+
     let api_key = support::extract_key(&headers, support::query_api_key(&uri).as_deref());
     // Build the log context before `body` moves into the request.
     let ctx = request_log_context(&db, &headers, &uri, "chat", &body, key_record.as_ref());
@@ -154,7 +194,17 @@ async fn dispatch_chat(
         api_key,
     };
 
-    match handle_chat(req).await {
+    let result = handle_chat(req).await;
+    // Release the slot as soon as the headers are produced. The body may still
+    // stream; the JS releases on finish, which for a stream is EOF — matching
+    // that exactly needs a stream-owned lease, so this is the closer,
+    // conservative approximation (never leaks a slot permanently).
+    // ponytail: release-on-headers; move into LoggedStream if strict
+    // concurrency accounting ever matters.
+    if let Some(key_id) = &lease {
+        let _ = nr_db::repos::release_api_key_request(&db, key_id);
+    }
+    match result {
         Ok(resp) => support::upstream_response(crate::request_log::log_upstream_response(db.clone(), ctx, resp)),
         Err(e) => {
             let status = e.status();

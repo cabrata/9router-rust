@@ -587,3 +587,36 @@ async fn denied_request_is_logged_with_403() {
     let logs = nr_db::get_request_logs(&db, &nr_db::RequestLogFilter::default()).unwrap();
     assert_eq!(logs["logs"][0]["status"], json!(403));
 }
+
+#[tokio::test]
+async fn rpm_limit_returns_429_with_retry_after() {
+    let _g = lock();
+    let (_d, router, db) = app_with(true).await;
+    install(MockEngine::json(200, &openai_ok_body()));
+
+    let key = nr_db::create_api_key(&db, Some("Limited".into()), "machine-1".into(), None).unwrap();
+    db.execute_with_params("UPDATE apiKeys SET rpm = 1 WHERE id = ?", [key.id.clone()])
+        .unwrap();
+
+    let body = json!({"model": "openai/gpt-4o", "messages": []});
+    let (s, _) = call(router.clone(), "POST", "/v1/chat/completions", Some(body.clone()), Some(&key.key)).await;
+    assert_eq!(s, StatusCode::OK);
+
+    let resp = {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", format!("Bearer {}", key.key))
+            .header(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        router.oneshot(req).await.unwrap()
+    };
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .expect("Retry-After header");
+    assert!(retry_after.parse::<i64>().unwrap() >= 1);
+}
