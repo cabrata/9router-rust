@@ -429,6 +429,7 @@ impl Default for ChatGptWebDeltaV1Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_parse_encoded_item_simple() {

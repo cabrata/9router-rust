@@ -357,6 +357,7 @@ async fn axum_proxy_handler(request: axum::extract::Request) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
 
     #[test]
     fn host_rewrite_only_for_chat_endpoints() {

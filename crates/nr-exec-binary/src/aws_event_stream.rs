@@ -312,6 +312,7 @@ pub fn encode_event_frame(headers: &BTreeMap<String, String>, payload: Option<&J
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn crc32_matches_js() {
