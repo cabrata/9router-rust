@@ -5,6 +5,7 @@
 //! repos, backup, legacy db.json import) plus src/lib/usageDb.js,
 //! requestDetailsDb.js and disabledModelsDb.js. Owner: db agent (see AGENTS.md).
 
+pub mod backup;
 pub mod connection;
 pub mod error;
 pub mod helpers;

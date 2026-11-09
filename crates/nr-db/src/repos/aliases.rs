@@ -21,9 +21,11 @@ pub fn get_model_aliases(db: &Db) -> Result<Value> {
         },
     )?;
 
+    // kv values are JSON columns: the alias target is stored JSON-encoded
+    // (`"openai/gpt-4o"`), so it must be parsed back like `aliasKv.getAll()`.
     let mut out = serde_json::Map::new();
     for (key, value) in rows {
-        out.insert(key, Value::String(value));
+        out.insert(key, parse_json(Some(value), Value::Null));
     }
 
     Ok(Value::Object(out))
@@ -31,9 +33,14 @@ pub fn get_model_aliases(db: &Db) -> Result<Value> {
 
 /// Set a model alias
 pub fn set_model_alias(db: &Db, alias: &str, model: &str) -> Result<()> {
+    // `aliasKv.set(alias, model)` → stringifyJson(model), i.e. a JSON string.
     db.execute_with_params(
         "INSERT INTO kv(scope, key, value) VALUES(?, ?, ?) ON CONFLICT(scope, key) DO UPDATE SET value = excluded.value",
-        [MODEL_ALIASES_SCOPE.to_string(), alias.to_string(), model.to_string()],
+        [
+            MODEL_ALIASES_SCOPE.to_string(),
+            alias.to_string(),
+            stringify_json(&Value::String(model.to_string())),
+        ],
     )?;
     Ok(())
 }
@@ -225,6 +232,12 @@ mod tests {
         set_model_alias(&db, "gpt4", "openai:gpt-4").unwrap();
         let aliases = get_model_aliases(&db).unwrap();
         assert_eq!(aliases.get("gpt4").and_then(|v| v.as_str()), Some("openai:gpt-4"));
+        // Stored JSON-encoded, exactly like `stringifyJson(model)` in aliasRepo.js.
+        let raw: String = db
+            .query_row("SELECT value FROM kv WHERE scope='modelAliases' AND key='gpt4'", &[], |r| r.get(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw, "\"openai:gpt-4\"");
 
         delete_model_alias(&db, "gpt4").unwrap();
         let aliases = get_model_aliases(&db).unwrap();

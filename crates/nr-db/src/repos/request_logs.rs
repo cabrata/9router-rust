@@ -200,7 +200,10 @@ pub fn get_request_logs(db: &Db, filter: &RequestLogFilter) -> Result<Value> {
     all_params.push(&offset);
 
     let mut logs = db.query_all(
-        &format!("SELECT * FROM requestLogs {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?"),
+        &format!(
+            "SELECT {} FROM requestLogs {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
+            LOG_COLS_WITH_ID
+        ),
         &all_params,
         row_to_log,
     )?;
@@ -254,8 +257,13 @@ pub fn get_request_logs(db: &Db, filter: &RequestLogFilter) -> Result<Value> {
     }))
 }
 
-/// Row -> log object, preserving the column order of `SELECT *` in the schema
-/// and coercing `stream` (stored as 0/1) back to a boolean.
+/// The `requestLogs` projection used by [`get_request_logs`]. Named columns, not
+/// `SELECT *`, so a database whose physical column order differs (an older file
+/// grown via ALTER TABLE) still maps by name.
+const LOG_COLS_WITH_ID: &str = "id, timestamp, apiKeyId, apiKeyName, apiKeyMasked, ip, method, path, endpointKind, model, provider, resolvedModel, status, stream, promptTokens, completionTokens, durationMs, ttftMs, tps, userAgent, error";
+
+/// Row -> log object for [`LOG_COLS_WITH_ID`], coercing `stream` (stored as
+/// 0/1) back to a boolean.
 fn row_to_log(row: &rusqlite::Row) -> rusqlite::Result<Value> {
     let text = |idx: usize| -> Option<String> { row.get::<_, Option<String>>(idx).ok().flatten() };
     let int = |idx: usize| -> Option<i64> { row.get::<_, Option<i64>>(idx).ok().flatten() };

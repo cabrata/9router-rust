@@ -2,7 +2,7 @@ use crate::connection::Db;
 use crate::helpers::{parse_json, stringify_json};
 use nr_core::Result;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use chrono::Timelike;
@@ -277,6 +277,130 @@ fn calculate_cost(db: &Db, provider: Option<&str>, model: Option<&str>, tokens: 
     nr_data::pricing::calculate_cost_from_tokens(Some(tokens), Some(&pricing))
 }
 
+/// `addToCounter()`: bump one aggregation bucket in place.
+fn add_to_counter(target: &mut serde_json::Map<String, Value>, key: &str, values: &Value) {
+    let entry = target
+        .entry(key.to_string())
+        .or_insert_with(|| json!({
+            "requests": 0, "promptTokens": 0, "completionTokens": 0, "cachedTokens": 0, "cost": 0
+        }));
+    let Some(obj) = entry.as_object_mut() else {
+        return;
+    };
+    let bump_i = |obj: &mut serde_json::Map<String, Value>, field: &str, by: i64| {
+        let next = obj.get(field).and_then(Value::as_i64).unwrap_or(0) + by;
+        obj.insert(field.to_string(), json!(next));
+    };
+    bump_i(obj, "requests", values.get("requests").and_then(Value::as_i64).unwrap_or(1));
+    bump_i(obj, "promptTokens", values.get("promptTokens").and_then(Value::as_i64).unwrap_or(0));
+    bump_i(obj, "completionTokens", values.get("completionTokens").and_then(Value::as_i64).unwrap_or(0));
+    bump_i(obj, "cachedTokens", values.get("cachedTokens").and_then(Value::as_i64).unwrap_or(0));
+    let cost = obj.get("cost").and_then(Value::as_f64).unwrap_or(0.0)
+        + values.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
+    obj.insert("cost".to_string(), json!(cost));
+
+    // `if (values.meta) Object.assign(target[key], values.meta)`
+    if let Some(meta) = values.get("meta").and_then(Value::as_object) {
+        for (k, v) in meta {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+}
+
+/// `aggregateEntryToDay(day, entry)` — fold one usage row into the day rollup.
+fn aggregate_entry_to_day(
+    day: &mut Value,
+    entry: &Value,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cached_tokens: i64,
+    cost: f64,
+) {
+    let provider = entry.get("provider").and_then(Value::as_str);
+    let model = entry.get("model").and_then(Value::as_str);
+    let connection_id = entry.get("connectionId").and_then(Value::as_str);
+    let api_key = entry.get("apiKey").and_then(Value::as_str);
+    let endpoint = entry.get("endpoint").and_then(Value::as_str).unwrap_or("Unknown");
+
+    let vals = json!({
+        "promptTokens": prompt_tokens,
+        "completionTokens": completion_tokens,
+        "cachedTokens": cached_tokens,
+        "cost": cost,
+    });
+
+    let Some(day_obj) = day.as_object_mut() else {
+        return;
+    };
+
+    let bump_i = |obj: &mut serde_json::Map<String, Value>, field: &str, by: i64| {
+        let next = obj.get(field).and_then(Value::as_i64).unwrap_or(0) + by;
+        obj.insert(field.to_string(), json!(next));
+    };
+    bump_i(day_obj, "requests", 1);
+    bump_i(day_obj, "promptTokens", prompt_tokens);
+    bump_i(day_obj, "completionTokens", completion_tokens);
+    bump_i(day_obj, "cachedTokens", cached_tokens);
+    let day_cost = day_obj.get("cost").and_then(Value::as_f64).unwrap_or(0.0) + cost;
+    day_obj.insert("cost".to_string(), json!(day_cost));
+
+    for field in ["byProvider", "byModel", "byAccount", "byApiKey", "byEndpoint"] {
+        day_obj
+            .entry(field.to_string())
+            .or_insert_with(|| json!({}));
+    }
+
+    let provider_unknown = provider.unwrap_or("unknown");
+    let model_key = match provider {
+        Some(p) => format!("{}|{}", model.unwrap_or(""), p),
+        None => model.unwrap_or("").to_string(),
+    };
+    let entry_model = model.unwrap_or("");
+
+    if let Some(p) = provider {
+        if let Some(by) = day_obj.get_mut("byProvider").and_then(Value::as_object_mut) {
+            add_to_counter(by, p, &vals);
+        }
+    }
+
+    if let Some(by) = day_obj.get_mut("byModel").and_then(Value::as_object_mut) {
+        let mut with_meta = vals.clone();
+        with_meta["meta"] = json!({ "rawModel": entry_model, "provider": provider });
+        add_to_counter(by, &model_key, &with_meta);
+    }
+
+    if let Some(conn) = connection_id {
+        if let Some(by) = day_obj.get_mut("byAccount").and_then(Value::as_object_mut) {
+            let mut with_meta = vals.clone();
+            with_meta["meta"] = json!({ "rawModel": entry_model, "provider": provider });
+            add_to_counter(by, conn, &with_meta);
+        }
+    }
+
+    let api_key_val = api_key.unwrap_or("local-no-key");
+    let ak_model_key = format!("{}|{}|{}", api_key_val, entry_model, provider_unknown);
+    if let Some(by) = day_obj.get_mut("byApiKey").and_then(Value::as_object_mut) {
+        let mut with_meta = vals.clone();
+        with_meta["meta"] = json!({
+            "rawModel": entry_model,
+            "provider": provider,
+            "apiKey": api_key,
+        });
+        add_to_counter(by, &ak_model_key, &with_meta);
+    }
+
+    let ep_key = format!("{}|{}|{}", endpoint, entry_model, provider_unknown);
+    if let Some(by) = day_obj.get_mut("byEndpoint").and_then(Value::as_object_mut) {
+        let mut with_meta = vals.clone();
+        with_meta["meta"] = json!({
+            "endpoint": endpoint,
+            "rawModel": entry_model,
+            "provider": provider,
+        });
+        add_to_counter(by, &ep_key, &with_meta);
+    }
+}
+
 /// Save usage entry to the database with deduplication
 pub async fn save_request_usage(db: &Db, entry: &Value) -> Result<()> {
     let timestamp = entry
@@ -391,15 +515,10 @@ pub async fn save_request_usage(db: &Db, entry: &Value) -> Result<()> {
             })
         };
 
-        // Aggregate entry into day
-        if let Some(obj) = day_data.as_object_mut() {
-            obj["requests"] = json!(obj.get("requests").and_then(|v| v.as_i64()).unwrap_or(0) + 1);
-            obj["promptTokens"] = json!(obj.get("promptTokens").and_then(|v| v.as_i64()).unwrap_or(0) + prompt_tokens);
-            obj["completionTokens"] = json!(obj.get("completionTokens").and_then(|v| v.as_i64()).unwrap_or(0) + completion_tokens);
-            obj["cachedTokens"] = json!(obj.get("cachedTokens").and_then(|v| v.as_i64()).unwrap_or(0) + cached_tokens);
-            obj["cost"] = json!(obj.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0) + cost);
-        }
-
+        // Aggregate the entry into the local-day rollup (usageRepo
+        // `aggregateEntryToDay`). Every counters object keeps the JS shape so
+        // the dashboard reads either writer's rows.
+        aggregate_entry_to_day(&mut day_data, entry, prompt_tokens, completion_tokens, cached_tokens, cost);
         let day_json = stringify_json(&day_data);
         db.execute_with_params(
             "INSERT INTO usageDaily(dateKey, data) VALUES(?, ?) ON CONFLICT(dateKey) DO UPDATE SET data = excluded.data",
@@ -492,9 +611,213 @@ pub fn get_usage_history(db: &Db, filter: Option<&Value>) -> Result<Vec<Value>> 
     })
 }
 
-/// Get usage statistics for a period
+/// `getUsageStats(period)`: dashboard aggregate for one period.
+///
+/// Faithful port of usageRepo.getUsageStats — daily rollups for 7d/30d/60d/all,
+/// live `usageHistory` for today/24h, plus the last10Minutes buckets, active and
+/// recent request lists. Everything the dashboard renders is present.
 pub fn get_usage_stats(db: &Db, period: Option<&str>) -> Result<Value> {
     let period = period.unwrap_or("all");
+
+    // connectionMap: id -> name || email || id
+    let mut connection_map: serde_json::Map<String, Value> = serde_json::Map::new();
+    if let Ok(conns) = crate::repos::connections::get_provider_connections(db, None) {
+        for c in conns {
+            let Some(id) = c.get("id").and_then(Value::as_str) else { continue };
+            let label = c
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .or_else(|| c.get("email").and_then(Value::as_str).filter(|s| !s.is_empty()))
+                .unwrap_or(id);
+            connection_map.insert(id.to_string(), Value::String(label.to_string()));
+        }
+    }
+
+    // providerNodeNameMap: node id -> display name
+    let mut provider_node_names: serde_json::Map<String, Value> = serde_json::Map::new();
+    if let Ok(nodes) = crate::repos::nodes::get_provider_nodes(db, None) {
+        for n in nodes {
+            if let (Some(id), Some(name)) = (
+                n.get("id").and_then(Value::as_str),
+                n.get("name").and_then(Value::as_str),
+            ) {
+                provider_node_names.insert(id.to_string(), Value::String(name.to_string()));
+            }
+        }
+    }
+
+    // apiKeyMap: trimmed key -> { name, id, createdAt }
+    let mut api_key_map: serde_json::Map<String, Value> = serde_json::Map::new();
+    if let Ok(keys) = crate::repos::api_keys::get_api_keys(db) {
+        for k in keys {
+            if k.key.is_empty() {
+                continue;
+            }
+            api_key_map.insert(
+                k.key.trim().to_string(),
+                json!({ "name": k.name, "id": k.id, "createdAt": k.created_at }),
+            );
+        }
+    }
+
+    // recentRequests from live history (last 100 rows, deduped to 20)
+    let recent_rows = db.query_all(
+        "SELECT timestamp, provider, model, tokens, status FROM usageHistory ORDER BY id DESC LIMIT 100",
+        &[],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        },
+    )?;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut recent_requests: Vec<Value> = Vec::new();
+    for (timestamp, provider, model, tokens_str, status) in recent_rows {
+        let tokens = parse_json(tokens_str, json!({}));
+        let prompt = tokens
+            .get("prompt_tokens")
+            .or_else(|| tokens.get("input_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let completion = tokens
+            .get("completion_tokens")
+            .or_else(|| tokens.get("output_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if prompt == 0 && completion == 0 {
+            continue;
+        }
+        let cached = tokens
+            .get("cached_tokens")
+            .or_else(|| tokens.get("cache_read_input_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let minute: String = timestamp.chars().take(16).collect();
+        let dedupe = format!(
+            "{}|{}|{}|{}|{}",
+            model.clone().unwrap_or_default(),
+            provider.clone().unwrap_or_default(),
+            prompt,
+            completion,
+            minute
+        );
+        if !seen.insert(dedupe) {
+            continue;
+        }
+        recent_requests.push(json!({
+            "timestamp": timestamp,
+            "model": model,
+            "provider": provider.unwrap_or_default(),
+            "promptTokens": prompt,
+            "completionTokens": completion,
+            "cachedTokens": cached,
+            "status": status.unwrap_or_else(|| "ok".into()),
+        }));
+        if recent_requests.len() >= 20 {
+            break;
+        }
+    }
+
+    let (pending, active_requests, error_provider) = {
+        let state = PENDING_REQUESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let pending = json!({
+            "byModel": state.by_model,
+            "byAccount": state.by_account,
+        });
+        let mut active: Vec<Value> = Vec::new();
+        for (connection_id, models) in &state.by_account {
+            for (model_key, count) in models {
+                if *count <= 0 {
+                    continue;
+                }
+                let account_name = connection_map
+                    .get(connection_id)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| {
+                        format!("Account {}...", &connection_id[..8.min(connection_id.len())])
+                    });
+                // `^(.*) \((.*)\)$`
+                let (model, provider) = match model_key.rfind(" (") {
+                    Some(idx) if model_key.ends_with(')') => (
+                        model_key[..idx].to_string(),
+                        model_key[idx + 2..model_key.len() - 1].to_string(),
+                    ),
+                    _ => (model_key.clone(), "unknown".to_string()),
+                };
+                active.push(json!({
+                    "model": model,
+                    "provider": provider,
+                    "account": account_name,
+                    "count": count,
+                }));
+            }
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let error_provider = if now - state.last_error_provider.1 < 10_000 {
+            state.last_error_provider.0.clone()
+        } else {
+            String::new()
+        };
+        (pending, active, error_provider)
+    };
+
+    // last10Minutes: fixed 10 one-minute buckets ending at the current minute.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let current_minute = now_ms - now_ms.rem_euclid(60_000);
+    let ten_minutes_ago = current_minute - 9 * 60_000;
+    let mut bucket_index: HashMap<i64, usize> = HashMap::new();
+    let mut last10: Vec<Value> = Vec::new();
+    for i in 0..10i64 {
+        let ts = current_minute - (9 - i) * 60_000;
+        bucket_index.insert(ts, last10.len());
+        last10.push(json!({ "requests": 0, "promptTokens": 0, "completionTokens": 0, "cost": 0.0 }));
+    }
+    let start_iso = chrono::DateTime::from_timestamp_millis(ten_minutes_ago)
+        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default();
+    let end_iso = chrono::DateTime::from_timestamp_millis(now_ms)
+        .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default();
+    let recent10 = db.query_all(
+        "SELECT timestamp, promptTokens, completionTokens, cost FROM usageHistory WHERE timestamp >= ? AND timestamp <= ?",
+        &[&start_iso as &dyn rusqlite::ToSql, &end_iso],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+            ))
+        },
+    )?;
+    for (timestamp, prompt, completion, cost) in recent10 {
+        let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&timestamp) else {
+            continue;
+        };
+        let ts = dt.timestamp_millis();
+        let minute = ts - ts.rem_euclid(60_000);
+        let Some(&idx) = bucket_index.get(&minute) else {
+            continue;
+        };
+        if let Some(b) = last10.get_mut(idx).and_then(Value::as_object_mut) {
+            let bump_i = |obj: &mut serde_json::Map<String, Value>, k: &str, by: i64| {
+                let next = obj.get(k).and_then(Value::as_i64).unwrap_or(0) + by;
+                obj.insert(k.to_string(), json!(next));
+            };
+            bump_i(b, "requests", 1);
+            bump_i(b, "promptTokens", prompt);
+            bump_i(b, "completionTokens", completion);
+            let next_cost = b.get("cost").and_then(Value::as_f64).unwrap_or(0.0) + cost;
+            b.insert("cost".to_string(), json!(next_cost));
+        }
+    }
 
     let mut stats = json!({
         "totalRequests": 0,
@@ -507,65 +830,489 @@ pub fn get_usage_stats(db: &Db, period: Option<&str>) -> Result<Value> {
         "byAccount": {},
         "byApiKey": {},
         "byEndpoint": {},
-        "last10Minutes": [],
-        "pending": {},
-        "activeRequests": [],
-        "recentRequests": [],
-        "errorProvider": ""
+        "last10Minutes": last10,
+        "pending": pending,
+        "activeRequests": active_requests,
+        "recentRequests": recent_requests,
+        "errorProvider": error_provider,
     });
 
-    // Load period data from usageDaily
-    if period != "24h" && period != "today" {
-        let (max_days, use_daily) = match period {
-            "7d" => (Some(7), true),
-            "30d" => (Some(30), true),
-            "60d" => (Some(60), true),
-            _ => (None, true), // "all"
+    let use_daily_summary = period != "24h" && period != "today";
+
+    if use_daily_summary {
+        let max_days = match period {
+            "7d" => Some(7i64),
+            "30d" => Some(30),
+            "60d" => Some(60),
+            _ => None,
         };
 
-        if use_daily {
-            let sql = if let Some(days) = max_days {
-                let today = chrono::Local::now().date_naive();
-                let cutoff = today - chrono::Duration::days(days as i64 - 1);
+        let day_rows: Vec<(String, String)> = match max_days {
+            Some(days) => {
+                let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(days - 1);
                 let cutoff_key = cutoff.format("%Y-%m-%d").to_string();
-                format!(
-                    "SELECT dateKey, data FROM usageDaily WHERE dateKey >= '{}' ORDER BY dateKey ASC",
-                    cutoff_key
-                )
-            } else {
-                "SELECT dateKey, data FROM usageDaily ORDER BY dateKey ASC".to_string()
+                db.query_all(
+                    "SELECT dateKey, data FROM usageDaily WHERE dateKey >= ? ORDER BY dateKey ASC",
+                    &[&cutoff_key as &dyn rusqlite::ToSql],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?
+            }
+            None => db.query_all(
+                "SELECT dateKey, data FROM usageDaily ORDER BY dateKey ASC",
+                &[],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?,
+        };
+
+        let stats_obj = stats.as_object_mut().expect("stats is an object");
+        for (date_key, data_str) in day_rows {
+            let day = parse_json(Some(data_str), json!({}));
+            let Some(day_obj) = day.as_object() else { continue };
+
+            let add_total = |stats_obj: &mut serde_json::Map<String, Value>, field: &str, by: i64| {
+                let next = stats_obj.get(field).and_then(Value::as_i64).unwrap_or(0) + by;
+                stats_obj.insert(field.to_string(), json!(next));
             };
+            add_total(stats_obj, "totalPromptTokens", day_obj.get("promptTokens").and_then(Value::as_i64).unwrap_or(0));
+            add_total(stats_obj, "totalCompletionTokens", day_obj.get("completionTokens").and_then(Value::as_i64).unwrap_or(0));
+            add_total(stats_obj, "totalCachedTokens", day_obj.get("cachedTokens").and_then(Value::as_i64).unwrap_or(0));
+            let cost_next = stats_obj.get("totalCost").and_then(Value::as_f64).unwrap_or(0.0)
+                + day_obj.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
+            stats_obj.insert("totalCost".to_string(), json!(cost_next));
 
-            let day_rows = db.query_all(&sql, &[], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                ))
-            })?;
+            // byProvider
+            if let Some(by) = day_obj.get("byProvider").and_then(Value::as_object) {
+                let target = stats_obj.get_mut("byProvider").and_then(Value::as_object_mut).unwrap();
+                for (prov, p) in by {
+                    let entry = target.entry(prov.clone()).or_insert_with(|| {
+                        json!({ "requests": 0, "promptTokens": 0, "completionTokens": 0, "cachedTokens": 0, "cost": 0 })
+                    });
+                    merge_counter(entry, p);
+                }
+            }
 
-            for (_, data_str) in day_rows {
-                let day = parse_json(Some(data_str), json!({}));
-                if let Some(day_obj) = day.as_object() {
-                    if let Some(stats_obj) = stats.as_object_mut() {
-                        stats_obj["totalPromptTokens"] = json!(
-                            stats_obj.get("totalPromptTokens").and_then(|v| v.as_i64()).unwrap_or(0)
-                                + day_obj.get("promptTokens").and_then(|v| v.as_i64()).unwrap_or(0)
-                        );
-                        stats_obj["totalCompletionTokens"] = json!(
-                            stats_obj.get("totalCompletionTokens").and_then(|v| v.as_i64()).unwrap_or(0)
-                                + day_obj.get("completionTokens").and_then(|v| v.as_i64()).unwrap_or(0)
-                        );
-                        stats_obj["totalCost"] = json!(
-                            stats_obj.get("totalCost").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                                + day_obj.get("cost").and_then(|v| v.as_f64()).unwrap_or(0.0)
-                        );
-                    }
+            // byModel — key is `rawModel (provider)`
+            if let Some(by) = day_obj.get("byModel").and_then(Value::as_object) {
+                let target = stats_obj.get_mut("byModel").and_then(Value::as_object_mut).unwrap();
+                for (mk, m) in by {
+                    let raw_model = m
+                        .get("rawModel")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| mk.split('|').next().unwrap_or("").to_string());
+                    let provider = m
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| mk.split('|').nth(1).unwrap_or("").to_string());
+                    let stats_key = if provider.is_empty() { raw_model.clone() } else { format!("{} ({})", raw_model, provider) };
+                    let display = provider_node_names
+                        .get(&provider)
+                        .and_then(Value::as_str)
+                        .unwrap_or(&provider)
+                        .to_string();
+                    let entry = target.entry(stats_key.clone()).or_insert_with(|| {
+                        json!({
+                            "requests": 0, "promptTokens": 0, "completionTokens": 0, "cachedTokens": 0,
+                            "cost": 0, "rawModel": raw_model, "provider": display, "lastUsed": date_key,
+                        })
+                    });
+                    merge_counter(entry, m);
+                    bump_last_used(entry, &date_key);
+                }
+            }
+
+            // byAccount — key is `rawModel (provider - accountName)`
+            if let Some(by) = day_obj.get("byAccount").and_then(Value::as_object) {
+                let target = stats_obj.get_mut("byAccount").and_then(Value::as_object_mut).unwrap();
+                for (conn_id, a) in by {
+                    let account_name = connection_map
+                        .get(conn_id)
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("Account {}...", &conn_id[..8.min(conn_id.len())]));
+                    let raw_model = a.get("rawModel").and_then(Value::as_str).unwrap_or("").to_string();
+                    let provider = a.get("provider").and_then(Value::as_str).unwrap_or("").to_string();
+                    let display = provider_node_names
+                        .get(&provider)
+                        .and_then(Value::as_str)
+                        .unwrap_or(&provider)
+                        .to_string();
+                    let account_key = format!("{} ({} - {})", raw_model, provider, account_name);
+                    let entry = target.entry(account_key).or_insert_with(|| {
+                        json!({
+                            "requests": 0, "promptTokens": 0, "completionTokens": 0, "cachedTokens": 0,
+                            "cost": 0, "rawModel": raw_model, "provider": display,
+                            "connectionId": conn_id, "accountName": account_name, "lastUsed": date_key,
+                        })
+                    });
+                    merge_counter(entry, a);
+                    bump_last_used(entry, &date_key);
+                }
+            }
+
+            // byApiKey — masked display, keyed by the full key in the rollup
+            if let Some(by) = day_obj.get("byApiKey").and_then(Value::as_object) {
+                let target = stats_obj.get_mut("byApiKey").and_then(Value::as_object_mut).unwrap();
+                for (ak_key, ak) in by {
+                    let raw_model = ak.get("rawModel").and_then(Value::as_str).unwrap_or("").to_string();
+                    let provider = ak.get("provider").and_then(Value::as_str).unwrap_or("").to_string();
+                    let display = provider_node_names
+                        .get(&provider)
+                        .and_then(Value::as_str)
+                        .unwrap_or(&provider)
+                        .to_string();
+                    let api_key_val = ak
+                        .get("apiKey")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    let key_info = api_key_val
+                        .as_ref()
+                        .and_then(|k| api_key_map.get(k))
+                        .cloned();
+                    let api_key_masked = mask_api_key(api_key_val.as_deref());
+                    let key_name = key_info
+                        .as_ref()
+                        .and_then(|info| info.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| api_key_masked.clone())
+                        .or_else(|| api_key_val.as_ref().map(|k| format!("{}...", &k[..8.min(k.len())])))
+                        .unwrap_or_else(|| "Local (No API Key)".to_string());
+                    let api_key_key = api_key_masked.clone().unwrap_or_else(|| "local-no-key".to_string());
+                    let entry = target.entry(ak_key.clone()).or_insert_with(|| {
+                        json!({
+                            "requests": 0, "promptTokens": 0, "completionTokens": 0, "cachedTokens": 0,
+                            "cost": 0, "rawModel": raw_model, "provider": display,
+                            "apiKeyMasked": api_key_masked, "keyName": key_name,
+                            "apiKeyKey": api_key_key, "lastUsed": date_key,
+                        })
+                    });
+                    merge_counter(entry, ak);
+                    bump_last_used(entry, &date_key);
+                }
+            }
+
+            // byEndpoint — key is `endpoint|model|provider`
+            if let Some(by) = day_obj.get("byEndpoint").and_then(Value::as_object) {
+                let target = stats_obj.get_mut("byEndpoint").and_then(Value::as_object_mut).unwrap();
+                for (ep_key, ep) in by {
+                    let endpoint = ep
+                        .get("endpoint")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| ep_key.split('|').next().unwrap_or("Unknown").to_string());
+                    let raw_model = ep.get("rawModel").and_then(Value::as_str).unwrap_or("").to_string();
+                    let provider = ep.get("provider").and_then(Value::as_str).unwrap_or("").to_string();
+                    let display = provider_node_names
+                        .get(&provider)
+                        .and_then(Value::as_str)
+                        .unwrap_or(&provider)
+                        .to_string();
+                    let entry = target.entry(ep_key.clone()).or_insert_with(|| {
+                        json!({
+                            "requests": 0, "promptTokens": 0, "completionTokens": 0, "cachedTokens": 0,
+                            "cost": 0, "endpoint": endpoint, "rawModel": raw_model,
+                            "provider": display, "lastUsed": date_key,
+                        })
+                    });
+                    merge_counter(entry, ep);
+                    bump_last_used(entry, &date_key);
                 }
             }
         }
+
+        // Overlay precise lastUsed timestamps from history.
+        // ponytail: overlay scans only a recent window; entries older than that
+        // keep the day-level lastUsed from usageDaily. Materialize a per-key
+        // MAX(timestamp) if exact old timestamps ever matter.
+        const OVERLAY_WINDOW_MS: i64 = 2 * 86_400_000;
+        let max_days_ms = max_days.map(|d| d * 86_400_000);
+        let overlay_cutoff = chrono::Utc::now().timestamp_millis() - OVERLAY_WINDOW_MS;
+        let overlay_cutoff = match max_days_ms {
+            Some(ms) => overlay_cutoff.max(chrono::Utc::now().timestamp_millis() - ms),
+            None => overlay_cutoff,
+        };
+        let overlay_iso = chrono::DateTime::from_timestamp_millis(overlay_cutoff)
+            .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            .unwrap_or_default();
+        let hist_rows = db.query_all(
+            "SELECT timestamp, provider, model, connectionId, apiKey, endpoint FROM usageHistory WHERE timestamp >= ?",
+            &[&overlay_iso as &dyn rusqlite::ToSql],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )?;
+        for (ts, provider, model, connection_id, api_key, endpoint) in hist_rows {
+            let model = model.unwrap_or_default();
+            let provider = provider.unwrap_or_default();
+
+            let model_key = if provider.is_empty() { model.clone() } else { format!("{} ({})", model, provider) };
+            if let Some(entry) = stats_obj.get_mut("byModel").and_then(|v| v.get_mut(&model_key)) {
+                replace_if_newer(entry, &ts);
+            }
+
+            if let Some(conn_id) = connection_id {
+                let account_name = connection_map
+                    .get(&conn_id)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("Account {}...", &conn_id[..8.min(conn_id.len())]));
+                let account_key = format!("{} ({} - {})", model, provider, account_name);
+                if let Some(entry) = stats_obj.get_mut("byAccount").and_then(|v| v.get_mut(&account_key)) {
+                    replace_if_newer(entry, &ts);
+                }
+            }
+
+            let api_key_key = match api_key.as_deref() {
+                Some(k) if !k.is_empty() => format!("{}|{}|{}", k, model, if provider.is_empty() { "unknown" } else { &provider }),
+                _ => "local-no-key".to_string(),
+            };
+            if let Some(entry) = stats_obj.get_mut("byApiKey").and_then(|v| v.get_mut(&api_key_key)) {
+                replace_if_newer(entry, &ts);
+            }
+
+            let endpoint_key = format!(
+                "{}|{}|{}",
+                endpoint.as_deref().unwrap_or("Unknown"),
+                model,
+                if provider.is_empty() { "unknown" } else { &provider }
+            );
+            if let Some(entry) = stats_obj.get_mut("byEndpoint").and_then(|v| v.get_mut(&endpoint_key)) {
+                replace_if_newer(entry, &ts);
+            }
+        }
+    } else {
+        // 24h / today: read live history
+        let cutoff = if period == "today" {
+            let now = chrono::Local::now();
+            let start_of_day = now.date_naive().and_hms_opt(0, 0, 0).unwrap_or_default();
+            start_of_day
+                .and_local_timezone(now.timezone())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .earliest()
+                .unwrap_or_else(chrono::Utc::now)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        } else {
+            chrono::DateTime::from_timestamp_millis(now_ms - 86_400_000)
+                .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                .unwrap_or_default()
+        };
+
+        let filtered = db.query_all(
+            "SELECT timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, tokens FROM usageHistory WHERE timestamp >= ?",
+            &[&cutoff as &dyn rusqlite::ToSql],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                    row.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                    row.get::<_, Option<f64>>(8)?.unwrap_or(0.0),
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            },
+        )?;
+
+        let stats_obj = stats.as_object_mut().expect("stats is an object");
+        for (timestamp, provider, model, connection_id, api_key, endpoint, prompt_col, completion_col, cost, tokens_str) in filtered {
+            let tokens = parse_json(tokens_str, json!({}));
+            let prompt_tokens = tokens
+                .get("prompt_tokens")
+                .or_else(|| tokens.get("input_tokens"))
+                .and_then(Value::as_i64)
+                .unwrap_or(prompt_col);
+            let completion_tokens = tokens
+                .get("completion_tokens")
+                .or_else(|| tokens.get("output_tokens"))
+                .and_then(Value::as_i64)
+                .unwrap_or(completion_col);
+            let cached_tokens = tokens
+                .get("cached_tokens")
+                .or_else(|| tokens.get("cache_read_input_tokens"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let model = model.unwrap_or_default();
+            let provider = provider.unwrap_or_default();
+            let provider_display = provider_node_names
+                .get(&provider)
+                .and_then(Value::as_str)
+                .unwrap_or(&provider)
+                .to_string();
+
+            let bump_total = |stats_obj: &mut serde_json::Map<String, Value>, field: &str, by: i64| {
+                let next = stats_obj.get(field).and_then(Value::as_i64).unwrap_or(0) + by;
+                stats_obj.insert(field.to_string(), json!(next));
+            };
+            bump_total(stats_obj, "totalPromptTokens", prompt_tokens);
+            bump_total(stats_obj, "totalCompletionTokens", completion_tokens);
+            bump_total(stats_obj, "totalCachedTokens", cached_tokens);
+            let cost_next = stats_obj.get("totalCost").and_then(Value::as_f64).unwrap_or(0.0) + cost;
+            stats_obj.insert("totalCost".to_string(), json!(cost_next));
+
+            let vals = json!({
+                "requests": 1,
+                "promptTokens": prompt_tokens,
+                "completionTokens": completion_tokens,
+                "cachedTokens": cached_tokens,
+                "cost": cost,
+            });
+
+            if let Some(by) = stats_obj.get_mut("byProvider").and_then(Value::as_object_mut) {
+                add_to_counter(by, &provider, &vals);
+            }
+
+            let model_key = if provider.is_empty() { model.clone() } else { format!("{} ({})", model, provider) };
+            {
+                let by = stats_obj.get_mut("byModel").and_then(Value::as_object_mut).unwrap();
+                let entry = by.entry(model_key).or_insert_with(|| {
+                    json!({
+                        "requests": 0, "promptTokens": 0, "completionTokens": 0, "cachedTokens": 0,
+                        "cost": 0, "rawModel": model, "provider": provider_display, "lastUsed": timestamp,
+                    })
+                });
+                merge_counter(entry, &vals);
+                replace_if_newer(entry, &timestamp);
+            }
+
+            if let Some(conn_id) = connection_id {
+                let account_name = connection_map
+                    .get(&conn_id)
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("Account {}...", &conn_id[..8.min(conn_id.len())]));
+                let account_key = format!("{} ({} - {})", model, provider, account_name);
+                let by = stats_obj.get_mut("byAccount").and_then(Value::as_object_mut).unwrap();
+                let entry = by.entry(account_key).or_insert_with(|| {
+                    json!({
+                        "requests": 0, "promptTokens": 0, "completionTokens": 0, "cachedTokens": 0,
+                        "cost": 0, "rawModel": model, "provider": provider_display,
+                        "connectionId": conn_id, "accountName": account_name, "lastUsed": timestamp,
+                    })
+                });
+                merge_counter(entry, &vals);
+                replace_if_newer(entry, &timestamp);
+            }
+
+            let provider_unknown = if provider.is_empty() { "unknown".to_string() } else { provider.clone() };
+            match api_key.filter(|k| !k.is_empty()) {
+                Some(api_key_val) => {
+                    let key_info = api_key_map.get(api_key_val.trim()).cloned();
+                    let api_key_masked = mask_api_key(Some(&api_key_val));
+                    let key_name = key_info
+                        .as_ref()
+                        .and_then(|i| i.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or_else(|| api_key_masked.clone())
+                        .unwrap_or_else(|| format!("{}...", &api_key_val[..8.min(api_key_val.len())]));
+                    let ak_key = format!("{}|{}|{}", api_key_val, model, provider_unknown);
+                    let by = stats_obj.get_mut("byApiKey").and_then(Value::as_object_mut).unwrap();
+                    let entry = by.entry(ak_key).or_insert_with(|| {
+                        json!({
+                            "requests": 0, "promptTokens": 0, "completionTokens": 0, "cachedTokens": 0,
+                            "cost": 0, "rawModel": model, "provider": provider_display,
+                            "apiKeyMasked": api_key_masked, "keyName": key_name,
+                            "apiKeyKey": api_key_masked, "lastUsed": timestamp,
+                        })
+                    });
+                    merge_counter(entry, &vals);
+                    replace_if_newer(entry, &timestamp);
+                }
+                None => {
+                    let by = stats_obj.get_mut("byApiKey").and_then(Value::as_object_mut).unwrap();
+                    let entry = by.entry("local-no-key".to_string()).or_insert_with(|| {
+                        json!({
+                            "requests": 0, "promptTokens": 0, "completionTokens": 0, "cachedTokens": 0,
+                            "cost": 0, "rawModel": model, "provider": provider_display,
+                            "apiKeyMasked": Value::Null, "keyName": "Local (No API Key)",
+                            "apiKeyKey": "local-no-key", "lastUsed": timestamp,
+                        })
+                    });
+                    merge_counter(entry, &vals);
+                    replace_if_newer(entry, &timestamp);
+                }
+            }
+
+            let endpoint = endpoint.unwrap_or_else(|| "Unknown".to_string());
+            let ep_key = format!("{}|{}|{}", endpoint, model, provider_unknown);
+            let by = stats_obj.get_mut("byEndpoint").and_then(Value::as_object_mut).unwrap();
+            let entry = by.entry(ep_key).or_insert_with(|| {
+                json!({
+                    "requests": 0, "promptTokens": 0, "completionTokens": 0, "cachedTokens": 0,
+                    "cost": 0, "endpoint": endpoint, "rawModel": model,
+                    "provider": provider_display, "lastUsed": timestamp,
+                })
+            });
+            merge_counter(entry, &vals);
+            replace_if_newer(entry, &timestamp);
+        }
     }
 
+    // totalRequests = sum of byProvider requests
+    let total: i64 = stats
+        .get("byProvider")
+        .and_then(Value::as_object)
+        .map(|by| {
+            by.values()
+                .map(|p| p.get("requests").and_then(Value::as_i64).unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0);
+    stats["totalRequests"] = json!(total);
+
     Ok(stats)
+}
+
+/// `merge_counter(entry, delta)`: add the five counters from `delta` into `entry`.
+fn merge_counter(entry: &mut Value, delta: &Value) {
+    let Some(obj) = entry.as_object_mut() else { return };
+    for field in ["requests", "promptTokens", "completionTokens", "cachedTokens"] {
+        let by = delta.get(field).and_then(Value::as_i64).unwrap_or(0);
+        let next = obj.get(field).and_then(Value::as_i64).unwrap_or(0) + by;
+        obj.insert(field.to_string(), json!(next));
+    }
+    let cost = obj.get("cost").and_then(Value::as_f64).unwrap_or(0.0)
+        + delta.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
+    obj.insert("cost".to_string(), json!(cost));
+}
+
+/// `if (dateKey > lastUsed) lastUsed = dateKey` — day-granularity compare.
+fn bump_last_used(entry: &mut Value, date_key: &str) {
+    let Some(obj) = entry.as_object_mut() else { return };
+    let current = obj.get("lastUsed").and_then(Value::as_str).unwrap_or("");
+    if date_key > current {
+        obj.insert("lastUsed".to_string(), json!(date_key));
+    }
+}
+
+/// `if (new Date(ts) > new Date(lastUsed)) lastUsed = ts` — timestamp compare.
+fn replace_if_newer(entry: &mut Value, ts: &str) {
+    let Some(obj) = entry.as_object_mut() else { return };
+    let current = obj.get("lastUsed").and_then(Value::as_str).unwrap_or("");
+    let newer = match (
+        chrono::DateTime::parse_from_rfc3339(ts),
+        chrono::DateTime::parse_from_rfc3339(current),
+    ) {
+        (Ok(a), Ok(b)) => a > b,
+        (Ok(_), Err(_)) => true,
+        _ => ts > current,
+    };
+    if newer {
+        obj.insert("lastUsed".to_string(), json!(ts));
+    }
 }
 
 /// Get realtime summary for a period

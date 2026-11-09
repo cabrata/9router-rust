@@ -24,3 +24,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[test]]
+name = "js_compat"
+path = "tests/js_compat.rs"

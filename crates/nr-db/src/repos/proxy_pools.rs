@@ -191,3 +191,77 @@ pub fn delete_proxy_pool(db: &Db, id: &str) -> Result<bool> {
     )?;
     Ok(rows > 0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn db() -> (TempDir, Db) {
+        let dir = TempDir::new().unwrap();
+        let db = Db::open_in(dir.path()).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn create_get_update_delete_roundtrip() {
+        let (_dir, db) = db();
+        let created = create_proxy_pool(
+            &db,
+            &json!({
+                "id": "pool-1",
+                "name": "Primary",
+                "proxyUrl": "http://proxy:8080",
+                "noProxy": "localhost",
+                "type": "http",
+                "strictProxy": true,
+                "testStatus": "unknown",
+            }),
+        )
+        .unwrap();
+        assert_eq!(created["id"], json!("pool-1"));
+        assert_eq!(created["name"], json!("Primary"));
+        // isActive defaults to true when omitted (JS: isActive !== undefined).
+        assert_eq!(created["isActive"], json!(true));
+        // Extra fields round-trip through the `data` blob.
+        assert_eq!(created["proxyUrl"], json!("http://proxy:8080"));
+        assert_eq!(created["strictProxy"], json!(true));
+
+        let fetched = get_proxy_pool_by_id(&db, "pool-1").unwrap().unwrap();
+        assert_eq!(fetched["isActive"], json!(true));
+        assert_eq!(fetched["noProxy"], json!("localhost"));
+
+        // Filter by isActive.
+        let active = get_proxy_pools(&db, Some(&json!({"isActive": true}))).unwrap();
+        assert_eq!(active.len(), 1);
+        let inactive = get_proxy_pools(&db, Some(&json!({"isActive": false}))).unwrap();
+        assert!(inactive.is_empty());
+
+        // Update merges and keeps unspecified fields.
+        let updated = update_proxy_pool(&db, "pool-1", &json!({"name": "Renamed", "isActive": false}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated["name"], json!("Renamed"));
+        assert_eq!(updated["isActive"], json!(false));
+        assert_eq!(updated["proxyUrl"], json!("http://proxy:8080"));
+        let refetched = get_proxy_pool_by_id(&db, "pool-1").unwrap().unwrap();
+        assert_eq!(refetched["isActive"], json!(false));
+
+        // Update of a missing pool returns None.
+        assert!(update_proxy_pool(&db, "nope", &json!({"name": "x"})).unwrap().is_none());
+
+        // Delete returns true once, then false.
+        assert!(delete_proxy_pool(&db, "pool-1").unwrap());
+        assert!(!delete_proxy_pool(&db, "pool-1").unwrap());
+        assert!(get_proxy_pool_by_id(&db, "pool-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn id_defaults_to_uuid() {
+        let (_dir, db) = db();
+        let created = create_proxy_pool(&db, &json!({"name": "Auto", "proxyUrl": "x"})).unwrap();
+        let id = created["id"].as_str().unwrap();
+        assert_eq!(id.len(), 36, "uuid v4 by default");
+        assert!(get_proxy_pool_by_id(&db, id).unwrap().is_some());
+    }
+}

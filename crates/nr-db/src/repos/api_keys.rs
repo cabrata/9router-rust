@@ -78,79 +78,53 @@ pub fn normalize_api_key_limits(data: &Value) -> Result<Value> {
     Ok(result)
 }
 
+const API_KEY_COLS: &str = "id, key, name, machineId, isActive, expiredAt, limitConcurrent, rpm, createdAt, allowedModels, allowedEndpoints, accessRestricted, accessAllow";
+
+/// Column-by-name mapping for `apiKeys`. Explicit names (not `SELECT *`) so a
+/// database written by an older JS build, whose physical column order differs
+/// after an ALTER TABLE, still maps correctly.
+fn row_to_api_key(row: &rusqlite::Row) -> rusqlite::Result<ApiKey> {
+    Ok(ApiKey {
+        id: row.get("id")?,
+        key: row.get("key")?,
+        name: row.get("name")?,
+        machine_id: row.get("machineId")?,
+        is_active: row.get::<_, Option<i32>>("isActive")?.unwrap_or(1) == 1,
+        expired_at: row.get("expiredAt")?,
+        limit_concurrent: row.get::<_, Option<i32>>("limitConcurrent")?.unwrap_or(0).max(0) as u32,
+        rpm: row.get::<_, Option<i32>>("rpm")?.unwrap_or(0).max(0) as u32,
+        created_at: row.get("createdAt")?,
+        allowed_models: string_list(row.get("allowedModels")?),
+        allowed_endpoints: string_list(row.get("allowedEndpoints")?),
+        access: key_access_from_columns(
+            row.get::<_, Option<i32>>("accessRestricted")?,
+            row.get("accessAllow")?,
+        ),
+    })
+}
+
+fn string_list(raw: Option<String>) -> Vec<String> {
+    parse_json(raw, json!([]))
+        .as_array()
+        .map(|v| v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
 /// Get all API keys ordered by creation time
 pub fn get_api_keys(db: &Db) -> Result<Vec<ApiKey>> {
     db.query_all(
-        "SELECT * FROM apiKeys ORDER BY createdAt ASC",
+        &format!("SELECT {} FROM apiKeys ORDER BY createdAt ASC", API_KEY_COLS),
         &[],
-        |row| {
-            Ok(ApiKey {
-                id: row.get(0)?,
-                key: row.get(1)?,
-                name: row.get(2)?,
-                machine_id: row.get(3)?,
-                is_active: row.get::<_, i32>(4)? == 1,
-                expired_at: row.get(5)?,
-                limit_concurrent: row.get::<_, i32>(6)? as u32,
-                rpm: row.get::<_, i32>(7)? as u32,
-                created_at: row.get(8)?,
-                allowed_models: parse_json(row.get(9)?, json!([]))
-                    .as_array()
-                    .map(|v| {
-                        v.iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                allowed_endpoints: parse_json(row.get(10)?, json!([]))
-                    .as_array()
-                    .map(|v| {
-                        v.iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                access: key_access_from_columns(row.get(11)?, row.get(12)?),
-            })
-        },
+        row_to_api_key,
     )
 }
 
 /// Get a specific API key by ID
 pub fn get_api_key_by_id(db: &Db, id: &str) -> Result<Option<ApiKey>> {
     db.query_row(
-        "SELECT * FROM apiKeys WHERE id = ?",
+        &format!("SELECT {} FROM apiKeys WHERE id = ?", API_KEY_COLS),
         &[&id],
-        |row| {
-            Ok(ApiKey {
-                id: row.get(0)?,
-                key: row.get(1)?,
-                name: row.get(2)?,
-                machine_id: row.get(3)?,
-                is_active: row.get::<_, i32>(4)? == 1,
-                expired_at: row.get(5)?,
-                limit_concurrent: row.get::<_, i32>(6)? as u32,
-                rpm: row.get::<_, i32>(7)? as u32,
-                created_at: row.get(8)?,
-                allowed_models: parse_json(row.get(9)?, json!([]))
-                    .as_array()
-                    .map(|v| {
-                        v.iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                allowed_endpoints: parse_json(row.get(10)?, json!([]))
-                    .as_array()
-                    .map(|v| {
-                        v.iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                access: key_access_from_columns(row.get(11)?, row.get(12)?),
-            })
-        },
+        row_to_api_key,
     )
 }
 
@@ -161,38 +135,9 @@ pub fn get_api_key_by_key(db: &Db, key: &str) -> Result<Option<ApiKey>> {
     }
 
     db.query_row(
-        "SELECT * FROM apiKeys WHERE key = ?",
+        &format!("SELECT {} FROM apiKeys WHERE key = ?", API_KEY_COLS),
         &[&key],
-        |row| {
-            Ok(ApiKey {
-                id: row.get(0)?,
-                key: row.get(1)?,
-                name: row.get(2)?,
-                machine_id: row.get(3)?,
-                is_active: row.get::<_, i32>(4)? == 1,
-                expired_at: row.get(5)?,
-                limit_concurrent: row.get::<_, i32>(6)? as u32,
-                rpm: row.get::<_, i32>(7)? as u32,
-                created_at: row.get(8)?,
-                allowed_models: parse_json(row.get(9)?, json!([]))
-                    .as_array()
-                    .map(|v| {
-                        v.iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                allowed_endpoints: parse_json(row.get(10)?, json!([]))
-                    .as_array()
-                    .map(|v| {
-                        v.iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                access: key_access_from_columns(row.get(11)?, row.get(12)?),
-            })
-        },
+        row_to_api_key,
     )
 }
 
