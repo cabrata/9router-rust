@@ -4,10 +4,18 @@
 //!
 //! FROZEN for the CLI: [`ServerOptions`] and [`run`].
 
+pub mod console_log_buffer;
+pub mod dashboard;
+pub mod mitm;
 pub mod routes;
+pub mod support;
+pub mod v1;
+
+pub use routes::api::api_routes;
 
 use std::net::SocketAddr;
 
+use axum::Extension;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::json;
@@ -27,12 +35,22 @@ impl Default for ServerOptions {
     }
 }
 
-/// The application router. Wave 2 mounts /v1, /api and the dashboard here.
+/// The application router. Mounts `/v1`, `/api` and the HTML dashboard.
+///
+/// The `Db` is shared via `Extension` — route handlers take
+/// `Extension<Db>` so tests can swap in a fresh temp-dir database.
 pub fn app() -> Router {
-    Router::new().route("/api/health", get(|| async { Json(json!({ "ok": true })) }))
+    let db = nr_db::db().expect("nr-server: cannot open default database");
+    Router::new()
+        .route("/health", get(|| async { Json(json!({ "ok": true })) }))
+        .merge(v1::v1_router())
+        .merge(routes::routes())
+        .merge(api_routes())
+        .merge(dashboard::router())
+        .layer(axum::Extension(db))
 }
 
-/// Serve until shutdown (Ctrl-C / SIGTERM).
+/// Serve until shutdown (Ctrl-C / SIGTERM). Frozen contract for nr-cli.
 pub async fn run(opts: ServerOptions) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind((opts.hostname.as_str(), opts.port)).await?;
     tracing::info!("9router listening on http://{}:{}", opts.hostname, opts.port);
