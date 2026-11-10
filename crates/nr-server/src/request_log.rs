@@ -460,9 +460,12 @@ mod tests {
         assert_eq!(row["model"], json!("cc/opus"));
         assert_eq!(row["endpointKind"], json!("chat"));
         assert_eq!(row["stream"], json!(true));
-        // TTFT is marked right before finishing, so generation time is ~0 ms and
-        // the JS formula yields 0 rather than infinity.
-        assert_eq!(row["tps"].as_f64().unwrap(), 0.0);
+        // `tps` is derived from wall-clock timings, so its exact value here moves
+        // with scheduling jitter (a 14 ms pause makes it 7142.9). The formula
+        // itself is pinned deterministically by `tps_matches_js`; here we only
+        // assert the row carries a sane result.
+        let tps = row["tps"].as_f64().expect("tps is numeric");
+        assert!(tps.is_finite() && tps >= 0.0, "tps = {tps}");
     }
 
     #[test]
