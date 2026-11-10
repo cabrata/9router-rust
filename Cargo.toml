@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # Debian's rustc. resolver 3 picks the newest dependency versions that build on it.
 rust-version = "1.85"
