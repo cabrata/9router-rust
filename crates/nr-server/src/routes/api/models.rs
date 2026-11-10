@@ -8,9 +8,11 @@ use nr_db::{
     set_model_alias, update_provider_connection, Db,
 };
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::fs;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use super::common::{bad_request, get_db, internal_error};
 
@@ -383,13 +385,427 @@ pub async fn post_models_availability(
     (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
 }
 
+// ─── modelCatalog/sync.js ───────────────────────────────────────────────────
+
+const CATALOG_URL: &str = "https://models.dev/api.json";
+const CATALOG_VERSION: u64 = 2;
+const SYNC_INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
+const LIMIT_TOLERANCE: f64 = 0.1;
+
+/// `PROVIDER_ALIASES`: local provider id → models.dev provider id.
+const PROVIDER_ALIASES: &[(&str, &str)] = &[
+    ("github", "github-copilot"),
+    ("glm", "zai"),
+    ("glm-cn", "zhipuai"),
+    ("claude", "anthropic"),
+    ("gemini", "google"),
+    ("kimi", "moonshotai"),
+    ("kimi-cn", "moonshotai-cn"),
+    ("qwen", "alibaba"),
+    ("qwen-cn", "alibaba-cn"),
+    ("zhipu", "zhipuai"),
+    ("hunyuan", "tencent"),
+    ("doubao", "volcengine"),
+    ("cloudflare-ai", "cloudflare-workers-ai"),
+];
+
+fn provider_alias(provider: &str) -> &str {
+    PROVIDER_ALIASES
+        .iter()
+        .find(|(local, _)| *local == provider)
+        .map(|(_, upstream)| *upstream)
+        .unwrap_or(provider)
+}
+
+/// `MODALITY_BY_INPUT`: models.dev input modality → capability flag.
+fn modality_by_input(input: &str) -> Option<&'static str> {
+    match input {
+        "image" => Some("vision"),
+        "pdf" => Some("pdf"),
+        "audio" => Some("audioInput"),
+        "video" => Some("videoInput"),
+        _ => None,
+    }
+}
+
+/// `baseId`: "zai-org/GLM-4.6V:free" -> "glm-4.6v".
+fn base_id(model_id: &str) -> String {
+    model_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_id)
+        .to_lowercase()
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// One registry model with the capabilities the hand-written tables resolve on
+/// their own, so `build` can tell which upstream values are a change.
+struct CatalogEntry {
+    provider: String,
+    model: String,
+    context_length: Option<f64>,
+    current: Value,
+}
+
+fn collect_entries() -> Vec<CatalogEntry> {
+    let mut entries = Vec::new();
+    for provider in nr_data::registry() {
+        let Some(provider_id) = provider.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(models) = provider.get("models").and_then(Value::as_array) else {
+            continue;
+        };
+        for model in models {
+            let Some(model_id) = model.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            entries.push(CatalogEntry {
+                provider: provider_id.to_string(),
+                model: model_id.to_string(),
+                context_length: model.get("contextLength").and_then(Value::as_f64),
+                current: nr_data::capabilities::get_capabilities_for_model(
+                    Some(provider_id),
+                    Some(model_id),
+                ),
+            });
+        }
+    }
+    entries
+}
+
+/// `build(catalog, entries)`: the capabilities worth overriding, keyed by
+/// provider+model so a gateway's own modalities and limits win.
+pub fn build_catalog(catalog: &Value, entries: &[CatalogEntry]) -> Value {
+    // Upstream provider id → the local ids it belongs to.
+    let mut local_ids: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for entry in entries {
+        let upstream_id = provider_alias(&entry.provider).to_string();
+        let locals = local_ids.entry(upstream_id).or_default();
+        if !locals.contains(&entry.provider) {
+            locals.push(entry.provider.clone());
+        }
+    }
+
+    let mut by_provider: std::collections::HashMap<String, std::collections::HashMap<String, Value>> =
+        std::collections::HashMap::new();
+    let mut models = Map::new();
+
+    if let Some(catalog_obj) = catalog.as_object() {
+        for (provider_id, provider) in catalog_obj {
+            let empty = Vec::new();
+            let locals = local_ids.get(provider_id).unwrap_or(&empty);
+            let mut models_by_id: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+            let mut seen: HashSet<String> = HashSet::new();
+
+            if let Some(models_obj) = provider.get("models").and_then(Value::as_object) {
+                for (model_id, model) in models_obj {
+                    let id = base_id(model_id);
+                    models_by_id.insert(id.clone(), model.clone());
+                    // One entry per provider+model: upstream ids that normalize to
+                    // the same model must not stack their modalities.
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    let mut declared = Map::new();
+                    if let Some(inputs) = model
+                        .get("modalities")
+                        .and_then(|m| m.get("input"))
+                        .and_then(Value::as_array)
+                    {
+                        for input in inputs {
+                            if let Some(key) = input.as_str().and_then(modality_by_input) {
+                                declared.insert(key.to_string(), Value::Bool(true));
+                            }
+                        }
+                    }
+                    if declared.is_empty() {
+                        continue;
+                    }
+                    let declared = Value::Object(declared);
+                    for local in locals {
+                        models.insert(format!("{local}:{id}"), declared.clone());
+                    }
+                    if !locals.contains(provider_id) {
+                        models.insert(format!("{provider_id}:{id}"), declared);
+                    }
+                }
+            }
+            by_provider.insert(provider_id.clone(), models_by_id);
+        }
+    }
+
+    // Limits belong to the gateway, keyed by provider + model.
+    let mut providers = Map::new();
+    for entry in entries {
+        let alias = provider_alias(&entry.provider);
+        let upstream = if catalog.get(&entry.provider).is_some() {
+            Some(entry.provider.clone())
+        } else if catalog.get(alias).is_some() {
+            Some(alias.to_string())
+        } else {
+            None
+        };
+        let Some(upstream) = upstream else { continue };
+        let Some(provider_models) = by_provider.get(&upstream) else {
+            continue;
+        };
+        let Some(upstream_model) = provider_models.get(&base_id(&entry.model)) else {
+            continue;
+        };
+
+        let mut delta = Map::new();
+        let limit = upstream_model.get("limit");
+        let context = limit.and_then(|l| l.get("context")).and_then(Value::as_f64).unwrap_or(0.0);
+        let output = limit.and_then(|l| l.get("output")).and_then(Value::as_f64).unwrap_or(0.0);
+        let current_context = entry
+            .current
+            .get("contextWindow")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let current_output = entry
+            .current
+            .get("maxOutput")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+
+        if context > 0.0
+            && entry.context_length.unwrap_or(0.0) <= 0.0
+            && current_context > 0.0
+            && (context - current_context).abs() / current_context > LIMIT_TOLERANCE
+        {
+            delta.insert("contextWindow".into(), json!(context));
+        }
+        if output > 0.0
+            && current_output > 0.0
+            && (output - current_output).abs() / current_output > LIMIT_TOLERANCE
+        {
+            delta.insert("maxOutput".into(), json!(output));
+        }
+        if delta.is_empty() {
+            continue;
+        }
+        let slot = providers
+            .entry(entry.provider.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(obj) = slot.as_object_mut() {
+            obj.insert(entry.model.clone(), Value::Object(delta));
+        }
+    }
+
+    json!({ "models": Value::Object(models), "providers": Value::Object(providers) })
+}
+
+/// `slim(catalog)`: trimmed copy for the add-models skill (~470KB vs 4.3MB).
+fn slim_catalog(catalog: &Value) -> Value {
+    let mut out = Map::new();
+    let Some(catalog_obj) = catalog.as_object() else {
+        return Value::Object(out);
+    };
+    for (provider_id, provider) in catalog_obj {
+        let mut models = Map::new();
+        if let Some(models_obj) = provider.get("models").and_then(Value::as_object) {
+            for (model_id, model) in models_obj {
+                let inputs: Vec<Value> = model
+                    .get("modalities")
+                    .and_then(|m| m.get("input"))
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter(|v| v.as_str() != Some("text")).cloned().collect())
+                    .unwrap_or_default();
+                let mut entry = Map::new();
+                entry.insert("i".into(), Value::Array(inputs));
+                if let Some(c) = model.get("limit").and_then(|l| l.get("context")) {
+                    entry.insert("c".into(), c.clone());
+                }
+                if let Some(o) = model.get("limit").and_then(|l| l.get("output")) {
+                    entry.insert("o".into(), o.clone());
+                }
+                if model.get("reasoning").and_then(Value::as_bool) == Some(true) {
+                    entry.insert("r".into(), Value::Bool(true));
+                }
+                models.insert(model_id.clone(), Value::Object(entry));
+            }
+        }
+        out.insert(provider_id.clone(), Value::Object(models));
+    }
+    Value::Object(out)
+}
+
+#[derive(Default)]
+struct CatalogSyncState {
+    running: bool,
+    last_sync: Option<f64>,
+    last_error: Option<String>,
+    last_result: Option<Value>,
+    etag: Option<String>,
+    file_version: Option<u64>,
+}
+
+fn sync_state() -> &'static Mutex<CatalogSyncState> {
+    static STATE: OnceLock<Mutex<CatalogSyncState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(CatalogSyncState::default()))
+}
+
+fn catalog_file() -> std::path::PathBuf {
+    nr_core::paths::data_dir().join("model-catalog.json")
+}
+
+fn catalog_raw_file() -> std::path::PathBuf {
+    nr_core::paths::data_dir().join("model-catalog-raw.json")
+}
+
+/// Write via `tmp` + rename so a concurrent reader never sees a partial file.
+fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path)
+}
+
+fn now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
+}
+
+/// `restoreEtag()`: the etag lives in the file we wrote, so a restart resumes
+/// from it instead of re-downloading 4.3MB to be told nothing changed.
+fn restore_catalog_state() {
+    let Ok(parsed) = fs::read_to_string(catalog_file())
+        .map_err(|e| e)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).map_err(|_| std::io::Error::other("bad json")))
+    else {
+        return;
+    };
+    let mut state = sync_state().lock().unwrap_or_else(|e| e.into_inner());
+    state.etag = parsed.get("etag").and_then(Value::as_str).map(str::to_string);
+    state.file_version = parsed.get("v").and_then(Value::as_u64);
+    state.last_sync = fs::metadata(catalog_file())
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as f64);
+}
+
+/// `syncModelCatalog()`: one run. `None` means it could not complete.
+pub async fn sync_model_catalog() -> Option<Value> {
+    {
+        let mut state = sync_state().lock().unwrap_or_else(|e| e.into_inner());
+        if state.running {
+            return None;
+        }
+        state.running = true;
+    }
+
+    let result = sync_model_catalog_inner().await;
+
+    let mut state = sync_state().lock().unwrap_or_else(|e| e.into_inner());
+    state.running = false;
+    match &result {
+        Some(value) => {
+            state.last_sync = Some(now_ms());
+            state.last_error = None;
+            state.last_result = Some(value.clone());
+        }
+        None => {}
+    }
+    result
+}
+
+async fn sync_model_catalog_inner() -> Option<Value> {
+    let (etag, file_version) = {
+        let state = sync_state().lock().unwrap_or_else(|e| e.into_inner());
+        (state.etag.clone(), state.file_version)
+    };
+
+    let mut request = nr_core::http::FetchRequest::get(CATALOG_URL);
+    request.headers.insert("accept".into(), "application/json".into());
+    // A file written by an older schema must be rebuilt even when upstream is
+    // unchanged, so only ask for a 304 when the file is current.
+    if let Some(etag) = etag.as_ref().filter(|_| file_version == Some(CATALOG_VERSION)) {
+        request.headers.insert("if-none-match".into(), etag.clone());
+    }
+    request.header_timeout = Some(std::time::Duration::from_secs(60));
+
+    let response = match nr_core::http::proxy_fetch(request, None).await {
+        Ok(response) => response,
+        Err(error) => {
+            let mut state = sync_state().lock().unwrap_or_else(|e| e.into_inner());
+            state.last_error = Some(error.to_string());
+            return None;
+        }
+    };
+
+    if response.status == 304 {
+        return Some(json!({ "status": "unchanged" }));
+    }
+    if !response.ok() {
+        let mut state = sync_state().lock().unwrap_or_else(|e| e.into_inner());
+        state.last_error = Some(format!("HTTP {}", response.status));
+        return None;
+    }
+
+    let new_etag = response.header("etag").map(str::to_string);
+    let catalog = match response.json_body().await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let mut state = sync_state().lock().unwrap_or_else(|e| e.into_inner());
+            state.last_error = Some(error.to_string());
+            return None;
+        }
+    };
+
+    let entries = collect_entries();
+    let built = build_catalog(&catalog, &entries);
+    let models_count = built.get("models").and_then(Value::as_object).map_or(0, |o| o.len());
+    let providers_count = built.get("providers").and_then(Value::as_object).map_or(0, |o| o.len());
+    let synced_at = now_ms();
+    let serialized = json!({
+        "v": CATALOG_VERSION,
+        "etag": new_etag,
+        "syncedAt": synced_at,
+        "models": built.get("models").cloned().unwrap_or_else(|| json!({})),
+        "providers": built.get("providers").cloned().unwrap_or_else(|| json!({})),
+    });
+    let serialized_text = serialized.to_string();
+
+    if let Err(error) = write_atomic(&catalog_file(), &serialized_text) {
+        let mut state = sync_state().lock().unwrap_or_else(|e| e.into_inner());
+        state.last_error = Some(error.to_string());
+        return None;
+    }
+    // The slim copy only feeds the add-models skill; a failure here is not fatal.
+    let _ = write_atomic(&catalog_raw_file(), &slim_catalog(&catalog).to_string());
+
+    {
+        let mut state = sync_state().lock().unwrap_or_else(|e| e.into_inner());
+        state.etag = new_etag.clone();
+        state.file_version = Some(CATALOG_VERSION);
+    }
+    nr_data::capabilities::set_catalog_source(Some(&built));
+
+    Some(json!({
+        "status": "updated",
+        "etag": new_etag,
+        "bytes": serialized_text.len(),
+        "models": models_count,
+        "providers": providers_count,
+    }))
+}
+
 // GET /api/models/catalog-sync - Catalog sync state
 pub async fn get_models_catalog_sync() -> Response {
-    let catalog_file = nr_core::paths::data_dir().join("model-catalog.json");
+    let catalog_path = catalog_file();
     let mut catalog_info = Value::Null;
 
-    if let Ok(metadata) = fs::metadata(&catalog_file) {
-        if let Ok(content) = fs::read_to_string(&catalog_file) {
+    if let Ok(metadata) = fs::metadata(&catalog_path) {
+        if let Ok(content) = fs::read_to_string(&catalog_path) {
             if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
                 let models_count = parsed.get("models").and_then(Value::as_object).map_or(0, |o| o.len());
                 let providers_count = parsed.get("providers").and_then(Value::as_object).map_or(0, |o| o.len());
@@ -403,17 +819,28 @@ pub async fn get_models_catalog_sync() -> Response {
         }
     }
 
+    let (running, last_sync, last_error, last_result, etag) = {
+        let state = sync_state().lock().unwrap_or_else(|e| e.into_inner());
+        (
+            state.running,
+            state.last_sync,
+            state.last_error.clone(),
+            state.last_result.clone(),
+            state.etag.clone(),
+        )
+    };
+
     (
         StatusCode::OK,
         Json(json!({
-            "running": false,
-            "lastSync": Value::Null,
-            "lastError": Value::Null,
-            "lastResult": Value::Null,
-            "etag": Value::Null,
-            "file": catalog_file.to_string_lossy(),
-            "url": "https://models.dev/api.json",
-            "intervalMs": 86400000_u64,
+            "running": running,
+            "lastSync": last_sync,
+            "lastError": last_error,
+            "lastResult": last_result,
+            "etag": etag,
+            "file": catalog_path.to_string_lossy(),
+            "url": CATALOG_URL,
+            "intervalMs": SYNC_INTERVAL_MS,
             "catalog": catalog_info,
         })),
     )
@@ -422,14 +849,33 @@ pub async fn get_models_catalog_sync() -> Response {
 
 // POST /api/models/catalog-sync - Run sync now
 pub async fn post_models_catalog_sync() -> Response {
-    (
-        StatusCode::OK,
-        Json(json!({
-            "success": true,
-            "result": { "models": 0, "providers": 0 },
-        })),
-    )
-        .into_response()
+    match sync_model_catalog().await {
+        Some(result) => (StatusCode::OK, Json(json!({ "success": true, "result": result }))).into_response(),
+        None => {
+            let last_error = {
+                let state = sync_state().lock().unwrap_or_else(|e| e.into_inner());
+                state.last_error.clone()
+            };
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({ "error": last_error.unwrap_or_else(|| "sync in progress".to_string()) })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `startModelCatalogSync()`: resume from the file's etag. The periodic timer is
+/// left to the caller (`nr-server` boots one in `app()`); `MODEL_CATALOG_SYNC=off`
+/// disables it.
+pub fn start_model_catalog_sync() {
+    if std::env::var("MODEL_CATALOG_SYNC")
+        .map(|v| v.eq_ignore_ascii_case("off"))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    restore_catalog_state();
 }
 
 // GET /api/models/custom - List custom models
@@ -603,4 +1049,111 @@ pub async fn post_models_test(Json(body): Json<Value>) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(provider: &str, model: &str, context_length: Option<f64>) -> CatalogEntry {
+        CatalogEntry {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            context_length,
+            current: json!({
+                "vision": false, "pdf": false, "audioInput": false, "videoInput": false,
+                "contextWindow": 200000, "maxOutput": 64000,
+            }),
+        }
+    }
+
+    #[test]
+    fn base_id_normalizes_vendor_and_suffix() {
+        assert_eq!(base_id("zai-org/GLM-4.6V:free"), "glm-4.6v");
+        assert_eq!(base_id("claude-opus-4.5"), "claude-opus-4.5");
+        assert_eq!(base_id("MOONSHOT:8k"), "moonshot");
+    }
+
+    #[test]
+    fn build_aliases_local_provider_to_upstream() {
+        let catalog = json!({
+            "github-copilot": {
+                "models": {
+                    "gpt-5-codex:free": {
+                        "modalities": { "input": ["text", "image"] },
+                        "limit": { "context": 300000, "output": 128000 },
+                    }
+                }
+            }
+        });
+        let entries = [entry("github", "gpt-5-codex", None)];
+        let built = build_catalog(&catalog, &entries);
+        let models = built.get("models").and_then(Value::as_object).unwrap();
+        assert!(models.contains_key("github:gpt-5-codex"), "alias key missing");
+        assert_eq!(models["github:gpt-5-codex"]["vision"], json!(true));
+        let providers = built.get("providers").and_then(Value::as_object).unwrap();
+        assert_eq!(providers["github"]["gpt-5-codex"]["contextWindow"], json!(300000.0));
+    }
+
+    #[test]
+    fn build_skips_limits_within_tolerance() {
+        let catalog = json!({
+            "anthropic": {
+                "models": {
+                    "claude-opus-4.5": {
+                        "modalities": { "input": ["text"] },
+                        "limit": { "context": 202752, "output": 64000 },
+                    }
+                }
+            }
+        });
+        // current contextWindow 200000 vs upstream 202752: 1.4% diff < 10%.
+        let entries = [entry("claude", "claude-opus-4.5", None)];
+        let built = build_catalog(&catalog, &entries);
+        let providers = built.get("providers").and_then(Value::as_object).unwrap();
+        assert!(!providers.contains_key("claude"), "no delta expected within tolerance");
+    }
+
+    #[test]
+    fn build_skips_when_registry_declares_context_length() {
+        let catalog = json!({
+            "zai": {
+                "models": {
+                    "glm-4.6v": {
+                        "modalities": { "input": ["text"] },
+                        "limit": { "context": 400000, "output": 64000 },
+                    }
+                }
+            }
+        });
+        // contextLength present on the registry entry → the local value wins.
+        let entries = [entry("glm", "glm-4.6v", Some(400000.0))];
+        let built = build_catalog(&catalog, &entries);
+        let providers = built.get("providers").and_then(Value::as_object).unwrap();
+        assert!(!providers.contains_key("glm"));
+    }
+
+    #[test]
+    fn build_fails_modalities_per_provider_plus_model() {
+        // Two upstream models normalize to the same base id; only the first's
+        // modalities may apply (JS `seen` guard).
+        let catalog = json!({
+            "anthropic": {
+                "models": {
+                    "claude-opus-4.5:1024": {
+                        "modalities": { "input": ["text", "image"] },
+                    },
+                    "claude-opus-4.5:8192": {
+                        "modalities": { "input": ["text", "pdf"] },
+                    },
+                }
+            }
+        });
+        let entries = [entry("claude", "claude-opus-4.5", None)];
+        let built = build_catalog(&catalog, &entries);
+        let models = built.get("models").and_then(Value::as_object).unwrap();
+        let caps = &models["claude:claude-opus-4.5"];
+        assert_eq!(caps["vision"], json!(true));
+        assert!(caps.get("pdf").is_none(), "second normalized id must not stack");
+    }
 }
