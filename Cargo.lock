@@ -2141,7 +2141,7 @@ dependencies = [
 
 [[package]]
 name = "nr-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2173,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "nr-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2193,7 +2193,7 @@ dependencies = [
 
 [[package]]
 name = "nr-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "nr-data"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hostname",
  "nr-core",
@@ -2224,7 +2224,7 @@ dependencies = [
 
 [[package]]
 name = "nr-db"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "indexmap",
@@ -2245,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "nr-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "nr-exec-base"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2298,7 +2298,7 @@ dependencies = [
 
 [[package]]
 name = "nr-exec-binary"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2333,7 +2333,7 @@ dependencies = [
 
 [[package]]
 name = "nr-exec-browser"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2372,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "nr-exec-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2403,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "nr-exec-ide"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "async-trait",
@@ -2443,7 +2443,7 @@ dependencies = [
 
 [[package]]
 name = "nr-exec-simple"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2479,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "nr-exec-webchat"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "nr-executors"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "nr-core",
  "nr-exec-base",
@@ -2528,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "nr-oauth"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "nr-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2620,7 +2620,7 @@ dependencies = [
 
 [[package]]
 name = "nr-translator"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",

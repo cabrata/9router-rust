@@ -47,10 +47,11 @@ sed -i "s/^version = \"$version\"/version = \"$new\"/" Cargo.toml
 echo "version: $version -> $new"
 
 # The crate versions are all `version.workspace = true`, so the root bump is
-# the only edit. Make sure the workspace still resolves.
+# the only edit. `cargo metadata` also rewrites the workspace members' versions in
+# Cargo.lock, so commit the lock too (v0.1.1 missed it).
 cargo metadata --no-deps --format-version 1 >/dev/null
 
-git add Cargo.toml
+git add Cargo.toml Cargo.lock
 git commit -q -m "chore(release): v$new"
 git tag "v$new"
 

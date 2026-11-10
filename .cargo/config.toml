@@ -1,6 +1,5 @@
 [build]
 # The dev box has 4 cores and ~3 GB free RAM; several agents share one target dir.
 jobs = 2
-# Root partition is small (containerd fills it) and /media/caliph is NTFS (fuseblk, no exec).
-# This ext4 loop mount has ~149G free and supports executable build scripts.
-target-dir = "/mnt/immich-media/rust-target"
+# Build output lives outside the NTFS mount via the `target/` symlink (see AGENTS.md);
+# do not hardcode a machine-local target-dir here, CI builds on a clean runner.
