@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep target dir inside the workspace so the cache key is stable.
+  CARGO_TARGET_DIR: target
+
+jobs:
+  check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check all crates (default features, no tray)
+        run: cargo check --workspace --all-targets
+
+      - name: Build binary
+        run: cargo build --workspace --all-targets
+
+      - name: Test workspace
+        run: cargo test --workspace --no-fail-fast
+        env:
+          # Tests must never touch a real home data dir.
+          DATA_DIR: ${{ runner.temp }}/9router-data
