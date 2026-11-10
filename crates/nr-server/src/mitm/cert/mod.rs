@@ -114,13 +114,17 @@ impl RootCa {
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     let mut f = std::fs::File::create(path)
         .map_err(|e| Error::other(format!("create {}: {e}", path.display())))?;
     f.write_all(bytes).map_err(|e| Error::other(format!("write {}: {e}", path.display())))?;
-    let mut perms = f.metadata().map_err(|e| Error::other(e.to_string()))?.permissions();
-    perms.set_mode(0o600);
-    f.set_permissions(perms).map_err(|e| Error::other(format!("chmod {}: {e}", path.display())))?;
+    // shortcut: no mode bits on Windows (NTFS ACLs), the key stays world-readable there; add an ACL call if Windows MITM ships.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = f.metadata().map_err(|e| Error::other(e.to_string()))?.permissions();
+        perms.set_mode(0o600);
+        f.set_permissions(perms).map_err(|e| Error::other(format!("chmod {}: {e}", path.display())))?;
+    }
     Ok(())
 }
 
